@@ -175,9 +175,9 @@ build_platform() {
     OUT_DIR="${BUILD_DIR}/${platform}"
     mkdir -p "$OUT_DIR"
     
-    # Set binary extensions
-    SERVER_BIN="quietroom_server"
-    CLIENT_BIN="quietroom_client"
+    # Set binary names with platform and version appended
+    SERVER_BIN="quietroom_server-${platform}-v${VERSION}"
+    CLIENT_BIN="quietroom_client-${platform}-v${VERSION}"
     if [ "$GOOS" = "windows" ]; then
         SERVER_BIN="${SERVER_BIN}.exe"
         CLIENT_BIN="${CLIENT_BIN}.exe"
