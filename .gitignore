@@ -1,0 +1,8 @@
+security.log
+chat_server.log
+client_config.json
+server_config.json
+server_private.pem
+chat_public.pem
+downloads/
+build/
