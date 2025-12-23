@@ -64,8 +64,8 @@ This project does not seek to compete with large-scale platforms. It offers some
 
 For detailed setup instructions, configuration options, and troubleshooting:
 
-- **[Server Documentation](SERVER_README.md)** - Complete server setup, configuration, and administration guide
-- **[Client Documentation](CLIENT_README.md)** - Client installation, configuration, and usage instructions
+- **[Server Documentation](SERVER_README.MD)** - Complete server setup, configuration, and administration guide
+- **[Client Documentation](CLIENT_README.MD)** - Client installation, configuration, and usage instructions
 
 ## Security Overview
 
