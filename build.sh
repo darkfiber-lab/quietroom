@@ -176,14 +176,14 @@ build_platform() {
     mkdir -p "$OUT_DIR"
     
     # Set binary extensions
-    SERVER_BIN="chat_server"
-    CLIENT_BIN="chat_client"
+    SERVER_BIN="quietroom_server"
+    CLIENT_BIN="quietroom_client"
     if [ "$GOOS" = "windows" ]; then
         SERVER_BIN="${SERVER_BIN}.exe"
         CLIENT_BIN="${CLIENT_BIN}.exe"
     fi
     
-    # Build server
+    # Build server (with CGO_ENABLED=0 for platform-agnostic static binaries)
     print_msg "$YELLOW" "   Building server..."
     if CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build \
         -ldflags="-w -s -X main.Version=${VERSION}" \
@@ -195,7 +195,7 @@ build_platform() {
         return 1
     fi
     
-    # Build client
+    # Build client (with CGO_ENABLED=0 for platform-agnostic static binaries)
     print_msg "$YELLOW" "   Building client..."
     if CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build \
         -ldflags="-w -s -X main.Version=${VERSION}" \
