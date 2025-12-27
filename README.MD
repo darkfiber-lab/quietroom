@@ -143,7 +143,7 @@ Contributions are welcome! Please ensure:
 
 ## Security Disclosure
 
-If you discover a security vulnerability, please email the maintainers directly rather than opening a public issue. We take security seriously and will respond promptly.
+If you discover a security vulnerability, please contact the maintainer directly (I am not sure if you can do that right now).
 
 ## License
 
