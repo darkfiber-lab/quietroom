@@ -284,12 +284,6 @@ netstat -tulpn | grep 37842
 - **CPU**: Minimal (<1% idle), ~5-10% during active encryption
 - **Network**: ~100-500 bytes/30s per client (decoy traffic)
 
-### Scaling
-
-- Tested with 100+ concurrent clients
-- CPU-bound during key exchanges
-- Network-bound during active chat
-
 ## License
 
 This project is licensed under the GNU Affero General Public License v3 (AGPL-3.0).
