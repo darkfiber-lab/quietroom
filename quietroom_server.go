@@ -659,7 +659,7 @@ Available Commands:
   /leave <#room>    - Leave a chat room
   /rooms          - List all available rooms
   /users          - List users in current room or online
-  /file <user> <filename> <sha256_hash> - Send file to a user (only filename, no paths)
+  /file <user> <path/filename> Send file to a user
   /accept <id>      - Accept incoming file transfer
   /decline <id>     - Decline incoming file transfer
   /quit           - Disconnect from server
@@ -831,7 +831,7 @@ func (s *Server) handleListUsers(client *Client) {
 
 func (s *Server) handleFileTransferInit(client *Client, parts []string) {
 	if len(parts) < 4 {
-		s.sendToClient(client, "Usage: /file <username> <filename> <sha256_hash>")
+		s.sendToClient(client, "Usage: /file <username> <path/filename>")
 		return
 	}
 	targetUser := parts[1]
