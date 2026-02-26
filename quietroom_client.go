@@ -45,6 +45,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"strconv"
 
 	"golang.org/x/term"
 )
@@ -82,6 +83,7 @@ type Client struct {
 	stopDecoy  chan bool
 	username   string
 	shutdown   chan bool
+	shutdownOnce sync.Once
 
 	pendingTransfer *FileTransferState
 	transferMu      sync.Mutex
@@ -668,7 +670,7 @@ func main() {
 	go func() {
 		<-sigChan
 		fmt.Println("\n✓ Shutting down client gracefully...")
-		close(client.shutdown)
+		client.shutdownOnce.Do(func() { close(client.shutdown) })
 		if client.conn != nil {
 			client.conn.Close()
 		}
@@ -788,6 +790,10 @@ func main() {
 	defer conn.Close()
 
 	client.conn = conn
+	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 
 	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Secure TLS connection established"))
 
@@ -905,6 +911,7 @@ func main() {
 		for {
 			select {
 			case <-client.shutdown:
+				client.shutdownOnce.Do(func() { close(client.shutdown) })
 				done <- true
 				return
 			default:
@@ -912,6 +919,8 @@ func main() {
 
 			packet, err := readObfuscatedPacket(conn)
 			if err != nil {
+				client.printMessageSafe("*** Connection to server lost ***")
+				client.shutdownOnce.Do(func() { close(client.shutdown) })
 				done <- true
 				return
 			}
@@ -932,7 +941,13 @@ func main() {
 					parts := strings.Split(msgStr, "|")
 					if len(parts) >= 3 {
 						filename := filepath.Base(parts[1])
-						fmt.Sscanf(parts[2], "%d", &expectedSize)
+						expectedSize, err = strconv.ParseInt(parts[2], 10, 64)
+						if err != nil || expectedSize <= 0 {
+							client.mu.Lock()
+							client.printMessageSafe("*** File transfer cancelled: invalid file size received ***")
+							client.mu.Unlock()
+							continue
+						}
 
 						if len(parts) == 4 {
 							expectedHash = parts[3]
@@ -1044,26 +1059,19 @@ func main() {
 			msgStr := string(msg)
 
 			if strings.HasPrefix(msgStr, "BEGIN_SEND|") {
-				parts := strings.Split(msgStr, "|")
-				if len(parts) >= 2 {
-					filePath := parts[1]
-					filePath = filepath.Clean(filePath)
+				client.transferMu.Lock()
+				pending := client.pendingTransfer
+				client.transferMu.Unlock()
 
-					client.transferMu.Lock()
-					if client.pendingTransfer != nil && client.pendingTransfer.filename != "" {
-						filePath = client.pendingTransfer.filename
-					}
-					client.transferMu.Unlock()
-
-					if len(parts) == 3 {
-						expectedHash = parts[2]
-					}
-
-					client.mu.Lock()
-					client.printMessageSafe("Starting file transfer...")
-					client.mu.Unlock()
-					go client.sendFile(filePath)
+				if pending == nil || pending.filename == "" {
+					// Server sent BEGIN_SEND with no transfer we initiated — ignore
+					continue
 				}
+
+				client.mu.Lock()
+				client.printMessageSafe("Starting file transfer...")
+				client.mu.Unlock()
+				go client.sendFile(pending.filename)
 				continue
 			}
 
@@ -1126,7 +1134,7 @@ func main() {
 			} else if b == 3 { // Ctrl+C
 				term.Restore(int(os.Stdin.Fd()), oldState)
 				fmt.Println("\n✓ Shutting down client gracefully...")
-				close(client.shutdown)
+				client.shutdownOnce.Do(func() { close(client.shutdown) })
 				if client.conn != nil {
 					client.conn.Close()
 				}

@@ -43,6 +43,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"strconv"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -179,11 +180,11 @@ func loadConfig() ServerConfig {
 
 func NewServer() (*Server, error) {
 	config := loadConfig()
-	logFile, err := os.OpenFile(config.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFile, err := os.OpenFile(config.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY,600)
 	if err != nil {
 		return nil, err
 	}
-	secLogFile, err := os.OpenFile(config.SecurityLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	secLogFile, err := os.OpenFile(config.SecurityLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +198,7 @@ func NewServer() (*Server, error) {
 
 	privateKeyBytes := x509.MarshalPKCS1PrivateKey(privateKey)
 	privateKeyPEM := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: privateKeyBytes}
-	privFile, err := os.Create("server_private.pem")
+	privFile, err := os.OpenFile("server_private.pem", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +276,6 @@ func (s *Server) run() {
 		case client := <-s.join:
 			s.mu.Lock()
 			s.clients[client] = true
-			s.usernames[client.username] = client
 			s.mu.Unlock()
 			joinMsg := fmt.Sprintf("*** %s joined the chat ***", client.username)
 			s.broadcastToLobby(joinMsg)
@@ -293,6 +293,7 @@ func (s *Server) run() {
 			}
 			s.mu.Unlock()
 			s.roomsMu.Lock()
+			client.mu.Lock()
 			for roomName := range client.rooms {
 				if room, exists := s.rooms[roomName]; exists {
 					room.mu.Lock()
@@ -300,6 +301,7 @@ func (s *Server) run() {
 					room.mu.Unlock()
 				}
 			}
+			client.mu.Unlock()
 			s.roomsMu.Unlock()
 
 			// Clean up pending file transfers involving this client
@@ -486,6 +488,14 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 	clientDHPub := new(big.Int).SetBytes(clientDHPubBytes)
+
+	one := big.NewInt(1)
+	pMinusOne := new(big.Int).Sub(s.dhParams.P, one)
+	if clientDHPub.Cmp(one) <= 0 || clientDHPub.Cmp(pMinusOne) >= 0 {
+		s.logSecurity("Invalid DH public key from %s (small subgroup attack attempt)", ipAddr)
+		return
+	}
+
 	sharedSecret := computeDHSharedSecret(dhPrivate, clientDHPub, s.dhParams.P)
 	s.logSecurity("Diffie-Hellman key exchange completed with %s", ipAddr)
 	block, err := aes.NewCipher(sharedSecret)
@@ -552,6 +562,16 @@ func (s *Server) handleClient(conn net.Conn) {
 			return
 		}
 	}
+	s.mu.Lock()
+	if _, taken := s.usernames[username]; taken {
+		s.mu.Unlock()
+		errMsg, _ := client.encrypt([]byte("*** Username already taken. Please reconnect with a different name. ***"))
+		conn.Write(s.createObfuscatedPacket(0x01, errMsg))
+		time.Sleep(500 * time.Millisecond)
+		return
+	}
+	s.usernames[username] = client
+	s.mu.Unlock()
 	client.username = username
 	s.join <- client
 	go func() {
@@ -599,11 +619,15 @@ func (s *Server) handleClient(conn net.Conn) {
 			}
 		}
 		msg := fmt.Sprintf("[%s] %s: %s", time.Now().Format("15:04:05"), client.username, text)
-		if client.currentRoom == "" {
+		client.mu.Lock()
+		currentRoom := client.currentRoom
+		client.mu.Unlock()
+
+		if currentRoom == "" {
 			s.broadcastToLobby(msg)
 		} else {
 			s.roomsMu.RLock()
-			if room, exists := s.rooms[client.currentRoom]; exists {
+			if room, exists := s.rooms[currentRoom]; exists {
 				s.broadcastToRoom(room, msg)
 			}
 			s.roomsMu.RUnlock()
@@ -749,8 +773,10 @@ func (s *Server) handleJoinRoom(client *Client, parts []string) bool {
 	room.mu.Lock()
 	room.members[client] = true
 	room.mu.Unlock()
+	client.mu.Lock()
 	client.rooms[roomName] = true
 	client.currentRoom = roomName
+	client.mu.Unlock()
 	s.roomsMu.Unlock()
 	s.broadcastToRoom(room, fmt.Sprintf("*** %s joined %s ***", client.username, roomName))
 	return true
@@ -772,10 +798,12 @@ func (s *Server) handleLeaveRoom(client *Client, parts []string) bool {
 	room.mu.Lock()
 	delete(room.members, client)
 	room.mu.Unlock()
+	client.mu.Lock()
 	delete(client.rooms, roomName)
 	if client.currentRoom == roomName {
 		client.currentRoom = ""
 	}
+	client.mu.Unlock()
 	s.sendToClient(client, fmt.Sprintf("Left room %s - returned to lobby", roomName))
 	s.broadcastToRoom(room, fmt.Sprintf("*** %s left %s ***", client.username, roomName))
 	return true
@@ -1033,7 +1061,20 @@ func (s *Server) handleFileData(client *Client, encryptedData []byte) {
 			s.transfersMu.RUnlock()
 			if activeTransfer != nil {
 				activeTransfer.filename = filename
-				fmt.Sscanf(filesizeStr, "%d", &activeTransfer.filesize)
+				size, err := strconv.ParseInt(filesizeStr, 10, 64)
+				if err != nil || size <= 0 {
+					s.sendToClient(client, "*** File transfer cancelled: invalid file size ***")
+					s.transfersMu.Lock()
+					for id, t := range s.fileTransfers {
+						if t == activeTransfer {
+							delete(s.fileTransfers, id)
+							break
+						}
+					}
+					s.transfersMu.Unlock()
+					return
+				}
+				activeTransfer.filesize = size
 				msg := fmt.Sprintf("FILE_START|%s|%s|%s", filename, filesizeStr, activeTransfer.expectedHash)
 				encrypted, _ := activeTransfer.recipient.encrypt([]byte(msg))
 				packet := s.createObfuscatedPacket(0x03, encrypted)
@@ -1153,6 +1194,10 @@ func main() {
 
 	for {
 		conn, err := listener.Accept()
+		if tcpConn, ok := conn.(*tls.Conn).NetConn().(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
 		if err != nil {
 			select {
 			case <-server.shutdown:
