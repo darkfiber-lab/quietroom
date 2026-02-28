@@ -1,0 +1,6 @@
+# QuietRoom LLM Bot — Python dependencies
+# Install with: pip install -r requirements_bot.txt
+
+cryptography>=41.0.0   # AES-GCM, RSA verification, TLS cert handling
+requests>=2.31.0       # Ollama backend
+openai>=1.0.0          # OpenAI-compatible backend (also works with local servers)
