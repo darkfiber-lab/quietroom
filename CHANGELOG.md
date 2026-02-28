@@ -1,6 +1,13 @@
 # Changelog
 
-## [1.0.1] - 2025-12-23
+## [1.1.0] - 2026-02-28
+
+### Added
+- **QuietRoom Connector (`quietroom_connector.py`)** — a standalone Python library that implements the full QuietRoom protocol stack (TLS, Diffie-Hellman key exchange, AES-256-GCM, obfuscated packet framing) and exposes a clean callback-based interface for building automated clients; the connector maintains a persistent connection and registered username on the server for the lifetime of the process, supports `on_dm`, `on_message`, and `on_disconnect` callbacks, and provides thread-safe `send_dm`, `send_message`, `join_room`, and `leave_room` methods
+- **LLM Bot (`quietroom_llm_bot.py`)** — a Python client built on top of the connector that routes incoming direct messages to a locally running language model; supports Ollama and any OpenAI-compatible inference server (LM Studio, vLLM, LocalAI, etc.) as pluggable backends, maintains per-sender conversation history with configurable depth and TTL-based expiry, splits long responses into multiple DMs automatically, and purges conversation history when a user disconnects from the server to prevent context leaking to a subsequent user who registers the same username
+
+
+## [1.0.1] - 2026-02-27
 
 ### Security
 - **Fixed critical small subgroup attack** — DH public keys are now validated to be within the range `(1, P-1)` on both client and server before the shared secret is computed; previously a malicious peer could force the session key to a known constant
