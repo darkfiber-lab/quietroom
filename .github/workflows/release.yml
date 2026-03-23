@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+      - main
+
+jobs:
+
+  # ── Determine version from latest tag ──────────────────────────
+  version:
+    name: Determine release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version
+        id: version
+        run: |
+          # Use the latest tag if it points to this commit, otherwise
+          # create a version from the tag + commit count since it
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          EXACT=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+
+          if [ -n "$EXACT" ]; then
+            # This commit is exactly on a tag
+            VERSION="${EXACT#v}"
+          else
+            # Commits since last tag — create a prerelease version
+            COMMITS=$(git rev-list ${TAG}..HEAD --count)
+            SHORT=$(git rev-parse --short HEAD)
+            VERSION="${TAG#v}-pre.${COMMITS}+${SHORT}"
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Release version: ${VERSION}"
+
+  # ── Build CLI and server ────────────────────────────────────────
+  build-cli:
+    name: Build CLI + Server
+    needs: version
+    uses: ./.github/workflows/build-cli.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      is_release: true
+
+  # ── Build GUI ───────────────────────────────────────────────────
+  build-gui:
+    name: Build GUI
+    needs: version
+    uses: ./.github/workflows/build-gui.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      is_release: true
+
+  # ── Create GitHub Release ───────────────────────────────────────
+  create-release:
+    name: Create GitHub Release
+    needs: [version, build-cli, build-gui]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/cli/
+          pattern: quietroom-cli-*
+          merge-multiple: false
+
+      - name: Download all GUI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/gui/
+          pattern: quietroom-gui-*
+          merge-multiple: false
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+
+          # Package CLI artifacts — one zip per platform
+          for dir in artifacts/cli/*/; do
+            platform=$(basename "$dir")
+            platform="${platform#quietroom-cli-}"
+            if [ -d "$dir" ]; then
+              zip -j "release/quietroom-cli-${platform}-v${{ needs.version.outputs.version }}.zip" "$dir"/*
+            fi
+          done
+
+          # Copy GUI artifacts — already zipped for macOS, flat files for others
+          find artifacts/gui/ -type f \( -name "*.zip" -o -name "*.exe" -o -name "quietroom_client_gui-*" \) \
+            -exec cp {} release/ \;
+
+          echo "Release files:"
+          ls -lah release/
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          # Extract the section for this version from CHANGELOG.md if it exists
+          VERSION="${{ needs.version.outputs.version }}"
+          if [ -f CHANGELOG.md ]; then
+            # Get content between this version header and the next --- separator
+            NOTES=$(awk "/## \[${VERSION}\]/{found=1; next} found && /^---/{exit} found{print}" CHANGELOG.md)
+            if [ -z "$NOTES" ]; then
+              NOTES="See CHANGELOG.md for details."
+            fi
+          else
+            NOTES="Release v${VERSION}"
+          fi
+          # Write to file to handle multiline
+          echo "$NOTES" > release_notes.md
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: QuietRoom v${{ needs.version.outputs.version }}
+          body_path: release_notes.md
+          files: release/*
+          draft: false
+          prerelease: ${{ contains(needs.version.outputs.version, '-pre.') || contains(needs.version.outputs.version, '-rc') || contains(needs.version.outputs.version, '-beta') || contains(needs.version.outputs.version, '-alpha') }}
+          make_latest: ${{ !contains(needs.version.outputs.version, '-pre.') }}

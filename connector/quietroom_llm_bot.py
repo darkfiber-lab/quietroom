@@ -74,7 +74,7 @@ log = logging.getLogger("quietroom.llm_bot")
 class OllamaConfig:
     base_url: str = "http://localhost:11434"
     model: str = "llama3"
-    timeout: int = 120
+    timeout: int = 600
 
 
 @dataclass
@@ -82,7 +82,7 @@ class OpenAIConfig:
     base_url: str = "http://localhost:8080/v1"
     api_key: str = "not-needed"
     model: str = "gpt-3.5-turbo"
-    timeout: int = 120
+    timeout: int = 600
 
 
 @dataclass
@@ -187,7 +187,7 @@ def load_config(path: str = "bot_config.json") -> BotConfig:
         cfg.ollama = OllamaConfig(
             base_url=o.get("base_url", "http://localhost:11434"),
             model=o.get("model", "llama3"),
-            timeout=o.get("timeout", 120),
+            timeout=o.get("timeout", 600),
         )
     if "openai" in d:
         o = d["openai"]
@@ -195,7 +195,7 @@ def load_config(path: str = "bot_config.json") -> BotConfig:
             base_url=o.get("base_url", "http://localhost:8080/v1"),
             api_key=o.get("api_key", "not-needed"),
             model=o.get("model", "gpt-3.5-turbo"),
-            timeout=o.get("timeout", 120),
+            timeout=o.get("timeout", 600),
         )
 
     return cfg
@@ -257,7 +257,7 @@ class OllamaBackend(LLMBackend):
         try:
             resp = self._requests.post(
                 url,
-                json={"model": self._cfg.model, "messages": messages, "stream": False},
+                json={"model": self._cfg.model, "messages": messages, "stream": False, "think": False},
                 timeout=self._cfg.timeout,
             )
             resp.raise_for_status()

@@ -82,6 +82,7 @@ type Client struct {
 	mu         sync.Mutex
 	stopDecoy  chan bool
 	username   string
+	currentRoom string
 	shutdown   chan bool
 	shutdownOnce sync.Once
 
@@ -1205,6 +1206,35 @@ func main() {
 					client.printMessageSafe("✗ Usage: /file <username> <filepath>")
 					client.printMessageSafe("   Tip: Use quotes for paths with spaces")
 					continue
+				}
+			}
+
+			// Auto-prefix room messages
+			if !strings.HasPrefix(text, "/") {
+				client.mu.Lock()
+				currentRoom := client.currentRoom
+				client.mu.Unlock()
+				if currentRoom != "" {
+					text = fmt.Sprintf("[%s] %s", currentRoom, text)
+				}
+			}
+			
+			// Track current room for auto-prefixing
+			if strings.HasPrefix(text, "/join ") {
+				parts := strings.Fields(text)
+				if len(parts) >= 2 {
+					client.mu.Lock()
+					client.currentRoom = parts[1]
+					client.mu.Unlock()
+				}
+			} else if strings.HasPrefix(text, "/leave ") {
+				parts := strings.Fields(text)
+				if len(parts) >= 2 {
+					client.mu.Lock()
+					if client.currentRoom == parts[1] {
+						client.currentRoom = ""
+					}
+					client.mu.Unlock()
 				}
 			}
 

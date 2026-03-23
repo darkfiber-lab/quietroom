@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QuietRoom</title>
+  <script type="module" crossorigin src="/assets/index-OxCzFrQC.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-BZSZZ54b.css">
+</head>
+<body>
+
+  <!-- ── Connection screen ───────────────────────────────────── -->
+  <div id="screen-connect" class="screen active">
+    <div class="connect-card">
+      <div class="logo" style="--wails-draggable: drag">
+        <span class="logo-lock">🔒</span>
+        <h1>QuietRoom</h1>
+        <p class="logo-sub">End-to-end encrypted · Self-hosted · Private</p>
+      </div>
+
+      <div id="connect-error" class="alert alert-error hidden"></div>
+
+      <div class="form-group">
+        <label>Server Profile</label>
+        <select id="profile-select"></select>
+      </div>
+
+      <div class="form-group">
+        <label>Host</label>
+        <input type="text" id="input-host" placeholder="localhost"
+              autocorrect="off" autocapitalize="off" spellcheck="false" />
+      </div>
+
+      <div class="form-row">
+        <div class="form-group flex-1">
+          <label>Port</label>
+          <input type="number" id="input-port" value="37842" />
+        </div>
+        <div class="form-group flex-2">
+          <label>Username</label>
+          <input type="text" id="input-username" placeholder="Your name"
+                autocorrect="off" autocapitalize="off" spellcheck="false" />
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Certificate file (chat_public.pem)</label>
+        <div class="file-row">
+          <input type="text" id="input-cert" placeholder="chat_public.pem" readonly
+                  autocorrect="off" autocapitalize="off" spellcheck="false" />
+          <button class="btn btn-secondary" id="btn-browse-cert">Browse</button>
+        </div>
+      </div>
+
+      <button class="btn btn-primary btn-full" id="btn-connect">
+        Connect
+      </button>
+
+      <button class="btn btn-secondary btn-full" id="btn-save-profile">
+        💾 Save as Profile
+      </button>
+
+      <button class="btn btn-ghost btn-full" id="btn-open-settings">
+        ⚙ Settings
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Main chat screen ─────────────────────────────────────── -->
+  <div id="screen-chat" class="screen">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header" style="--wails-draggable: drag">
+        <span class="sidebar-title">QuietRoom</span>
+        <span id="status-dot" class="status-dot connected" title="Connected"></span>
+      </div>
+
+      <nav class="sidebar-nav">
+        <div class="nav-section-label">CHANNELS</div>
+        <ul id="room-list">
+          <li class="nav-item active" data-room="__lobby__">
+            <span class="nav-icon">💬</span> Lobby
+            <span class="unread-badge hidden" data-room="__lobby__"></span>
+          </li>
+        </ul>
+
+        <button class="btn btn-ghost btn-sm nav-join-btn" id="btn-join-room">+ Join Room</button>
+
+        <div class="nav-section-label" style="margin-top:16px">DIRECT MESSAGES</div>
+        <ul id="dm-list"></ul>
+
+        <button class="btn btn-ghost btn-sm nav-join-btn" id="btn-new-dm">+ New DM</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="sidebar-user">
+          <span class="user-avatar" id="sidebar-avatar">U</span>
+          <span id="sidebar-username">User</span>
+        </div>
+        <button class="btn btn-ghost btn-icon" id="btn-disconnect" title="Disconnect">⏻</button>
+      </div>
+    </aside>
+
+    <!-- Main panel -->
+    <main class="main-panel">
+
+      <!-- Top bar -->
+      <div class="topbar" style="--wails-draggable: drag">
+        <div class="topbar-title" id="topbar-title">Lobby</div>
+        <div class="topbar-actions">
+          <button class="btn btn-ghost btn-sm" id="btn-list-users" title="List all online users"
+                  onclick="App.listUsers()">👥 Users</button>
+          <button class="btn btn-ghost btn-sm" id="btn-list-members" title="List members of current channel"
+                  onclick="App.listMembers()">👁 Members</button>
+          <button class="btn btn-ghost btn-sm" id="btn-list-rooms" title="List rooms"
+                  onclick="App.listRooms()">📋 Rooms</button>
+        </div>
+      </div>
+
+      <!-- Message pane -->
+      <div class="messages" id="messages"></div>
+
+      <!-- File transfer progress bar (hidden by default) -->
+      <div id="transfer-bar" class="transfer-bar hidden">
+        <span id="transfer-label">Sending…</span>
+        <div class="progress-track">
+          <div class="progress-fill" id="transfer-fill"></div>
+        </div>
+        <span id="transfer-pct">0%</span>
+      </div>
+
+      <!-- Input area -->
+      <div class="input-area">
+        <button class="btn btn-ghost btn-icon attach-btn" id="btn-attach" title="Send file">📎</button>
+        <input
+          type="text"
+          id="message-input"
+          class="message-input"
+          placeholder="Message…"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="true"
+        />
+        <button class="btn btn-primary send-btn" id="btn-send">Send</button>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- ── Modals ───────────────────────────────────────────────── -->
+
+  <!-- Join room modal -->
+  <div id="modal-join-room" class="modal-overlay hidden">
+    <div class="modal">
+      <h3>Join a Room</h3>
+      <div class="form-group">
+        <label>Room name (starting with #)</label>
+        <input type="text" id="join-room-name" placeholder="#general"
+              autocorrect="off" autocapitalize="off" spellcheck="false" />
+        <ul id="join-room-suggestions" class="suggestions-list hidden"></ul>
+      </div>
+      <div class="form-group">
+        <label>Password (leave empty if none)</label>
+        <input type="password" id="join-room-password" placeholder="optional" />
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="App.closeModal('modal-join-room')">Cancel</button>
+        <button class="btn btn-primary" id="btn-confirm-join">Join</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- New DM modal -->
+  <div id="modal-new-dm" class="modal-overlay hidden">
+    <div class="modal">
+      <h3>New Direct Message</h3>
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" id="dm-target-username" placeholder="username"
+              autocorrect="off" autocapitalize="off" spellcheck="false" />
+        <ul id="dm-suggestions" class="suggestions-list hidden"></ul>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="App.closeModal('modal-new-dm')">Cancel</button>
+        <button class="btn btn-primary" id="btn-confirm-dm">Open DM</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- File transfer request modal -->
+  <div id="modal-file-request" class="modal-overlay hidden">
+    <div class="modal">
+      <h3>Incoming File Transfer</h3>
+      <div id="file-request-details" class="file-request-info"></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-decline-file">Decline</button>
+        <button class="btn btn-primary" id="btn-accept-file">Accept</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="modal-settings" class="modal-overlay hidden">
+    <div class="modal modal-wide">
+      <h3>Settings</h3>
+
+      <div class="settings-section">
+        <h4>Server Profiles</h4>
+        <div id="profiles-list"></div>
+        <button class="btn btn-ghost btn-sm" id="btn-add-profile">+ Add Profile</button>
+      </div>
+
+      <div class="settings-section">
+        <h4>Privacy</h4>
+        <label class="toggle-row">
+          <span>Decoy traffic</span>
+          <input type="checkbox" id="setting-decoy" />
+        </label>
+        <div class="form-row">
+          <div class="form-group flex-1">
+            <label>Interval (s)</label>
+            <input type="number" id="setting-decoy-interval" min="5" max="300" />
+          </div>
+          <div class="form-group flex-1">
+            <label>Min bytes</label>
+            <input type="number" id="setting-decoy-min" min="10" />
+          </div>
+          <div class="form-group flex-1">
+            <label>Max bytes</label>
+            <input type="number" id="setting-decoy-max" min="10" />
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h4>Notifications</h4>
+        <label class="toggle-row">
+          <span>Sound notifications</span>
+          <input type="checkbox" id="setting-sound" />
+        </label>
+      </div>
+
+      <div class="settings-section">
+        <h4>Downloads</h4>
+        <div class="form-group">
+          <label>Download directory</label>
+          <input type="text" id="setting-download-dir" />
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="App.closeModal('modal-settings')">Cancel</button>
+        <button class="btn btn-primary" id="btn-save-settings">Save</button>
+      </div>
+    </div>
+  </div>
+    <!-- Room list modal -->
+    <div id="modal-room-list" class="modal-overlay hidden">
+      <div class="modal">
+        <h3>Available Rooms</h3>
+        <ul id="room-list-items" style="list-style:none;display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto"></ul>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" onclick="App.closeModal('modal-room-list')">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- User list modal -->
+    <div id="modal-user-list" class="modal-overlay hidden">
+      <div class="modal">
+        <h3>Online Users</h3>
+        <ul id="user-list-items" style="list-style:none;display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto"></ul>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" onclick="App.closeModal('modal-user-list')">Close</button>
+        </div>
+      </div>
+    </div>
+
+</body>
+</html>
