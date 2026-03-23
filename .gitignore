@@ -12,3 +12,4 @@ connector/llm_bot.log
 connector/__pycache__
 quietroom-gui/build
 quietroom-gui/dist
+**/.DS_Store
