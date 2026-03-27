@@ -10,3 +10,6 @@ connector/chat_public.pem
 connector/bot_config.json
 connector/llm_bot.log
 connector/__pycache__
+quietroom-gui/build
+quietroom-gui/dist
+**/.DS_Store

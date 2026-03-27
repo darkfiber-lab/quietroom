@@ -358,19 +358,17 @@ func (s *Server) broadcastToLobby(msg string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for client := range s.clients {
-		if client.currentRoom == "" {
-			encrypted, err := client.encrypt([]byte(msg))
-			if err != nil {
-				continue
-			}
-			packet := s.createObfuscatedPacket(0x01, encrypted)
-			select {
-			case client.outgoing <- packet:
-				client.mu.Lock()
-				client.lastActive = time.Now()
-				client.mu.Unlock()
-			default:
-			}
+		encrypted, err := client.encrypt([]byte(msg))
+		if err != nil {
+			continue
+		}
+		packet := s.createObfuscatedPacket(0x01, encrypted)
+		select {
+		case client.outgoing <- packet:
+			client.mu.Lock()
+			client.lastActive = time.Now()
+			client.mu.Unlock()
+		default:
 		}
 	}
 }
@@ -593,6 +591,10 @@ func (s *Server) handleClient(conn net.Conn) {
 			s.logger.Printf("Connection error from %s: %v", client.username, err)
 			break
 		}
+		client.mu.Lock()
+    	client.lastActive = time.Now()
+    	client.mu.Unlock()
+		
 		if packet.Type == 0x02 {
 			continue
 		}
@@ -618,19 +620,44 @@ func (s *Server) handleClient(conn net.Conn) {
 				continue
 			}
 		}
-		msg := fmt.Sprintf("[%s] %s: %s", time.Now().Format("15:04:05"), client.username, text)
-		client.mu.Lock()
-		currentRoom := client.currentRoom
-		client.mu.Unlock()
+		// Parse optional [#roomname] routing prefix from message
+		targetRoom := ""
+		cleanText := text
+		if strings.HasPrefix(text, "[#") {
+			closeBracket := strings.Index(text, "] ")
+			if closeBracket != -1 {
+				candidate := text[1:closeBracket]
+				if strings.HasPrefix(candidate, "#") {
+					targetRoom = candidate
+					cleanText = text[closeBracket+2:]
+				}
+			}
+		}
 
-		if currentRoom == "" {
+		if targetRoom == "" {
+			msg := fmt.Sprintf("[%s] %s: %s", time.Now().Format("15:04:05"), client.username, cleanText)
 			s.broadcastToLobby(msg)
 		} else {
-			s.roomsMu.RLock()
-			if room, exists := s.rooms[currentRoom]; exists {
-				s.broadcastToRoom(room, msg)
+			client.mu.Lock()
+			isMember := client.rooms[targetRoom]
+			client.mu.Unlock()
+
+			if !isMember {
+				s.sendToClient(client, fmt.Sprintf("*** You are not a member of %s ***", targetRoom))
+				continue
 			}
+
+			s.roomsMu.RLock()
+			room, exists := s.rooms[targetRoom]
 			s.roomsMu.RUnlock()
+
+			if !exists {
+				s.sendToClient(client, fmt.Sprintf("*** Room %s does not exist ***", targetRoom))
+				continue
+			}
+
+			msg := fmt.Sprintf("[%s] [%s] %s: %s", time.Now().Format("15:04:05"), targetRoom, client.username, cleanText)
+			s.broadcastToRoom(room, msg)
 		}
 	}
 	s.leave <- client
@@ -659,6 +686,9 @@ func (s *Server) handleCommand(client *Client, text string) bool {
 	case "/users":
 		s.handleListUsers(client)
 		return true
+	case "/members":
+		s.handleListMembers(client, parts)
+		return true
 	case "/file":
 		s.handleFileTransferInit(client, parts)
 		return true
@@ -677,16 +707,17 @@ func (s *Server) handleCommand(client *Client, text string) bool {
 func (s *Server) sendHelp(client *Client) {
 	help := `
 Available Commands:
-  /help           - Show this help message
-  /msg <user> <msg> - Send private message to a user
-  /join <#room> [pw] - Join a chat room (with optional password)
-  /leave <#room>    - Leave a chat room
-  /rooms          - List all available rooms
-  /users          - List users in current room or online
-  /file <user> <path/filename> Send file to a user
-  /accept <id>      - Accept incoming file transfer
-  /decline <id>     - Decline incoming file transfer
-  /quit           - Disconnect from server
+  /help           				- Show this help message
+  /msg <user> <msg> 			- Send private message to a user
+  /join <#room> [pw] 			- Join a chat room (with optional password)
+  /leave <#room>    			- Leave a chat room
+  /rooms          				- List all available rooms
+  /users            			- List all users currently online
+  /members <#room|lobby> 		- List members of a room or the lobby
+  /file <user> <path/filename> 	- Send file to a user
+  /accept <id>      			- Accept incoming file transfer
+  /decline <id>     			- Decline incoming file transfer
+  /quit             			- Disconnect from server
 
 Room names must start with # (e.g., #general, #random)
 Private messages are not logged and only sent if recipient is online.
@@ -834,27 +865,83 @@ func (s *Server) handleListRooms(client *Client) {
 func (s *Server) handleListUsers(client *Client) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var userList strings.Builder
-	if client.currentRoom != "" {
-		userList.WriteString(fmt.Sprintf("Users in %s:\n", client.currentRoom))
-		s.roomsMu.RLock()
-		if room, exists := s.rooms[client.currentRoom]; exists {
-			room.mu.RLock()
-			for member := range room.members {
-				userList.WriteString(fmt.Sprintf("  %s\n", member.username))
-			}
-			room.mu.RUnlock()
-		}
-		s.roomsMu.RUnlock()
-	} else {
-		userList.WriteString("Online Users (Lobby):\n")
+
+	var names []string
+	for c := range s.clients {
+		names = append(names, c.username)
+	}
+
+	msg := fmt.Sprintf("Online Users (%d):\n  %s", len(names), strings.Join(names, "\n  "))
+	s.sendToClient(client, msg)
+}
+
+func (s *Server) handleListMembers(client *Client, parts []string) {
+	if len(parts) < 2 {
+		s.sendToClient(client, "Usage: /members <#roomname|lobby>")
+		return
+	}
+
+	target := strings.ToLower(parts[1])
+
+	// Lobby members
+	if target == "lobby" {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		var names []string
 		for c := range s.clients {
-			if c.currentRoom == "" {
-				userList.WriteString(fmt.Sprintf("  %s\n", c.username))
+			c.mu.Lock()
+			inNoRooms := len(c.rooms) == 0
+			c.mu.Unlock()
+			if inNoRooms {
+				names = append(names, c.username)
 			}
+		}
+		msg := fmt.Sprintf("Members of lobby (%d):\n  %s", len(names), strings.Join(names, "\n  "))
+		s.sendToClient(client, msg)
+		return
+	}
+
+	// Room members
+	roomName := parts[1] // preserve original case for room lookup
+	if !strings.HasPrefix(roomName, "#") {
+		s.sendToClient(client, "Usage: /members <#roomname|lobby>")
+		return
+	}
+
+	s.roomsMu.RLock()
+	room, exists := s.rooms[roomName]
+	s.roomsMu.RUnlock()
+
+	if !exists {
+		s.sendToClient(client, "Room not found or access denied.")
+		return
+	}
+
+	// Password-protected room — check membership
+	room.mu.RLock()
+	isPasswordProtected := room.passwordHash != ""
+	room.mu.RUnlock()
+
+	if isPasswordProtected {
+		client.mu.Lock()
+		isMember := client.rooms[roomName]
+		client.mu.Unlock()
+		if !isMember {
+			// Do not confirm room exists
+			s.sendToClient(client, "Room not found or access denied.")
+			return
 		}
 	}
-	s.sendToClient(client, userList.String())
+
+	room.mu.RLock()
+	var names []string
+	for member := range room.members {
+		names = append(names, member.username)
+	}
+	room.mu.RUnlock()
+
+	msg := fmt.Sprintf("Members of %s (%d):\n  %s", roomName, len(names), strings.Join(names, "\n  "))
+	s.sendToClient(client, msg)
 }
 
 func (s *Server) handleFileTransferInit(client *Client, parts []string) {
@@ -1143,6 +1230,40 @@ func (s *Server) Shutdown() {
 	fmt.Println("✓ Server stopped")
 }
 
+func (s *Server) startIdleChecker() {
+    go func() {
+        ticker := time.NewTicker(60 * time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-s.shutdown:
+                return
+            case <-ticker.C:
+                s.mu.RLock()
+                stale := []*Client{}
+                for client := range s.clients {
+                    client.mu.Lock()
+                    idle := time.Since(client.lastActive)
+                    client.mu.Unlock()
+                    if idle > 3*time.Minute {
+                        stale = append(stale, client)
+                    }
+                }
+                s.mu.RUnlock()
+
+                for _, client := range stale {
+                    s.logSecurity(
+                        "Closing stale connection for %s (idle %.0fs)",
+                        client.username,
+                        time.Since(client.lastActive).Seconds(),
+                    )
+                    client.conn.Close()
+                }
+            }
+        }
+    }()
+}
+
 func main() {
 	server, err := NewServer()
 	if err != nil {
@@ -1160,6 +1281,7 @@ func main() {
 	}()
 
 	go server.run()
+	server.startIdleChecker()
 
 	cert, err := tls.LoadX509KeyPair("chat_public.pem", "server_private.pem")
 	if err != nil {

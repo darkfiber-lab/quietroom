@@ -38,7 +38,7 @@ else
 fi
 
 # Build configuration
-VERSION="1.0.0"
+VERSION="1.2.0"
 BUILD_DIR="./build"
 SERVER_SRC="quietroom_server.go"
 CLIENT_SRC="quietroom_client.go"

@@ -1,0 +1,270 @@
+name: Build GUI Client
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
+        default: ''
+      is_release:
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+
+  # ── Linux builds ───────────────────────────────────────────────
+  build-linux:
+    name: Build Linux ${{ matrix.goarch }}
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            target: linux-amd64
+          - goarch: arm64
+            target: linux-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [ -z "$VERSION" ]; then
+              VERSION="dev-$(git rev-parse --short HEAD)"
+            else
+              VERSION="${VERSION#v}"
+            fi
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Install system dependencies (amd64)
+        if: matrix.goarch == 'amd64'
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev
+
+      - name: Install system dependencies (arm64 cross)
+        if: matrix.goarch == 'arm64'
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          sudo apt update
+          sudo apt install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libgtk-3-dev:arm64 \
+            libwebkit2gtk-4.0-dev:arm64
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Install frontend dependencies
+        run: cd quietroom-gui/frontend && npm install
+
+      - name: Build (amd64)
+        if: matrix.goarch == 'amd64'
+        run: |
+          cd quietroom-gui
+          wails build \
+            -platform linux/amd64 \
+            -o quietroom_client_gui \
+            -ldflags "-X main.Version=${{ steps.version.outputs.version }}"
+          mkdir -p dist/${{ matrix.target }}
+          cp build/bin/quietroom_client_gui \
+            dist/${{ matrix.target }}/quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}
+
+      - name: Build (arm64 cross)
+        if: matrix.goarch == 'arm64'
+        env:
+          CC: aarch64-linux-gnu-gcc
+          CXX: aarch64-linux-gnu-g++
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+        run: |
+          cd quietroom-gui
+          GOOS=linux GOARCH=arm64 \
+          CC=$CC CXX=$CXX \
+          wails build \
+            -platform linux/arm64 \
+            -o quietroom_client_gui \
+            -ldflags "-X main.Version=${{ steps.version.outputs.version }}"
+          mkdir -p dist/${{ matrix.target }}
+          cp build/bin/quietroom_client_gui \
+            dist/${{ matrix.target }}/quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quietroom-gui-${{ matrix.target }}
+          path: quietroom-gui/dist/${{ matrix.target }}/
+          retention-days: 7
+
+  # ── macOS builds ───────────────────────────────────────────────
+  build-macos:
+    name: Build macOS ${{ matrix.goarch }}
+    runs-on: macos-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            target: darwin-amd64
+          - goarch: arm64
+            target: darwin-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [ -z "$VERSION" ]; then
+              VERSION="dev-$(git rev-parse --short HEAD)"
+            else
+              VERSION="${VERSION#v}"
+            fi
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Install frontend dependencies
+        run: cd quietroom-gui/frontend && npm install
+
+      - name: Build
+        run: |
+          cd quietroom-gui
+          GOOS=darwin GOARCH=${{ matrix.goarch }} \
+          wails build \
+            -platform darwin/${{ matrix.goarch }} \
+            -o quietroom_client_gui \
+            -ldflags "-X main.Version=${{ steps.version.outputs.version }}"
+          mkdir -p dist/${{ matrix.target }}
+          cp -r build/bin/QuietRoom.app \
+            "dist/${{ matrix.target }}/quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}.app"
+          cd dist/${{ matrix.target }}
+          zip -r \
+            "quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}.zip" \
+            "quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}.app"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quietroom-gui-${{ matrix.target }}
+          path: quietroom-gui/dist/${{ matrix.target }}/*.zip
+          retention-days: 7
+
+  # ── Windows build ───────────────────────────────────────────────
+  build-windows:
+    name: Build Windows amd64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [ -z "$VERSION" ]; then
+              VERSION="dev-$(git rev-parse --short HEAD)"
+            else
+              VERSION="${VERSION#v}"
+            fi
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Install frontend dependencies
+        run: cd quietroom-gui/frontend && npm install
+
+      - name: Build
+        shell: bash
+        run: |
+          cd quietroom-gui
+          GOOS=windows GOARCH=amd64 \
+          wails build \
+            -platform windows/amd64 \
+            -o quietroom_client_gui \
+            -ldflags "-X main.Version=${{ steps.version.outputs.version }}"
+          mkdir -p dist/windows-amd64
+          if [ -f build/bin/quietroom_client_gui.exe ]; then
+            SRC="build/bin/quietroom_client_gui.exe"
+          else
+            SRC="build/bin/quietroom_client_gui"
+          fi
+          cp "$SRC" \
+            "dist/windows-amd64/quietroom_client_gui-windows-amd64-v${{ steps.version.outputs.version }}.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quietroom-gui-windows-amd64
+          path: quietroom-gui/dist/windows-amd64/
+          retention-days: 7
