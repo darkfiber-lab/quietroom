@@ -245,7 +245,7 @@ build_platform() {
 
 build_all() {
     print_msg "$CYAN" "╔════════════════════════════════════════════════════════════════╗"
-    print_msg "$CYAN" "║         Building QuietRoom GUI for All Platforms              ║"
+    print_msg "$CYAN" "║         Building QuietRoom GUI for All Platforms               ║"
     print_msg "$CYAN" "╚════════════════════════════════════════════════════════════════╝"
     print_msg "$YELLOW" "⚠  Cross-compilation may fail — see -help for details"
     echo ""

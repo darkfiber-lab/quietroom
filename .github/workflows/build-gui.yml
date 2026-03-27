@@ -254,7 +254,12 @@ jobs:
             -o quietroom_client_gui \
             -ldflags "-X main.Version=${{ steps.version.outputs.version }}"
           mkdir -p dist/windows-amd64
-          cp build/bin/quietroom_client_gui.exe \
+          if [ -f build/bin/quietroom_client_gui.exe ]; then
+            SRC="build/bin/quietroom_client_gui.exe"
+          else
+            SRC="build/bin/quietroom_client_gui"
+          fi
+          cp "$SRC" \
             "dist/windows-amd64/quietroom_client_gui-windows-amd64-v${{ steps.version.outputs.version }}.exe"
 
       - name: Upload artifact
