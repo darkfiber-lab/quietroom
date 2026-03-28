@@ -5,11 +5,12 @@ server_config.json
 server_private.pem
 chat_public.pem
 downloads/
-build/
+build
 connector/chat_public.pem
 connector/bot_config.json
 connector/llm_bot.log
 connector/__pycache__
-quietroom-gui/build
+quietroom-gui/build/bin
 quietroom-gui/dist
+.DS_Store
 **/.DS_Store
