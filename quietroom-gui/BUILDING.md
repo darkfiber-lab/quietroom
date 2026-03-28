@@ -199,7 +199,7 @@ wails build
 GOOS=darwin GOARCH=arm64 wails build -platform darwin/arm64
 
 # Build with version info
-wails build -ldflags "-X main.Version=1.2.0"
+wails build -ldflags "-X main.Version=1.2.1"
 ```
 
 Wails places the output in `build/bin/`:
@@ -217,12 +217,12 @@ The build script copies completed binaries to `dist/<platform>/` with version-st
 ```
 dist/
   darwin-arm64/
-    quietroom_client_gui-darwin-arm64-v1.2.0.app
-    quietroom_client_gui-darwin-arm64-v1.2.0.zip   ← macOS zip for distribution
+    quietroom_client_gui-darwin-arm64-v1.2.1.app
+    quietroom_client_gui-darwin-arm64-v1.2.1.zip   ← macOS zip for distribution
   windows-amd64/
-    quietroom_client_gui-windows-amd64-v1.2.0.exe
+    quietroom_client_gui-windows-amd64-v1.2.1.exe
   linux-amd64/
-    quietroom_client_gui-linux-amd64-v1.2.0
+    quietroom_client_gui-linux-amd64-v1.2.1
 ```
 
 ---
@@ -275,13 +275,13 @@ sudo pacman -S webkit2gtk
 The version string is injected at build time via ldflags. To update the version, edit the `VERSION` variable at the top of `build.sh`:
 
 ```sh
-VERSION="1.2.0"
+VERSION="1.2.1"
 ```
 
 Or pass it directly to Wails:
 
 ```bash
-wails build -ldflags "-X main.Version=1.2.0"
+wails build -ldflags "-X main.Version=1.2.1"
 ```
 
 ---

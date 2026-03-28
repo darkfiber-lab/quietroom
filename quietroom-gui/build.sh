@@ -32,7 +32,7 @@ else
     RED="" GREEN="" YELLOW="" BLUE="" CYAN="" NC=""
 fi
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 BUILD_DIR="./dist"
 BINARY_NAME="quietroom_client_gui"
 
