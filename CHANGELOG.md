@@ -7,17 +7,17 @@
 
 ### Added
 
-GUI client (quietroom-gui/) — native desktop application built with Go and Wails, targeting macOS, Windows and Linux. Features a dark-themed interface with sidebar channel navigation, multi-room support, DM threads, file transfer UI with progress bar and hash verification, server profiles, settings panel, and sound notifications
-Multi-room architecture — clients can now join multiple rooms simultaneously and receive messages from all of them without leaving. Messages are routed via a [#roomname] prefix in the message body rather than server-side currentRoom tracking, allowing the GUI to switch between channels without generating join/leave noise
-Room message prefix — server now includes [#roomname] in broadcasts from rooms, enabling clients to correctly route incoming messages to the right channel regardless of which channel is currently viewed
-/members command — returns the member list for a specific room or the lobby. Password-protected rooms return access denied to non-members without confirming the room exists. Usage: /members #roomname or /members lobby
-Updated /users command — now returns all connected users globally regardless of which room they are in, rather than only users in the current context
-Idle connection detection — server now closes stale connections after 3 minutes of inactivity using an application-level idle checker, preventing hung usernames after ungraceful network disconnections
-GUI server profiles — connection settings (host, port, username, certificate path) can be saved as named profiles and selected from a dropdown on the login screen
-GUI autocomplete — Join Room and New DM dialogs fetch live room and user lists from the server when opened and offer autocomplete suggestions as you type
-Python connector updates — quietroom_connector.py updated to support the new routing protocol with send_room_message(), on_room_message(), on_system_message(), list_users(), list_members(), list_rooms(), joined_rooms property, and automatic keepalive when decoy traffic is disabled
-GitHub Actions workflows — CI/CD pipelines for building server, CLI client, and GUI client across all supported platforms on tag push or manual trigger
-GUI build script (quietroom-gui/build.sh) — standalone build script for the GUI with platform detection, dependency checking, and automatic zip packaging for macOS distribution
+- **GUI client (quietroom-gui/)** — native desktop application built with Go and Wails, targeting macOS, Windows and Linux. Features a dark-themed interface with sidebar channel navigation, multi-room support, DM threads, file transfer UI with progress bar and hash verification, server profiles, settings panel, and sound notifications
+- **Multi-room architecture** — clients can now join multiple rooms simultaneously and receive messages from all of them without leaving. Messages are routed via a [#roomname] prefix in the message body rather than server-side currentRoom tracking, allowing the GUI to switch between channels without generating join/leave noise
+- **Room message prefix** — server now includes [#roomname] in broadcasts from rooms, enabling clients to correctly route incoming messages to the right channel regardless of which channel is currently viewed
+- **/members command** — returns the member list for a specific room or the lobby. Password-protected rooms return access denied to non-members without confirming the room exists. Usage: /members #roomname or /members lobby
+- **Updated /users command** — now returns all connected users globally regardless of which room they are in, rather than only users in the current context
+- **Idle connection detection** — server now closes stale connections after 3 minutes of inactivity using an application-level idle checker, preventing hung usernames after ungraceful network disconnections
+- **GUI server profiles** — connection settings (host, port, username, certificate path) can be saved as named profiles and selected from a dropdown on the login screen
+- **GUI autocomplete** — Join Room and New DM dialogs fetch live room and user lists from the server when opened and offer autocomplete suggestions as you type
+- **Python connector updates** — quietroom_connector.py updated to support the new routing protocol with send_room_message(), on_room_message(), on_system_message(), list_users(), list_members(), list_rooms(), joined_rooms property, and automatic keepalive when decoy traffic is disabled
+- **GitHub Actions workflows** — CI/CD pipelines for building server, CLI client, and GUI client across all supported platforms on tag push or manual trigger
+- **GUI build script** (quietroom-gui/build.sh) — standalone build script for the GUI with platform detection, dependency checking, and automatic zip packaging for macOS distribution
 
 ## [1.1.0] - 2026-02-28
 
