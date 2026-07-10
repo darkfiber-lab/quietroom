@@ -14,12 +14,10 @@
 
 module mycoms/server
 
-go 1.24.0
+go 1.25.0
 
-toolchain go1.24.11
+require golang.org/x/crypto v0.52.0
 
-require golang.org/x/crypto v0.46.0
+require golang.org/x/term v0.43.0
 
-require golang.org/x/term v0.38.0
-
-require golang.org/x/sys v0.39.0 // indirect
+require golang.org/x/sys v0.45.0 // indirect
