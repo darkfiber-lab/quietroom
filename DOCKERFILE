@@ -29,28 +29,35 @@
 #     quietroom-server
 #
 # The server writes only to /app, so a read-only root filesystem works.
+# The final image contains no OS packages and no shell: only the binary.
+# Use `docker logs` for output; `docker exec` has nothing to run.
 # Restarting the container issues a new quietroom_access.pem (by design).
 
-FROM alpine:3.24
+# ── Preparation stage: binary permissions and an empty, user-owned data dir ──
+# alpine:3.24, pinned by digest (multi-arch index)
+FROM alpine@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS prep
 
-# Non-root user. uid/gid 1000 matches the typical first user on the host, so
-# files in the data volume stay accessible to the host account.
-RUN addgroup -g 1000 quietroom && \
-    adduser -D -H -s /sbin/nologin -u 1000 -G quietroom quietroom
+COPY quietroom_server /out/usr/local/bin/quietroom_server
+RUN chmod 0755 /out/usr/local/bin/quietroom_server && \
+    mkdir -p /out/app && chown 1000:1000 /out/app && chmod 0700 /out/app
+
+# ── Final image: static binary only, nothing else ─────────────────────────
+FROM scratch
 
 # The binary lives outside the data volume, so rebuilding the image really
 # updates the server (a binary inside /app would be hidden by the volume).
-COPY quietroom_server /usr/local/bin/quietroom_server
-RUN chmod 0755 /usr/local/bin/quietroom_server
+COPY --from=prep /out/usr/local/bin/quietroom_server /usr/local/bin/quietroom_server
 
-# Data directory (volume):
+# Data directory (volume), owned by uid/gid 1000 (typical first user on the
+# host, so the files stay accessible to the host account):
 #   - server_config.json (created with defaults on first start)
 #   - quietroom_access.pem (SECRET, regenerated on every start)
 #   - chat_server.log, security.log
+COPY --from=prep --chown=1000:1000 /out/app /app
 WORKDIR /app
-RUN chown quietroom:quietroom /app
 VOLUME ["/app"]
 
+# Numeric user: there is no /etc/passwd in a scratch image.
 USER 1000:1000
 EXPOSE 37842
 

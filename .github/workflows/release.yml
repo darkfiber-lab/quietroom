@@ -23,9 +23,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Get version
         id: version
@@ -45,8 +46,11 @@ jobs:
             VERSION="${TAG#v}-pre.${COMMITS}+${SHORT}"
           fi
 
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          case "${VERSION}" in
+            *[!0-9A-Za-z.+-]*) echo "Invalid version string: ${VERSION}"; exit 1 ;;
+          esac
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${VERSION}"
 
   # ── Build CLI and server ────────────────────────────────────────
@@ -80,23 +84,27 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download all CLI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts/cli/
           pattern: quietroom-cli-*
           merge-multiple: false
 
       - name: Download all GUI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts/gui/
           pattern: quietroom-gui-*
           merge-multiple: false
 
       - name: Prepare release files
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           mkdir -p release
 
@@ -105,7 +113,7 @@ jobs:
             platform=$(basename "$dir")
             platform="${platform#quietroom-cli-}"
             if [ -d "$dir" ]; then
-              zip -j "release/quietroom-cli-${platform}-v${{ needs.version.outputs.version }}.zip" "$dir"/*
+              zip -j "release/quietroom-cli-${platform}-v${VERSION}.zip" "$dir"/*
             fi
           done
 
@@ -123,15 +131,16 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: 'release/*'
 
       - name: Extract changelog for this version
         id: changelog
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           # Extract the section for this version from CHANGELOG.md if it exists
-          VERSION="${{ needs.version.outputs.version }}"
           if [ -f CHANGELOG.md ]; then
             # Get content between this version header and the next --- separator
             NOTES=$(awk "/## \[${VERSION}\]/{found=1; next} found && /^---/{exit} found{print}" CHANGELOG.md)
@@ -145,13 +154,25 @@ jobs:
           echo "$NOTES" > release_notes.md
           cat release_notes.md
 
+      # Uses the GitHub CLI preinstalled on the runner instead of a third-party
+      # action, so no external code runs with the release-writing token.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: QuietRoom v${{ needs.version.outputs.version }}
-          body_path: release_notes.md
-          files: release/*
-          draft: false
-          prerelease: ${{ contains(needs.version.outputs.version, '-pre.') || contains(needs.version.outputs.version, '-rc') || contains(needs.version.outputs.version, '-beta') || contains(needs.version.outputs.version, '-alpha') }}
-          make_latest: ${{ !contains(needs.version.outputs.version, '-pre.') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          PRERELEASE=""
+          case "${VERSION}" in
+            *-pre.*|*-rc*|*-beta*|*-alpha*) PRERELEASE="--prerelease" ;;
+          esac
+          LATEST="--latest"
+          case "${VERSION}" in
+            *-pre.*) LATEST="--latest=false" ;;
+          esac
+          gh release create "${TAG}" release/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "QuietRoom v${VERSION}" \
+            --notes-file release_notes.md \
+            ${PRERELEASE} ${LATEST}

@@ -104,7 +104,7 @@ ${GREEN}CROSS-COMPILATION NOTE:${NC}
 ${GREEN}REQUIREMENTS:${NC}
   - Go 1.21 or higher
   - Node.js 18 or higher
-  - Wails v2: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+  - Wails v2: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
   - Linux only: libgtk-3-dev libwebkit2gtk-4.0-dev
 
 EOF
@@ -127,7 +127,7 @@ check_deps() {
 
     if ! command -v wails >/dev/null 2>&1; then
         print_msg "$RED" "✗ Wails is not installed"
-        print_msg "$YELLOW" "  Install: go install github.com/wailsapp/wails/v2/cmd/wails@latest"
+        print_msg "$YELLOW" "  Install: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0"
         exit 1
     fi
     print_msg "$GREEN" "  ✓ $(wails version 2>/dev/null || echo 'Wails installed')"
@@ -135,7 +135,7 @@ check_deps() {
     # Install frontend deps if needed
     if [ ! -d "frontend/node_modules" ]; then
         print_msg "$YELLOW" "  Installing frontend dependencies..."
-        cd frontend && npm install && cd ..
+        cd frontend && npm ci && cd ..
         print_msg "$GREEN" "  ✓ Frontend dependencies installed"
     fi
 }

@@ -52,7 +52,7 @@ npm --version
 ### Wails
 
 ```bash
-go install github.com/wailsapp/wails/v2/cmd/wails@latest
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
 ```
 
 Make sure `~/go/bin` is in your `PATH`:
@@ -152,7 +152,7 @@ If `frontend/node_modules` doesn't exist yet, install dependencies manually:
 
 ```bash
 cd frontend
-npm install
+npm ci   # installs the exact versions from package-lock.json
 cd ..
 ```
 

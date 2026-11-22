@@ -16,7 +16,7 @@ A military-grade encrypted chat server with end-to-end encryption, perfect forwa
 
 ### Prerequisites
 
-- Go 1.16 or higher
+- Go 1.26 or higher (only needed to build from source)
 - Linux/Unix, macOS, or Windows
 
 ### Building

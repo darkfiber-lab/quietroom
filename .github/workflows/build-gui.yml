@@ -40,26 +40,29 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'   # latest 1.26 patch release (security fixes)
           check-latest: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
       - name: Determine version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION}"
           else
             VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
             if [ -z "$VERSION" ]; then
@@ -68,7 +71,10 @@ jobs:
               VERSION="${VERSION#v}"
             fi
           fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          case "${VERSION}" in
+            *[!0-9A-Za-z.+-]*) echo "Invalid version string: ${VERSION}"; exit 1 ;;
+          esac
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies (amd64)
         if: matrix.goarch == 'amd64'
@@ -93,22 +99,25 @@ jobs:
             libwebkit2gtk-4.0-dev:arm64
 
       - name: Install Wails
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0   # same version as quietroom-gui/go.mod
 
       - name: Install frontend dependencies
-        run: cd quietroom-gui/frontend && npm install
+        run: cd quietroom-gui/frontend && npm ci
 
       - name: Build (amd64)
         if: matrix.goarch == 'amd64'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
           cd quietroom-gui
           wails build \
             -platform linux/amd64 \
             -o quietroom_client_gui \
-            -ldflags "-X main.Version=${{ steps.version.outputs.version }}"
-          mkdir -p dist/${{ matrix.target }}
+            -ldflags "-X main.Version=${VERSION}"
+          mkdir -p "dist/${TARGET}"
           cp build/bin/quietroom_client_gui \
-            dist/${{ matrix.target }}/quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}
+            "dist/${TARGET}/quietroom_client_gui-${TARGET}-v${VERSION}"
 
       - name: Build (arm64 cross)
         if: matrix.goarch == 'arm64'
@@ -116,6 +125,8 @@ jobs:
           CC: aarch64-linux-gnu-gcc
           CXX: aarch64-linux-gnu-g++
           PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
           cd quietroom-gui
           GOOS=linux GOARCH=arm64 \
@@ -123,13 +134,13 @@ jobs:
           wails build \
             -platform linux/arm64 \
             -o quietroom_client_gui \
-            -ldflags "-X main.Version=${{ steps.version.outputs.version }}"
-          mkdir -p dist/${{ matrix.target }}
+            -ldflags "-X main.Version=${VERSION}"
+          mkdir -p "dist/${TARGET}"
           cp build/bin/quietroom_client_gui \
-            dist/${{ matrix.target }}/quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}
+            "dist/${TARGET}/quietroom_client_gui-${TARGET}-v${VERSION}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: quietroom-gui-${{ matrix.target }}
           path: quietroom-gui/dist/${{ matrix.target }}/
@@ -151,26 +162,29 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'   # latest 1.26 patch release (security fixes)
           check-latest: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
       - name: Determine version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION}"
           else
             VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
             if [ -z "$VERSION" ]; then
@@ -179,32 +193,39 @@ jobs:
               VERSION="${VERSION#v}"
             fi
           fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          case "${VERSION}" in
+            *[!0-9A-Za-z.+-]*) echo "Invalid version string: ${VERSION}"; exit 1 ;;
+          esac
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Install Wails
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0   # same version as quietroom-gui/go.mod
 
       - name: Install frontend dependencies
-        run: cd quietroom-gui/frontend && npm install
+        run: cd quietroom-gui/frontend && npm ci
 
       - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.goarch }}
         run: |
           cd quietroom-gui
-          GOOS=darwin GOARCH=${{ matrix.goarch }} \
+          GOOS=darwin GOARCH="${ARCH}" \
           wails build \
-            -platform darwin/${{ matrix.goarch }} \
+            -platform "darwin/${ARCH}" \
             -o quietroom_client_gui \
-            -ldflags "-X main.Version=${{ steps.version.outputs.version }}"
-          mkdir -p dist/${{ matrix.target }}
+            -ldflags "-X main.Version=${VERSION}"
+          mkdir -p "dist/${TARGET}"
           cp -r build/bin/QuietRoom.app \
-            "dist/${{ matrix.target }}/quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}.app"
-          cd dist/${{ matrix.target }}
+            "dist/${TARGET}/quietroom_client_gui-${TARGET}-v${VERSION}.app"
+          cd "dist/${TARGET}"
           zip -r \
-            "quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}.zip" \
-            "quietroom_client_gui-${{ matrix.target }}-v${{ steps.version.outputs.version }}.app"
+            "quietroom_client_gui-${TARGET}-v${VERSION}.zip" \
+            "quietroom_client_gui-${TARGET}-v${VERSION}.app"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: quietroom-gui-${{ matrix.target }}
           path: quietroom-gui/dist/${{ matrix.target }}/*.zip
@@ -217,27 +238,30 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'   # latest 1.26 patch release (security fixes)
           check-latest: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
       - name: Determine version
         id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION}"
           else
             VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
             if [ -z "$VERSION" ]; then
@@ -246,23 +270,28 @@ jobs:
               VERSION="${VERSION#v}"
             fi
           fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          case "${VERSION}" in
+            *[!0-9A-Za-z.+-]*) echo "Invalid version string: ${VERSION}"; exit 1 ;;
+          esac
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Install Wails
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0   # same version as quietroom-gui/go.mod
 
       - name: Install frontend dependencies
-        run: cd quietroom-gui/frontend && npm install
+        run: cd quietroom-gui/frontend && npm ci
 
       - name: Build
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           cd quietroom-gui
           GOOS=windows GOARCH=amd64 \
           wails build \
             -platform windows/amd64 \
             -o quietroom_client_gui \
-            -ldflags "-X main.Version=${{ steps.version.outputs.version }}"
+            -ldflags "-X main.Version=${VERSION}"
           mkdir -p dist/windows-amd64
           if [ -f build/bin/quietroom_client_gui.exe ]; then
             SRC="build/bin/quietroom_client_gui.exe"
@@ -270,10 +299,10 @@ jobs:
             SRC="build/bin/quietroom_client_gui"
           fi
           cp "$SRC" \
-            "dist/windows-amd64/quietroom_client_gui-windows-amd64-v${{ steps.version.outputs.version }}.exe"
+            "dist/windows-amd64/quietroom_client_gui-windows-amd64-v${VERSION}.exe"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: quietroom-gui-windows-amd64
           path: quietroom-gui/dist/windows-amd64/

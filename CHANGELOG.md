@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Security policy** — `SECURITY.md`; vulnerabilities can be reported privately via GitHub's "Report a vulnerability"
+
+### Changed
+- **Docker image** — the final image is built `FROM scratch` and contains only the static server binary (no OS packages, no shell); the preparation stage's base image is pinned by digest
+- **Dependencies** — `golang.org/x/crypto` v0.58.0, `golang.org/x/term` v0.47.0; minimum Go version 1.26
+- **CI** — all GitHub Actions pinned to commit SHAs; workflow inputs passed via environment variables; checkouts no longer persist credentials; releases are published with the GitHub CLI instead of a third-party action; Wails CLI pinned to v2.13.0; `npm ci` instead of `npm install`; `go mod download` + `go mod verify` instead of `go mod tidy` during builds
+
+---
+
 ## [2.1.1] - 2026-11-22
 
 ### Added
