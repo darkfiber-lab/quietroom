@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+- **Security scanning in CI** — govulncheck (server, CLI client, GUI), Trivy (Docker image), zizmor (workflows) and OpenSSF Scorecard run on pushes, pull requests and weekly; results go to GitHub code scanning
+
 ### Changed
+- **Build toolchain** — CLI, server and GUI builds use the latest Go 1.26 patch release (`GOTOOLCHAIN=local`) instead of the minimum Go version declared in `go.mod`
 - **Docker image** — based on Alpine 3.24 without extra packages; the server binary now lives in `/usr/local/bin` (outside the data volume) so rebuilding the image updates the server; the health check was removed; the file documents a hardened `docker run` command (read-only filesystem, no capabilities, resource and log limits)
 
 ---

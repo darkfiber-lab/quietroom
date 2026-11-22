@@ -18,6 +18,10 @@ on:
 permissions:
   contents: read
 
+# Never let go.mod's minimum version silently select an old, unpatched Go.
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -66,7 +70,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.26.x'   # latest 1.26 patch release (security fixes)
+          check-latest: true
 
       - name: Determine version
         id: version
