@@ -90,7 +90,7 @@ class BotConfig:
     # Passed through to ConnectorConfig
     server_host: str = "localhost"
     server_port: int = 37842
-    cert_file: str = "chat_public.pem"
+    cert_file: str = "quietroom_access.pem"
     username: str = "LLMBot"
     decoy_traffic: bool = True
     decoy_interval: int = 30
@@ -169,7 +169,7 @@ def load_config(path: str = "bot_config.json") -> BotConfig:
     cfg = BotConfig(
         server_host=d.get("server_host", "localhost"),
         server_port=d.get("server_port", 37842),
-        cert_file=d.get("cert_file", "chat_public.pem"),
+        cert_file=d.get("cert_file", "quietroom_access.pem"),
         username=d.get("username", "LLMBot"),
         decoy_traffic=d.get("decoy_traffic", True),
         decoy_interval=d.get("decoy_interval", 30),

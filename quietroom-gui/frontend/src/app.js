@@ -74,7 +74,7 @@ export const App = {
         const host     = document.getElementById('input-host').value.trim()
         const port     = parseInt(document.getElementById('input-port').value) || 37842
         const username = document.getElementById('input-username').value.trim()
-        const cert     = document.getElementById('input-cert').value.trim() || 'chat_public.pem'
+        const cert     = document.getElementById('input-cert').value.trim() || 'quietroom_access.pem'
         const errBox   = document.getElementById('connect-error')
 
         if (!host || !username) {
@@ -151,7 +151,7 @@ export const App = {
     const host     = document.getElementById('input-host').value.trim()
     const port     = parseInt(document.getElementById('input-port').value)
     const username = document.getElementById('input-username').value.trim()
-    const cert     = document.getElementById('input-cert').value.trim() || 'chat_public.pem'
+    const cert     = document.getElementById('input-cert').value.trim() || 'quietroom_access.pem'
     const errBox   = document.getElementById('connect-error')
     const btn      = document.getElementById('btn-connect')
 

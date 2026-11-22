@@ -46,11 +46,11 @@ This project does not seek to compete with large-scale platforms. It offers some
    ./quietroom_server
    ```
 
-2. Securely distribute `chat_public.pem` to your clients
+2. Securely distribute `quietroom_access.pem` to your clients (physical media). The file is **secret**: it contains the access key, and anyone holding it can join. Every server restart creates a new access file and invalidates the previous one.
 
 ### Client Setup
 
-1. Obtain `chat_public.pem` from your server administrator
+1. Obtain `quietroom_access.pem` from your server administrator
 
 2. Build and run the client:
    ```bash
@@ -73,8 +73,9 @@ For detailed setup instructions, configuration options, and troubleshooting:
 
 1. **TLS 1.3 Transport Layer** - Encrypts all network traffic between client and server
 2. **RSA-4096 Authentication** - Server proves its identity to prevent man-in-the-middle attacks
-3. **Diffie-Hellman Key Exchange** - Generates unique session keys for perfect forward secrecy
-4. **AES-256-GCM Session Encryption** - Encrypts all messages with authenticated encryption
+3. **Access Key (mutual TLS)** - Clients must present the master access key from `quietroom_access.pem`; connections without it are refused during the TLS handshake
+4. **Diffie-Hellman Key Exchange** - Generates unique session keys for perfect forward secrecy
+5. **AES-256-GCM Session Encryption** - Encrypts all messages with authenticated encryption
 
 ### Traffic Protection
 
