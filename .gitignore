@@ -18,3 +18,5 @@ quietroom-gui/dist
 quietroom_access.pem
 **/quietroom_access.pem
 .quietroom_access.pem.tmp-*
+# Frontend dependencies
+quietroom-gui/frontend/node_modules/
