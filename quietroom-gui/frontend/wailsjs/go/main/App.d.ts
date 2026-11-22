@@ -34,6 +34,8 @@ export function OpenDownloadDir():Promise<void>;
 
 export function PickFile():Promise<string>;
 
+export function PickFileToSend():Promise<string>;
+
 export function RequestMemberList(arg1:string):Promise<void>;
 
 export function RequestRoomList():Promise<void>;

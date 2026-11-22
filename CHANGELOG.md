@@ -1,7 +1,17 @@
 # Changelog
 [Unreleased]
 
+### Added
+- **Connection limits** — new `max_connections`, `max_connections_per_ip` and `max_new_connections_per_ip_per_minute` settings (defaults 100 / 10 / 30); connections over the limits are closed before the TLS handshake and summarised in the security log once a minute
+- **GUI content security policy** — the GUI frontend runs with a restrictive CSP; inline event handlers were replaced with script listeners
+
 ### Changed
+- **Room names** — must be `#` followed by 1–32 letters, digits, `_`, `-` or `.`
+- **GUI file sending** — files can only be sent after choosing them in the native file picker
+- **GUI links** — links in messages open in the system browser
+- **GUI rendering** — room names, usernames and other server-provided text are always rendered as plain text
+- **Server stability** — reworked client message queues and added a per-connection recovery handler so a problem with one connection cannot stop the server
+- **Dependencies** — vite 8.1.6, nanoid 3.3.20 (frontend build tooling)
 - **Access file** — the server now generates `quietroom_access.pem` on every start, replacing `chat_public.pem`. It contains the server certificate and a master access key that clients present during the TLS handshake (mutual TLS). The file is secret and must be distributed to participants only; a server restart issues a new file and invalidates the previous one
 - **Clients** — CLI, GUI and the Python connector read `quietroom_access.pem` and show clear messages for an outdated or incomplete access file
 - **Server key** — the server private key is kept in memory only and is no longer written to disk
