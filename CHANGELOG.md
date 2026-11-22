@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.1.1] - 2026-11-22
 
 ### Added
 - **Security scanning in CI** — govulncheck (server, CLI client, GUI), Trivy (Docker image), zizmor (workflows) and OpenSSF Scorecard run on pushes, pull requests and weekly; results go to GitHub code scanning
