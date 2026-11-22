@@ -1,5 +1,8 @@
 # Changelog
-[Unreleased]
+
+## [2.0.0] - 2026-11-22
+
+**Breaking:** clients now need the new `quietroom_access.pem`, which the server generates on every start. The server and all clients (CLI, GUI, Python connector) must be updated together; 1.x clients cannot connect to a 2.0 server.
 
 ### Added
 - **Connection limits** — new `max_connections`, `max_connections_per_ip` and `max_new_connections_per_ip_per_minute` settings (defaults 100 / 10 / 30); connections over the limits are closed before the TLS handshake and summarised in the security log once a minute
@@ -17,8 +20,9 @@
 - **Server key** — the server private key is kept in memory only and is no longer written to disk
 - **Connection handling** — the initial handshake now has a timeout, and connection setup is more robust
 - **Log files** — log files are created with owner-only permissions; existing log files are corrected on start
+- **CI** — GUI build workflow runs with read-only token permissions
 
-**Upgrade note:** server and all clients must be updated together; older clients cannot connect to this version.
+---
 
 [1.2.1] - 2026-03-28
 
