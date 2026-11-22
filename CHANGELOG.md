@@ -22,6 +22,9 @@
 - **Log files** — log files are created with owner-only permissions; existing log files are corrected on start
 - **CI** — GUI build workflow runs with read-only token permissions
 
+### Fixed
+- **Room switching** — CLI and GUI switch to a room only after the server confirms the join; a refused join (invalid name or wrong password) no longer sends later messages to that room
+
 ---
 
 [1.2.1] - 2026-03-28
