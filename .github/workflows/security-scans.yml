@@ -1,0 +1,179 @@
+# Copyright (C) 2026 darkfiber-lab
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, version 3.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# Security scans. Results are uploaded to GitHub code scanning (Security tab,
+# visible to maintainers only) as SARIF; the scanners do not print findings
+# to the (public) workflow logs.
+
+name: Security Scans
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: '17 5 * * 1'   # weekly, Monday 05:17 UTC: catch newly published vulnerabilities
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOVULNCHECK_VERSION: v1.9.0
+
+jobs:
+
+  # ── Go vulnerabilities: server and CLI client ─────────────────────
+  govulncheck-cli:
+    name: govulncheck (${{ matrix.program }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        program: [server, client]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: false
+
+      - name: Install govulncheck
+        run: go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+
+      # Server and client are both package main in the repository root, so
+      # each is scanned in its own temporary module.
+      - name: Scan
+        env:
+          PROGRAM: ${{ matrix.program }}
+        run: |
+          work="${RUNNER_TEMP}/vulncheck-${PROGRAM}"
+          mkdir -p "${work}"
+          cp go.mod go.sum "quietroom_${PROGRAM}.go" "${work}/"
+          (cd "${work}" && govulncheck -format sarif ./... > "${GITHUB_WORKSPACE}/govulncheck-${PROGRAM}.sarif")
+
+      - name: Upload results
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: govulncheck-${{ matrix.program }}.sarif
+          category: govulncheck-${{ matrix.program }}
+
+  # ── Go vulnerabilities: GUI (macOS runner: native dependencies build as-is)
+  govulncheck-gui:
+    name: govulncheck (gui)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: false
+
+      - name: Install govulncheck
+        run: go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+
+      - name: Scan
+        working-directory: quietroom-gui
+        run: govulncheck -format sarif ./... > "${GITHUB_WORKSPACE}/govulncheck-gui.sarif"
+
+      - name: Upload results
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: govulncheck-gui.sarif
+          category: govulncheck-gui
+
+  # ── Container image ────────────────────────────────────────────────
+  trivy-image:
+    name: Trivy (Docker image)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: false
+
+      - name: Build server binary and image
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -ldflags="-s -w" -o quietroom_server quietroom_server.go
+          docker build -f DOCKERFILE -t quietroom-server:scan .
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: quietroom-server:scan
+          scanners: vuln
+          image-config-scanners: misconfig
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-image.sarif
+
+      - name: Upload results
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  # ── GitHub Actions workflows ──────────────────────────────────────
+  zizmor:
+    name: zizmor (workflows)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Scan workflows
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          advanced-security: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
