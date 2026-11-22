@@ -727,10 +727,6 @@ tmux new -s quietroom
 tmux attach -t quietroom
 ```
 
-## Version
-
-Current Version: 1.0.0
-
 ## License
 
 This project is licensed under the GNU Affero General Public License v3 (AGPL-3.0).

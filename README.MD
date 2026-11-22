@@ -185,7 +185,3 @@ Built with:
 - Go standard library crypto packages
 - RFC 3526 (DH parameters)
 - NIST recommendations for key sizes
-
-## Version
-
-Current Version: 1.0.0
