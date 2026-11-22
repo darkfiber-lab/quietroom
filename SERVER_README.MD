@@ -9,7 +9,7 @@ A military-grade encrypted chat server with end-to-end encryption, perfect forwa
 - 🛡️ **AES-256-GCM Encryption** - Military-grade encryption for all messages
 - 🕵️ **Traffic Obfuscation** - TLS-like packet structure to evade Deep Packet Inspection
 - 🎭 **Decoy Traffic** - Hides activity patterns from traffic analysis
-- 📝 **Security Logging** - Detailed logs of all authentication attempts and security events
+- 📝 **Privacy-preserving Logging** - Security events are logged without recording participants (metadata logging is opt-in)
 - 👥 **Multi-client Support** - Concurrent connections with thread-safe broadcasting
 
 ## Installation
@@ -84,7 +84,8 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
   "decoy_max_bytes": 500,
   "max_connections": 100,
   "max_connections_per_ip": 10,
-  "max_new_connections_per_ip_per_minute": 30
+  "max_new_connections_per_ip_per_minute": 30,
+  "log_metadata": false
 }
 ```
 
@@ -99,16 +100,16 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
 #### `log_file` (string)
 - **Description**: Path to general activity log file
 - **Default**: `"chat_server.log"`
-- **Logs**: User joins/leaves, connection attempts, general activity
+- **Logs**: Server errors. With `log_metadata` enabled also user joins/leaves, connection attempts, DMs and file transfers
 - **Example**: `"chat_server.log"`, `"/var/log/chat/server.log"`
 
 #### `security_log_file` (string)
 - **Description**: Path to security events log file
 - **Default**: `"security.log"`
 - **Logs**: 
-  - Failed authentication attempts
-  - Decryption errors
-  - Key exchange failures
+  - Rejected connections (no or wrong access key), with IP address
+  - Connection limit summaries
+  - Decryption errors and key exchange failures (participant shown as `[member]` unless `log_metadata` is enabled)
   - Suspicious activity
 - **Example**: `"security.log"`, `"/var/log/chat/security.log"`
 
@@ -155,6 +156,11 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
 - **Default**: `30`
 - **Note**: Refused connections are summarised once a minute in the security log
 
+#### `log_metadata` (boolean)
+- **Description**: Record information about participants in the logs: who joined and left, successful logins, DMs (sender → recipient), file transfers, and member IP addresses
+- **Default**: `false`
+- **Note**: Leave this off in normal operation. Logs are exactly the kind of record that can be seized or subpoenaed; with it off, logs contain no information about participants. Enable it only temporarily for debugging. The server prints a warning at startup while it is on.
+
 Unauthenticated connections must complete the TLS handshake, key exchange and username within 15 seconds or they are closed.
 
 Room names must start with `#` followed by 1–32 letters, digits, `_`, `-` or `.`.
@@ -198,22 +204,23 @@ Room names must start with `#` followed by 1–32 letters, digits, `_`, `-` or `
 
 ## Log Files
 
-### General Log (`chat_server.log`)
+By default (`log_metadata: false`) the logs contain no information about participants. Server output (including `docker logs`) follows the same rule.
+
+### Security Log (`security.log`), default
 
 ```
-2024/12/11 15:30:45 New connection attempt from 192.168.1.100:54321
-2024/12/11 15:30:46 User joined: Alice from 192.168.1.100:54321
-2024/12/11 15:31:20 User left: Alice from 192.168.1.100:54321
+[SECURITY] 2026/11/22 15:30:45 Server started with enhanced security features
+[SECURITY] 2026/11/22 15:31:02 Rejected connection from 203.0.113.7:51544: tls: client didn't provide a certificate
+[SECURITY] 2026/11/22 15:32:00 Refused 12 connection(s) over connection limits in the last minute
+[SECURITY] 2026/11/22 15:33:10 Decryption error from [member]: cipher: message authentication failed
 ```
 
-### Security Log (`security.log`)
+### With `log_metadata: true`
 
 ```
-[SECURITY] 2024/12/11 15:30:45 Server started with enhanced security features
-[SECURITY] 2024/12/11 15:30:46 Diffie-Hellman key exchange completed with 192.168.1.100:54321
-[SECURITY] 2024/12/11 15:30:46 Successful authentication: Alice from 192.168.1.100:54321
-[SECURITY] 2024/12/11 15:31:00 Decryption error from Alice (192.168.1.100:54321): cipher: message authentication failed
-[SECURITY] 2024/12/11 15:32:00 Failed key exchange: Invalid base64 from 192.168.1.200:12345
+2026/11/22 15:30:46 User joined: Alice from 192.168.1.100:54321
+2026/11/22 15:30:58 DM: Alice -> Bob
+[SECURITY] 2026/11/22 15:30:46 Successful authentication: Alice from 192.168.1.100:54321
 ```
 
 ## Generated Files
