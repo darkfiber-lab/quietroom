@@ -30,7 +30,7 @@ export const Settings = {
         name:      'New Server',
         host:      'localhost',
         port:      37842,
-        cert_file: 'chat_public.pem',
+        cert_file: 'quietroom_access.pem',
         username:  'User',
       })
     })
@@ -102,7 +102,7 @@ export const Settings = {
       <input type="text"   class="pf-host"     value="${_esc(profile.host     || profile.Host     || '')}" placeholder="host" style="flex:2" />
       <input type="number" class="pf-port"     value="${     profile.port     || profile.Port     || 37842}"               style="width:70px" />
       <input type="text"   class="pf-username" value="${_esc(profile.username || profile.Username || '')}" placeholder="user" style="flex:1" />
-      <input type="text"   class="pf-cert"     value="${_esc(profile.cert_file || profile.CertFile || '')}" placeholder="cert" style="flex:1.5" />
+      <input type="text"   class="pf-cert"     value="${_esc(profile.cert_file || profile.CertFile || '')}" placeholder="access file" style="flex:1.5" />
       <button class="btn btn-secondary btn-sm pf-cert-browse" type="button">Browse</button>
       <button class="btn btn-ghost btn-icon btn-sm pf-remove" title="Remove" style="color:var(--red)">✕</button>`
 

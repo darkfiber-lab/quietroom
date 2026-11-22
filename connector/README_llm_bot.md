@@ -12,7 +12,7 @@ pip install cryptography requests openai
 
 - Python 3.11 or higher
 - `quietroom_connector.py` in the same directory
-- `chat_public.pem` copied from the server
+- `quietroom_access.pem` copied from the server (secret; replaced on every server restart)
 - A running local LLM inference server (Ollama or any OpenAI-compatible server)
 
 ---
@@ -21,7 +21,7 @@ pip install cryptography requests openai
 
 ### 1. Get the server certificate
 
-Copy `chat_public.pem` from the QuietRoom server into the working directory.
+Copy `quietroom_access.pem` from the QuietRoom server into the working directory.
 
 ### 2. Generate the config file
 
@@ -39,7 +39,7 @@ The bot exits after writing the config. Edit before running again.
 {
   "server_host": "localhost",
   "server_port": 37842,
-  "cert_file": "chat_public.pem",
+  "cert_file": "quietroom_access.pem",
   "username": "LLMBot",
   "llm_backend": "ollama",
   "ollama": {

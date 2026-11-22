@@ -22,7 +22,7 @@ A command-line chat client with strong encryption, perfect forward secrecy, and 
 
 - Go 1.16 or higher
 - Linux/Unix, macOS, or Windows
-- `chat_public.pem` file from the server
+- `quietroom_access.pem` file from the server
 
 ### Building
 
@@ -40,10 +40,12 @@ go run client.go
 
 ### First Time Setup
 
-1. **Obtain the public certificate:**
-   - Get `chat_public.pem` from your server administrator
+1. **Obtain the access file:**
+   - Get `quietroom_access.pem` from your server administrator (physical media recommended)
    - Place it in the same directory as the client
+   - ⚠️ **Keep it secret** — it contains the access key; anyone holding it can join the server
    - ⚠️ **Verify authenticity** (compare fingerprint with administrator)
+   - The file is only valid until the server restarts; after a restart you need the new one
 
 2. **Configure the client:**
    - Edit `client_config.json` (created on first run)
@@ -475,31 +477,46 @@ Network monitors see:
 
 ## Troubleshooting
 
-### Cannot find chat_public.pem
+### Cannot find quietroom_access.pem
 
-**Problem**: `✗ Error: chat_public.pem not found!`
+**Problem**: `✗ Error: quietroom_access.pem not found!`
 
 **Solution**: 
-1. Copy `chat_public.pem` from server to client directory
+1. Copy `quietroom_access.pem` from the server administrator to the client directory
 2. Ensure it's in the same directory as the client executable
-3. Check file permissions: `ls -l chat_public.pem`
+3. Check file permissions: `ls -l quietroom_access.pem`
+4. A `chat_public.pem` from an older server version no longer works
+
+### Access denied
+
+**Problem**: `✗ Access denied — the server rejected your access key`
+
+**Causes & Solutions**:
+1. **Outdated access file**: The server was restarted, which invalidates all access files — get the new `quietroom_access.pem`
+2. **Wrong file**: Make sure the file came from this server
+
+### Not a valid access file
+
+**Problem**: `✗ Error loading access file: ... is not a valid access file`
+
+**Solution**: The file must contain the server certificate *and* the access key. Get the complete `quietroom_access.pem` from your administrator.
 
 ### Server authentication failed
 
 **Problem**: `✗ Server authentication failed - possible MITM attack!`
 
 **Causes & Solutions**:
-1. **Wrong certificate file**: Get correct `chat_public.pem` from administrator
-2. **Server regenerated keys**: Server admin regenerated keys, get new certificate
+1. **Wrong access file**: Get the correct `quietroom_access.pem` from administrator
+2. **Server restarted**: Every restart generates new keys, get the new access file
 3. **Actual MITM attack**: Someone is intercepting your connection - investigate before connecting
 
 ### Certificate does not match
 
-**Problem**: `✗ peer certificate does not match the expected pinned certificate`
+**Problem**: `✗ Server certificate does not match your quietroom_access.pem`
 
 **Causes & Solutions**:
-1. **Wrong certificate**: Verify you have the correct `chat_public.pem`
-2. **Server changed**: Server administrator changed certificates
+1. **Wrong access file**: Verify you have the correct `quietroom_access.pem`
+2. **Server restarted**: Every restart generates new keys — get the new access file
 3. **MITM attack**: Possible man-in-the-middle attack - verify with administrator
 
 ### Connection refused
@@ -663,7 +680,7 @@ Most terminals support:
 2. **Enable decoy traffic** to hide activity patterns
 3. **Choose usernames carefully** - don't use real names if privacy is important
 4. **Verify certificate fingerprint** before first connection
-5. **Use secure channels** to obtain `chat_public.pem` (USB, in-person, etc.)
+5. **Use secure channels** to obtain `quietroom_access.pem` (USB, in-person, etc.) and never share it with anyone outside the group
 
 ## Advanced Usage
 
@@ -672,11 +689,11 @@ Most terminals support:
 Before first use, verify the certificate with your administrator:
 
 ```bash
-# SHA256 fingerprint
-openssl x509 -in chat_public.pem -noout -fingerprint -sha256
+# SHA256 fingerprint of the server certificate (first block in the access file)
+openssl x509 -in quietroom_access.pem -noout -fingerprint -sha256
 
 # Display certificate details
-openssl x509 -in chat_public.pem -text -noout
+openssl x509 -in quietroom_access.pem -text -noout
 ```
 
 Compare the fingerprint with what your administrator provides.

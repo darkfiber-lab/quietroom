@@ -11,7 +11,8 @@ Available for macOS, Windows, and Linux.
 ### Security
 - **End-to-end encryption** — AES-256-GCM with per-session keys derived via Diffie-Hellman key exchange
 - **Perfect forward secrecy** — each session generates a new DH keypair; past sessions cannot be decrypted if a key is later compromised
-- **Certificate pinning** — the server's TLS certificate is compared byte-for-byte against the locally stored `chat_public.pem`; connections are refused if they don't match, blocking man-in-the-middle attacks
+- **Access key** — the client presents the master access key from `quietroom_access.pem` during the TLS handshake; the server refuses connections without it
+- **Certificate pinning** — the server's TLS certificate is compared byte-for-byte against the one stored in `quietroom_access.pem`; connections are refused if they don't match, blocking man-in-the-middle attacks
 - **DH key validation** — small subgroup attack prevention on the key exchange
 - **Decoy traffic** — configurable random padding packets sent at intervals to obscure communication patterns from traffic analysis
 
@@ -44,9 +45,11 @@ Available for macOS, Windows, and Linux.
 
 ## Getting started
 
-### 1. Get the server certificate
+### 1. Get the access file
 
-Copy `chat_public.pem` from your QuietRoom server to the same directory as the application binary. This file is required to verify the server's identity. Without it the client will refuse to connect.
+Copy `quietroom_access.pem` from your QuietRoom server administrator to the same directory as the application binary (or select it in the server profile). It contains the server certificate, used to verify the server's identity, and the access key the server requires. Without it you cannot connect.
+
+⚠️ The file is **secret** — anyone holding it can join the server. It is only valid until the server restarts; after a restart, get the new file.
 
 ### 2. Launch the application
 
@@ -124,5 +127,5 @@ Open settings via the **⚙** button on the login screen or the settings button 
 
 - The client never stores messages on disk — all conversation history is held in memory for the duration of the session only
 - Server profiles (host, port, username, certificate path) are stored in the OS config directory (`~/Library/Application Support/QuietRoom/config.json` on macOS, `~/.config/QuietRoom/config.json` on Linux, `%AppData%\QuietRoom\config.json` on Windows)
-- The certificate file (`chat_public.pem`) is read from disk on each connection — it is never embedded in the application
+- The access file (`quietroom_access.pem`) is read from disk on each connection — it is never embedded in the application
 - File transfers are relayed through the server, which means the server operator can see file contents in transit. This is an architectural limitation of the relay model and is documented behaviour.

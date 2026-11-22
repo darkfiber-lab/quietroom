@@ -12,7 +12,7 @@ The connector maintains a persistent connection for as long as it runs. The user
 pip install cryptography
 ```
 
-Python 3.11 or higher. `chat_public.pem` must be copied from the server to the working directory.
+Python 3.11 or higher. `quietroom_access.pem` must be copied from the server to the working directory. It is secret (it contains the access key) and is replaced every time the server restarts.
 
 ---
 
@@ -54,7 +54,7 @@ All options are set via `ConnectorConfig`:
 |---|---|---|---|
 | `server_host` | str | `"localhost"` | Hostname or IP of the QuietRoom server |
 | `server_port` | int | `37842` | Server port |
-| `cert_file` | str | `"chat_public.pem"` | Path to the pinned server certificate |
+| `cert_file` | str | `"quietroom_access.pem"` | Path to the access file (pinned server certificate + access key) |
 | `username` | str | `"Bot"` | Username to register on the server |
 | `decoy_traffic` | bool | `True` | Send random padding traffic at intervals |
 | `decoy_interval` | int | `30` | Seconds between decoy bursts |
@@ -245,7 +245,7 @@ conn.disconnect()       # graceful shutdown: sends /quit, closes socket
 | Exception | When raised |
 |---|---|
 | `FileNotFoundError` | `cert_file` not found at `connect()` time |
-| `SecurityError` | Certificate mismatch or invalid DH key from server |
+| `SecurityError` | Certificate mismatch, invalid access file, access key rejected by the server, or invalid DH key from server |
 | `ConnectorError` | Handshake, login failure, or username already taken |
 | `ConnectionLostError` | Server closed the connection mid-session |
 | `OSError` | Network-level failure |
@@ -310,7 +310,7 @@ while conn.is_connected:
 
 ## Security notes
 
-- **Certificate pinning** — the connector compares the server's TLS certificate byte-for-byte against `chat_public.pem` and refuses to connect if they do not match, blocking man-in-the-middle attacks.
+- **Certificate pinning** — the connector compares the server's TLS certificate byte-for-byte against the certificate in `quietroom_access.pem` and refuses to connect if they do not match, blocking man-in-the-middle attacks.
 - **DH key validation** — the server's Diffie-Hellman public key is validated to be in the range `(1, P-1)` before computing the shared secret, blocking small subgroup attacks.
 - **Room membership validation** — the server validates that the connector is a member of a room before routing messages to it. Sending to a room you have not joined returns an error and the message is not delivered.
 - **Decoy traffic** — when enabled, random padding packets are sent at intervals to obscure communication patterns from traffic analysis.
