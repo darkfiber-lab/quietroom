@@ -33,6 +33,7 @@ export const App = {
 
   // ── Boot ───────────────────────────────────────────────────
   async init() {
+    this._pendingJoins = {}  // room -> hasPassword, until the server confirms
     // Load config from Go
     try {
       this.config = await go().GetConfig()
@@ -218,9 +219,9 @@ export const App = {
       const pw   = document.getElementById('join-room-password').value.trim()
       if (!room) return
       try {
+        // The room tab is added when the server confirms the join (room_joined)
+        this._pendingJoins[room] = pw.length > 0
         await go().JoinRoom(room, pw)
-        Chat.addRoom(room, pw.length > 0)
-        Chat.switchTo(room)
         this.closeModal('modal-join-room')
         document.getElementById('join-room-name').value = ''
         document.getElementById('join-room-password').value = ''
@@ -458,9 +459,15 @@ export const App = {
     })
 
     runtime.EventsOn('room_joined', data => {
-      if (data.username !== this.username) {
-        Chat.appendSystem(`${data.username} joined ${data.room}`, data.room)
+      if (data.username === this.username) {
+        // Server confirmed our own join: now show and switch to the room
+        const hasPassword = this._pendingJoins[data.room] === true
+        delete this._pendingJoins[data.room]
+        Chat.addRoom(data.room, hasPassword)
+        Chat.switchTo(data.room)
+        return
       }
+      Chat.appendSystem(`${data.username} joined ${data.room}`, data.room)
     })
 
     runtime.EventsOn('room_left', data => {
@@ -529,9 +536,8 @@ export const App = {
         li.innerHTML = `<span style="font-size:13px">${Chat._escapeText(room)}</span>
           <button class="btn btn-primary btn-sm">Join</button>`
         li.querySelector('button').addEventListener('click', () => {
+          this._pendingJoins[roomName] = false
           go().JoinRoom(roomName, '').then(() => {
-            Chat.addRoom(roomName)
-            Chat.switchTo(roomName)
             this.closeModal('modal-room-list')
           }).catch(e => Chat.appendSystem(`Error joining ${room}: ${e}`))
         })
