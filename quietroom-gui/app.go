@@ -293,14 +293,9 @@ func (a *App) JoinRoom(room string, password string) error {
 	if password != "" {
 		cmd += " " + password
 	}
-	if err := a.sendText(cmd); err != nil {
-		return err
-	}
-	// Only update currentRoom — do not send any leave/join for routing
-	a.clientMu.Lock()
-	a.currentRoom = room
-	a.clientMu.Unlock()
-	return nil
+	// currentRoom is updated only when the server confirms the join
+	// (our own room_joined event), so a refused join never redirects messages.
+	return a.sendText(cmd)
 }
 
 
@@ -490,6 +485,11 @@ func (a *App) handleProtocolEvent(evt protocol.Event) {
 		})
 
 	case protocol.EvtRoomJoined:
+		a.clientMu.Lock()
+		if evt.Sender == a.username {
+			a.currentRoom = evt.Room // server confirmed our own join
+		}
+		a.clientMu.Unlock()
 		runtime.EventsEmit(a.ctx, "room_joined", map[string]string{
 			"username": evt.Sender,
 			"room":     evt.Room,

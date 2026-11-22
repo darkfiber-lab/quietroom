@@ -490,6 +490,21 @@ func loadAccessBundle(filename string) (*x509.Certificate, tls.Certificate, erro
 	return serverCert, accessPair, nil
 }
 
+// joinedRoomFromServer recognises the server's own join confirmation
+// ("Joined room #x" / "Created and joined room #x"). The whole message must
+// match, so text relayed from other users can never trigger it.
+func joinedRoomFromServer(msg string) (string, bool) {
+	for _, prefix := range []string{"Created and joined room ", "Joined room "} {
+		if strings.HasPrefix(msg, prefix) {
+			room := strings.TrimPrefix(msg, prefix)
+			if strings.HasPrefix(room, "#") && len(room) > 1 && !strings.ContainsAny(room, " \t\r\n") {
+				return room, true
+			}
+		}
+	}
+	return "", false
+}
+
 // describeConnError turns a server-side access rejection into a clear message.
 func describeConnError(err error) string {
 	msg := err.Error()
@@ -1080,6 +1095,13 @@ func main() {
 				continue
 			}
 
+			// Switch the current room only once the server confirms the join
+			if room, ok := joinedRoomFromServer(msgStr); ok {
+				client.mu.Lock()
+				client.currentRoom = room
+				client.mu.Unlock()
+			}
+
 			client.mu.Lock()
 			client.lastSentMu.Lock()
 			isOwnMessage := false
@@ -1223,15 +1245,9 @@ func main() {
 				}
 			}
 			
-			// Track current room for auto-prefixing
-			if strings.HasPrefix(text, "/join ") {
-				parts := strings.Fields(text)
-				if len(parts) >= 2 {
-					client.mu.Lock()
-					client.currentRoom = parts[1]
-					client.mu.Unlock()
-				}
-			} else if strings.HasPrefix(text, "/leave ") {
+			// Track current room for auto-prefixing. Joins take effect when the
+			// server confirms them (see joinedRoomFromServer); leaving is immediate.
+			if strings.HasPrefix(text, "/leave ") {
 				parts := strings.Fields(text)
 				if len(parts) >= 2 {
 					client.mu.Lock()
