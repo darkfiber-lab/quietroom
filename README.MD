@@ -92,7 +92,7 @@ For detailed setup instructions, configuration options, and troubleshooting:
 
 ## System Requirements
 
-- **Go**: Version 1.16 or higher
+- **Go**: Version 1.26 or higher (only needed to build from source)
 - **Operating Systems**: Linux, macOS, Windows
 - **Network**: TCP connectivity between server and clients
 - **Disk Space**: Minimal (< 50MB for binaries and logs)
@@ -167,7 +167,7 @@ Contributions are welcome! Please ensure:
 
 ## Security Disclosure
 
-If you discover a security vulnerability, please contact the maintainer directly (I am not sure if you can do that right now).
+If you discover a security vulnerability, please report it privately via the repository's **Security** tab → **Report a vulnerability**. Do not open a public issue. See [SECURITY.md](SECURITY.md) for details.
 
 ## License
 

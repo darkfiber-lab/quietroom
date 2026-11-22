@@ -20,7 +20,7 @@ A command-line chat client with strong encryption, perfect forward secrecy, and 
 
 ### Prerequisites
 
-- Go 1.16 or higher
+- Go 1.26 or higher (only needed to build from source)
 - Linux/Unix, macOS, or Windows
 - `quietroom_access.pem` file from the server
 

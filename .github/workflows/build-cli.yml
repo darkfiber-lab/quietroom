@@ -63,21 +63,24 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'   # latest 1.26 patch release (security fixes)
           check-latest: true
 
       - name: Determine version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          if [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION}"
           else
             # Use latest tag if available, otherwise use short SHA
             VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
@@ -87,22 +90,28 @@ jobs:
               VERSION="${VERSION#v}"
             fi
           fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          case "${VERSION}" in
+            *[!0-9A-Za-z.+-]*) echo "Invalid version string: ${VERSION}"; exit 1 ;;
+          esac
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building version: ${VERSION}"
 
-      - name: Install dependencies
-        run: go mod tidy && go mod download
+      - name: Download and verify dependencies
+        run: go mod download && go mod verify
 
       - name: Build server
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
         run: |
-          mkdir -p build/${{ matrix.target }}
+          mkdir -p "build/${TARGET}"
           go build \
-            -ldflags="-w -s -X main.Version=${{ steps.version.outputs.version }}" \
-            -o "build/${{ matrix.target }}/quietroom_server-${{ matrix.target }}-v${{ steps.version.outputs.version }}${{ matrix.ext }}" \
+            -ldflags="-w -s -X main.Version=${VERSION}" \
+            -o "build/${TARGET}/quietroom_server-${TARGET}-v${VERSION}${EXT}" \
             quietroom_server.go
 
       - name: Build CLI client
@@ -110,14 +119,17 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
         run: |
           go build \
-            -ldflags="-w -s -X main.Version=${{ steps.version.outputs.version }}" \
-            -o "build/${{ matrix.target }}/quietroom_client-${{ matrix.target }}-v${{ steps.version.outputs.version }}${{ matrix.ext }}" \
+            -ldflags="-w -s -X main.Version=${VERSION}" \
+            -o "build/${TARGET}/quietroom_client-${TARGET}-v${VERSION}${EXT}" \
             quietroom_client.go
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: quietroom-cli-${{ matrix.target }}
           path: build/${{ matrix.target }}/
