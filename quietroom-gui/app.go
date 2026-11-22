@@ -95,6 +95,7 @@ type App struct {
 
 	// Pending file send state (path stored while waiting for BEGIN_SEND)
 	pendingFilePath string
+	pickedSendPath  string // last path chosen via PickFileToSend
 	pendingFileMu   sync.Mutex
 
 	decoyStop chan struct{}
@@ -351,8 +352,32 @@ func (a *App) sendText(text string) error {
 // File transfers
 // ─────────────────────────────────────────────
 
+// PickFileToSend opens a native file picker for choosing a file to send.
+// Only a path chosen here can be passed to InitiateFileTransfer, so the
+// frontend can never name an arbitrary local file on its own.
+func (a *App) PickFileToSend() (string, error) {
+	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "Select file to send",
+	})
+	if err != nil {
+		return "", err
+	}
+	a.pendingFileMu.Lock()
+	a.pickedSendPath = path
+	a.pendingFileMu.Unlock()
+	return path, nil
+}
+
 // InitiateFileTransfer starts the file transfer handshake
 func (a *App) InitiateFileTransfer(recipient string, filePath string) error {
+	a.pendingFileMu.Lock()
+	allowed := filePath != "" && filePath == a.pickedSendPath
+	a.pickedSendPath = ""
+	a.pendingFileMu.Unlock()
+	if !allowed {
+		return fmt.Errorf("file must be selected with the file picker")
+	}
+
 	hash, err := protocol.ComputeFileHash(filePath)
 	if err != nil {
 		return fmt.Errorf("cannot hash file: %w", err)

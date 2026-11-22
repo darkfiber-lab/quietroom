@@ -81,7 +81,10 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
   "decoy_traffic": true,
   "decoy_interval_seconds": 30,
   "decoy_min_bytes": 100,
-  "decoy_max_bytes": 500
+  "decoy_max_bytes": 500,
+  "max_connections": 100,
+  "max_connections_per_ip": 10,
+  "max_new_connections_per_ip_per_minute": 30
 }
 ```
 
@@ -136,6 +139,25 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
 - **Range**: `100` - `2000` recommended
 - **Example**: `500`, `1000`
 - **Note**: Random size between min and max for each decoy
+
+#### `max_connections` (integer)
+- **Description**: Maximum number of simultaneous connections to the server
+- **Default**: `100`
+- **Note**: Connections over the limit are closed immediately, before the TLS handshake
+
+#### `max_connections_per_ip` (integer)
+- **Description**: Maximum number of simultaneous connections from one IP address
+- **Default**: `10`
+- **Note**: If several participants connect from behind the same router (shared public IP), raise this value accordingly
+
+#### `max_new_connections_per_ip_per_minute` (integer)
+- **Description**: Maximum number of new connections accepted from one IP address per minute
+- **Default**: `30`
+- **Note**: Refused connections are summarised once a minute in the security log
+
+Unauthenticated connections must complete the TLS handshake, key exchange and username within 15 seconds or they are closed.
+
+Room names must start with `#` followed by 1–32 letters, digits, `_`, `-` or `.`.
 
 ## Security Features
 
