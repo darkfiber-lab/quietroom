@@ -60,6 +60,7 @@ import secrets
 import socket
 import ssl
 import struct
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -92,7 +93,7 @@ class ConnectionLostError(ConnectorError):
 class ConnectorConfig:
     server_host: str = "localhost"
     server_port: int = 37842
-    cert_file: str = "chat_public.pem"
+    cert_file: str = "quietroom_access.pem"   # access file distributed by the server
     username: str = "Bot"
 
     # Decoy traffic — mirrors the Go client behaviour to avoid traffic analysis.
@@ -197,6 +198,55 @@ _MAX_PACKET_DATA = 32768
 def _make_packet(msg_type: int, data: bytes) -> bytes:
     padding = secrets.token_bytes(secrets.randbelow(256))
     return struct.pack(">BH", msg_type, len(data)) + data + padding
+
+
+ACCESS_FILE_NAME = "quietroom_access.pem"
+
+_PEM_BLOCK_RE = re.compile(r"-----BEGIN ([A-Z ]+)-----.*?-----END \1-----", re.S)
+
+
+def _load_access_bundle(path: str) -> tuple[str, bytes, str]:
+    """
+    Parse an access file: the pinned server certificate followed by the master
+    access certificate and its private key.
+
+    Returns (server_cert_pem, server_cert_der, access_cert_and_key_pem).
+    """
+    with open(path, "r", encoding="ascii") as f:
+        text = f.read()
+
+    certs: list[str] = []
+    key: Optional[str] = None
+    for m in _PEM_BLOCK_RE.finditer(text):
+        kind, block = m.group(1), m.group(0) + "\n"
+        if kind == "CERTIFICATE":
+            certs.append(block)
+        elif kind in ("PRIVATE KEY", "EC PRIVATE KEY") and key is None:
+            key = block
+
+    if len(certs) != 2 or key is None:
+        raise SecurityError(
+            f"'{path}' is not a valid access file (it must contain the server "
+            f"certificate and the access key). Get the current {ACCESS_FILE_NAME} "
+            "from your server administrator."
+        )
+    server_pem = certs[0]
+    return server_pem, ssl.PEM_cert_to_DER_cert(server_pem), certs[1] + key
+
+
+def _load_client_cert(ctx: ssl.SSLContext, cert_and_key_pem: str):
+    """
+    ssl.SSLContext.load_cert_chain only accepts file paths, so the access
+    certificate and key are written to a private (0600) temp file that is
+    removed immediately after loading.
+    """
+    fd, tmp_path = tempfile.mkstemp(prefix=".qr_access_", suffix=".pem")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(cert_and_key_pem)
+        ctx.load_cert_chain(tmp_path)
+    finally:
+        os.unlink(tmp_path)
 
 
 def _read_exact(sock: ssl.SSLSocket, n: int) -> bytes:
@@ -326,6 +376,11 @@ class QuietRoomConnector:
         self._cfg = config
         self._sock: Optional[ssl.SSLSocket] = None
         self._session_key: Optional[bytes] = None
+
+        # Loaded from the access file at connect() time
+        self._server_cert_pem: Optional[str] = None
+        self._server_cert_der: Optional[bytes] = None
+        self._access_pem: Optional[str] = None
         self._send_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._shutdown_once = threading.Lock()
@@ -417,7 +472,18 @@ class QuietRoomConnector:
         """
         self._validate_cert_file()
         self._sock = self._tls_connect()
-        self._perform_dh_exchange()
+        try:
+            self._perform_dh_exchange()
+        except (OSError, ConnectionLostError) as e:
+            # In TLS 1.3 a rejected access key surfaces on the first read.
+            msg = str(e).lower()
+            if ("alert" in msg and "certificate" in msg) or isinstance(e, ConnectionLostError):
+                raise SecurityError(
+                    f"Access denied — the server rejected the access key. "
+                    f"'{self._cfg.cert_file}' is wrong or outdated "
+                    "(the server may have been restarted)."
+                ) from e
+            raise
         self._login()
 
         self._recv_thread = threading.Thread(
@@ -597,14 +663,19 @@ class QuietRoomConnector:
     def _validate_cert_file(self):
         if not os.path.exists(self._cfg.cert_file):
             raise FileNotFoundError(
-                f"Certificate file '{self._cfg.cert_file}' not found. "
-                "Copy chat_public.pem from the server."
+                f"Access file '{self._cfg.cert_file}' not found. "
+                f"Copy {ACCESS_FILE_NAME} from the server."
             )
+        (self._server_cert_pem,
+         self._server_cert_der,
+         self._access_pem) = _load_access_bundle(self._cfg.cert_file)
 
     def _tls_connect(self) -> ssl.SSLSocket:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE  # manual pinning below
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        _load_client_cert(ctx, self._access_pem)  # master access key (mutual TLS)
 
         raw = socket.create_connection(
             (self._cfg.server_host, self._cfg.server_port),
@@ -614,13 +685,11 @@ class QuietRoomConnector:
 
         # Certificate pinning — compare raw DER bytes
         peer_der = tls_sock.getpeercert(binary_form=True)
-        with open(self._cfg.cert_file, "rb") as f:
-            pinned_der = ssl.PEM_cert_to_DER_cert(f.read().decode())
-
-        if peer_der != pinned_der:
+        if peer_der != self._server_cert_der:
             tls_sock.close()
             raise SecurityError(
-                "Peer certificate does not match pinned certificate — possible MITM attack"
+                "Server certificate does not match the access file — either the server was "
+                "restarted (get the new file) or the connection is being intercepted (possible MITM)"
             )
 
         log.debug("TLS established and certificate pinned")
@@ -651,8 +720,7 @@ class QuietRoomConnector:
         from cryptography.hazmat.primitives import hashes
         from cryptography.x509 import load_pem_x509_certificate
 
-        with open(self._cfg.cert_file, "rb") as f:
-            cert = load_pem_x509_certificate(f.read())
+        cert = load_pem_x509_certificate(self._server_cert_pem.encode())
 
         try:
             cert.public_key().verify(

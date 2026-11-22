@@ -40,10 +40,12 @@ go run server.go
    ./chat_server
    ```
 
-2. **Copy the public key to clients:**
-   - The server generates `chat_public.pem` on first run
-   - **Securely copy this file** to all client machines (USB drive, SCP, etc.)
-   - ⚠️ **Never transmit the PEM file over insecure channels**
+2. **Copy the access file to clients:**
+   - The server generates `quietroom_access.pem` on every start
+   - **Securely copy this file** to all client machines (physical media recommended)
+   - ⚠️ **The file is SECRET** — it contains the master access key. Anyone holding it can join
+   - ⚠️ **Never transmit the access file over insecure channels**
+   - Restarting the server generates new keys and invalidates every previously distributed access file (this is intentional: a restart is how you revoke access)
 
 ### Starting the Server
 
@@ -53,10 +55,11 @@ go run server.go
 
 You should see:
 ```
-✓ Generated RSA authentication keys
-✓ Public key saved to: chat_public.pem
-⚠ COPY chat_public.pem to client machines before connecting!
+✓ Generated new server key and master access key (valid until server restart)
 ✓ Initialized Diffie-Hellman parameters (2048-bit)
+✓ Access file saved to: quietroom_access.pem
+⚠ COPY quietroom_access.pem to client machines before connecting — it is SECRET, anyone holding it can join!
+⚠ Restarting the server invalidates the previous access file.
 ✓ Encrypted chat server started on port 37842
 ✓ Logging to: chat_server.log
 ✓ Security logging to: security.log
@@ -139,16 +142,22 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
 ### Encryption Layers
 
 1. **RSA-4096 Authentication**
-   - Server generates a 4096-bit RSA key pair on startup
-   - Public key (`chat_public.pem`) must be distributed to clients offline
-   - Prevents man-in-the-middle attacks
+   - Server generates a 4096-bit RSA key pair on every startup (kept in memory only)
+   - The server certificate is part of `quietroom_access.pem`, distributed to clients offline
+   - Clients pin it exactly, preventing man-in-the-middle attacks
 
-2. **Diffie-Hellman Key Exchange**
+2. **Access Key (mutual TLS)**
+   - Server generates a master access key (ECDSA P-256) on every startup, stored in `quietroom_access.pem`
+   - Every client must present this key during the TLS handshake; connections without it are refused before any chat data is exchanged
+   - Rejected connections are recorded in the security log
+   - A server restart rotates the key and revokes all previously distributed access files
+
+3. **Diffie-Hellman Key Exchange**
    - 2048-bit MODP Group (RFC 3526)
    - Ephemeral keys generated per session
    - Perfect forward secrecy - past sessions stay secure even if RSA key is compromised
 
-3. **AES-256-GCM**
+4. **AES-256-GCM**
    - Session encryption using DH-derived keys
    - Authenticated encryption prevents tampering
    - 256-bit key strength
@@ -187,8 +196,9 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
 
 ## Generated Files
 
-- `server_private.pem` - Server's RSA private key (⚠️ **KEEP SECRET**)
-- `chat_public.pem` - Server's RSA public key (distribute to clients)
+- `quietroom_access.pem` - Access file: server certificate + master access key (⚠️ **SECRET** — distribute only to participants; replaced on every start)
+- The server private key is kept in memory only and is never written to disk
+- `server_private.pem` / `chat_public.pem` from older versions are no longer used and can be deleted
 - `server_config.json` - Configuration file
 - `chat_server.log` - General activity log
 - `security.log` - Security events log
@@ -262,8 +272,8 @@ netstat -tulpn | grep 37842
 **Problem**: `[SECURITY] Failed key exchange: Decryption failed`
 
 **Solution**: 
-1. Ensure clients have the correct `chat_public.pem` file
-2. Regenerate keys if PEM file is corrupted
+1. Ensure clients have the current `quietroom_access.pem` (a server restart replaces it)
+2. `Rejected connection from ...: access key not recognised` / `client didn't provide a certificate` means a client without a valid access file tried to connect
 3. Check for man-in-the-middle attacks
 
 ## Security Best Practices

@@ -14,3 +14,9 @@ quietroom-gui/build/bin
 quietroom-gui/dist
 .DS_Store
 **/.DS_Store
+# Access file contains the master access key - never commit
+quietroom_access.pem
+**/quietroom_access.pem
+.quietroom_access.pem.tmp-*
+# Frontend dependencies
+quietroom-gui/frontend/node_modules/

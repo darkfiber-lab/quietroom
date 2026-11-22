@@ -440,38 +440,66 @@ func (c *Client) sendDecoyTraffic() {
 	}
 }
 
-func loadPublicKey(filename string) (*rsa.PublicKey, error) {
-	pemData, err := os.ReadFile(filename)
+const (
+	accessFile       = "quietroom_access.pem"
+	legacyAccessFile = "chat_public.pem"
+)
+
+// loadAccessBundle parses quietroom_access.pem: the pinned server certificate
+// followed by the master access certificate and its private key.
+func loadAccessBundle(filename string) (*x509.Certificate, tls.Certificate, error) {
+	var none tls.Certificate
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read public key file: %v", err)
+		return nil, none, fmt.Errorf("failed to read %s: %v", filename, err)
 	}
 
-	block, _ := pem.Decode(pemData)
-	if block == nil {
-		return nil, fmt.Errorf("failed to decode PEM block")
-	}
-
-	if block.Type == "CERTIFICATE" {
-		cert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse certificate: %v", err)
+	var certs []*pem.Block
+	var key *pem.Block
+	for rest := data; ; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
 		}
-		rsaPub, ok := cert.PublicKey.(*rsa.PublicKey)
-		if !ok {
-			return nil, fmt.Errorf("certificate does not contain an RSA public key")
+		switch block.Type {
+		case "CERTIFICATE":
+			certs = append(certs, block)
+		case "PRIVATE KEY", "EC PRIVATE KEY":
+			if key == nil {
+				key = block
+			}
 		}
-		return rsaPub, nil
+	}
+	if len(certs) != 2 || key == nil {
+		return nil, none, fmt.Errorf("%s is not a valid access file (it must contain the server certificate and the access key) — get the current %s from your server administrator", filename, accessFile)
 	}
 
-	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	serverCert, err := x509.ParseCertificate(certs[0].Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse public key: %v", err)
+		return nil, none, fmt.Errorf("failed to parse server certificate: %v", err)
 	}
-	rsaPub, ok := pub.(*rsa.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("not an RSA public key")
+	if _, ok := serverCert.PublicKey.(*rsa.PublicKey); !ok {
+		return nil, none, fmt.Errorf("server certificate does not contain an RSA public key")
 	}
-	return rsaPub, nil
+
+	accessPair, err := tls.X509KeyPair(pem.EncodeToMemory(certs[1]), pem.EncodeToMemory(key))
+	if err != nil {
+		return nil, none, fmt.Errorf("invalid access key: %v", err)
+	}
+	return serverCert, accessPair, nil
+}
+
+// describeConnError turns a server-side access rejection into a clear message.
+func describeConnError(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "pinned certificate"):
+		return "Server certificate does not match your " + accessFile + " — either the server was restarted (get the new file) or someone is intercepting the connection (possible MITM)."
+	case strings.Contains(msg, "remote error: tls") && strings.Contains(msg, "certificate"):
+		return "Access denied — the server rejected your access key. Your " + accessFile + " is wrong or outdated (the server may have been restarted)."
+	}
+	return msg
 }
 
 func loadConfig() ClientConfig {
@@ -680,19 +708,23 @@ func main() {
 
 	client.clearScreen()
 
-	if _, err := os.Stat("chat_public.pem"); os.IsNotExist(err) {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Error: chat_public.pem not found!"))
-		fmt.Println(client.colorize(config.Theme.SystemColor, "Please copy the public key file from the server to this directory."))
+	if _, err := os.Stat(accessFile); os.IsNotExist(err) {
+		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Error: "+accessFile+" not found!"))
+		if _, err := os.Stat(legacyAccessFile); err == nil {
+			fmt.Println(client.colorize(config.Theme.SystemColor, legacyAccessFile+" is from an older server version and no longer works."))
+		}
+		fmt.Println(client.colorize(config.Theme.SystemColor, "Please copy "+accessFile+" from your server administrator to this directory."))
 		os.Exit(1)
 	}
 
-	publicKey, err := loadPublicKey("chat_public.pem")
+	pinnedCert, accessPair, err := loadAccessBundle(accessFile)
 	if err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Error loading public key: "+err.Error()))
+		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Error loading access file: "+err.Error()))
 		os.Exit(1)
 	}
+	publicKey := pinnedCert.PublicKey.(*rsa.PublicKey)
 
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Loaded RSA authentication key"))
+	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Loaded server certificate and access key"))
 
 	dhParams := initDHParams()
 	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Initialized Diffie-Hellman parameters"))
@@ -736,56 +768,27 @@ func main() {
 
 	fmt.Println(client.colorize(config.Theme.SystemColor, "Connecting to "+serverAddr+"..."))
 
-	certPEM, err := os.ReadFile("chat_public.pem")
-	if err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Failed to read chat_public.pem: "+err.Error()))
-		os.Exit(1)
-	}
-
-	certPool := x509.NewCertPool()
-	if ok := certPool.AppendCertsFromPEM(certPEM); !ok {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Failed to parse chat_public.pem as a valid certificate"))
-		os.Exit(1)
-	}
-
 	tlsConfig := &tls.Config{
-		RootCAs:            certPool,
+		// Chain verification is replaced by exact pinning of the server
+		// certificate from the access file (see VerifyPeerCertificate).
 		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+		Certificates:       []tls.Certificate{accessPair},
 
 		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
 				return fmt.Errorf("no peer certificate presented")
 			}
-
-			peerCert, err := x509.ParseCertificate(rawCerts[0])
-			if err != nil {
-				return fmt.Errorf("failed to parse peer certificate: %v", err)
-			}
-
-			pinnedPEM, err := os.ReadFile("chat_public.pem")
-			if err != nil {
-				return fmt.Errorf("failed to read pinned certificate: %v", err)
-			}
-			pinnedBlock, _ := pem.Decode(pinnedPEM)
-			if pinnedBlock == nil {
-				return fmt.Errorf("failed to decode pinned certificate PEM")
-			}
-			pinnedCert, err := x509.ParseCertificate(pinnedBlock.Bytes)
-			if err != nil {
-				return fmt.Errorf("failed to parse pinned certificate: %v", err)
-			}
-
-			if !bytes.Equal(peerCert.Raw, pinnedCert.Raw) {
+			if !bytes.Equal(rawCerts[0], pinnedCert.Raw) {
 				return fmt.Errorf("peer certificate does not match the expected pinned certificate")
 			}
-
 			return nil
 		},
 	}
 
 	conn, err := tls.Dial("tcp", serverAddr, tlsConfig)
 	if err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ TLS connection failed: "+err.Error()))
+		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ TLS connection failed: "+describeConnError(err)))
 		os.Exit(1)
 	}
 	defer conn.Close()
@@ -800,7 +803,8 @@ func main() {
 
 	var serverDHPubLen uint32
 	if err := binary.Read(conn, binary.BigEndian, &serverDHPubLen); err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ DH exchange failed"))
+		// In TLS 1.3 a rejected access key surfaces on the first read.
+		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Connection failed: "+describeConnError(err)))
 		os.Exit(1)
 	}
 

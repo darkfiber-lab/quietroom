@@ -18,12 +18,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 package main
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -31,6 +35,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -95,6 +100,9 @@ type Server struct {
 	join           chan *Client
 	leave          chan *Client
 	privateKey     *rsa.PrivateKey
+	tlsCert        tls.Certificate
+	accessCertRaw  []byte // DER of the master access certificate clients must present
+	accessBundle   []byte // contents of quietroom_access.pem for this run
 	dhParams       *DHParams
 	config         ServerConfig
 	logger         *log.Logger
@@ -153,6 +161,144 @@ func randomInt(max int64) int64 {
 	return n.Int64()
 }
 
+// accessFile is the secret bundle distributed to clients. It holds, in order:
+// the server certificate (for pinning), the master access certificate and the
+// master access private key (presented by clients via mutual TLS).
+const accessFile = "quietroom_access.pem"
+
+// handshakeTimeout bounds the unauthenticated phase of a connection
+// (TLS handshake, DH exchange and username).
+const handshakeTimeout = 15 * time.Second
+
+type sessionKeys struct {
+	privateKey    *rsa.PrivateKey
+	tlsCert       tls.Certificate
+	accessCertRaw []byte
+	accessBundle  []byte // PEM contents of quietroom_access.pem
+}
+
+func randomSerial() (*big.Int, error) {
+	return rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
+}
+
+// generateSessionKeys creates a fresh server identity and master access key
+// for this server run, plus the access bundle contents. Nothing is reused
+// across restarts by design: a restart invalidates every previously issued
+// bundle. The server private key is kept in memory only; the bundle is written
+// by main() once the listener is up, so a failed start never replaces the
+// access file of a server that is already running.
+func generateSessionKeys() (*sessionKeys, error) {
+	now := time.Now()
+
+	serverKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return nil, err
+	}
+	serverSerial, err := randomSerial()
+	if err != nil {
+		return nil, err
+	}
+	serverTmpl := &x509.Certificate{
+		SerialNumber: serverSerial,
+		Subject: pkix.Name{
+			CommonName:   "Self-Hosted Chat Server",
+			Organization: []string{"Private Chat"},
+		},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	serverDER, err := x509.CreateCertificate(rand.Reader, serverTmpl, serverTmpl, &serverKey.PublicKey, serverKey)
+	if err != nil {
+		return nil, err
+	}
+	serverCert, err := x509.ParseCertificate(serverDER)
+	if err != nil {
+		return nil, err
+	}
+
+	accessKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	accessSerial, err := randomSerial()
+	if err != nil {
+		return nil, err
+	}
+	accessTmpl := &x509.Certificate{
+		SerialNumber:          accessSerial,
+		Subject:               pkix.Name{CommonName: "QuietRoom Access"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+	accessDER, err := x509.CreateCertificate(rand.Reader, accessTmpl, accessTmpl, &accessKey.PublicKey, accessKey)
+	if err != nil {
+		return nil, err
+	}
+	accessKeyDER, err := x509.MarshalPKCS8PrivateKey(accessKey)
+	if err != nil {
+		return nil, err
+	}
+
+	var bundle bytes.Buffer
+	for _, b := range []*pem.Block{
+		{Type: "CERTIFICATE", Bytes: serverDER},
+		{Type: "CERTIFICATE", Bytes: accessDER},
+		{Type: "PRIVATE KEY", Bytes: accessKeyDER},
+	} {
+		if err := pem.Encode(&bundle, b); err != nil {
+			return nil, err
+		}
+	}
+	return &sessionKeys{
+		accessBundle: bundle.Bytes(),
+		privateKey: serverKey,
+		tlsCert: tls.Certificate{
+			Certificate: [][]byte{serverDER},
+			PrivateKey:  serverKey,
+			Leaf:        serverCert,
+		},
+		accessCertRaw: accessDER,
+	}, nil
+}
+
+// writeFileAtomic writes data to a temp file in the same directory and renames
+// it into place, so a crash never leaves a truncated file behind.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+// verifyAccessCert is the TLS VerifyPeerCertificate hook: the client must
+// present exactly the master access certificate generated for this run.
+func (s *Server) verifyAccessCert(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	if len(rawCerts) == 0 || subtle.ConstantTimeCompare(rawCerts[0], s.accessCertRaw) != 1 {
+		return errors.New("access key not recognised")
+	}
+	return nil
+}
+
 func loadConfig() ServerConfig {
 	config := ServerConfig{
 		Port:            37842,
@@ -180,7 +326,10 @@ func loadConfig() ServerConfig {
 
 func NewServer() (*Server, error) {
 	config := loadConfig()
-	logFile, err := os.OpenFile(config.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY,600)
+	// Repair log files created with a broken mode by earlier versions.
+	os.Chmod(config.LogFile, 0600)
+	os.Chmod(config.SecurityLogFile, 0600)
+	logFile, err := os.OpenFile(config.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -191,59 +340,21 @@ func NewServer() (*Server, error) {
 	logger := log.New(logFile, "", log.LstdFlags)
 	securityLogger := log.New(secLogFile, "[SECURITY] ", log.LstdFlags)
 
-	privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	keys, err := generateSessionKeys()
 	if err != nil {
 		return nil, err
 	}
+	privateKey := keys.privateKey
 
-	privateKeyBytes := x509.MarshalPKCS1PrivateKey(privateKey)
-	privateKeyPEM := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: privateKeyBytes}
-	privFile, err := os.OpenFile("server_private.pem", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return nil, err
-	}
-	defer privFile.Close()
-	if err := pem.Encode(privFile, privateKeyPEM); err != nil {
-		return nil, err
-	}
-
-	certTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			CommonName:   "Self-Hosted Chat Server",
-			Organization: []string{"Private Chat"},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(10, 0, 0),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-
-	certBytes, err := x509.CreateCertificate(rand.Reader, certTemplate, certTemplate, &privateKey.PublicKey, privateKey)
-	if err != nil {
-		return nil, err
-	}
-
-	certPEM := &pem.Block{Type: "CERTIFICATE", Bytes: certBytes}
-	pubFile, err := os.Create("chat_public.pem")
-	if err != nil {
-		return nil, err
-	}
-	defer pubFile.Close()
-	if err := pem.Encode(pubFile, certPEM); err != nil {
-		return nil, err
-	}
-
-	fmt.Println("✓ Generated RSA key pair and self-signed TLS certificate")
-	fmt.Println("✓ Public certificate saved to: chat_public.pem")
-	fmt.Println("⚠ COPY chat_public.pem to client machines before connecting!")
+	fmt.Println("✓ Generated new server key and master access key (valid until server restart)")
 
 	dhParams := initDHParams()
 	fmt.Println("✓ Initialized Diffie-Hellman parameters (2048-bit)")
 
 	server := &Server{
+		tlsCert:        keys.tlsCert,
+		accessCertRaw:  keys.accessCertRaw,
+		accessBundle:   keys.accessBundle,
 		clients:        make(map[*Client]bool),
 		join:           make(chan *Client),
 		leave:          make(chan *Client),
@@ -451,6 +562,19 @@ func (s *Server) handleClient(conn net.Conn) {
 
 	ipAddr := conn.RemoteAddr().String()
 	s.logger.Printf("New connection attempt from %s", ipAddr)
+
+	// Complete the TLS handshake (including access key verification) up
+	// front, and bound the whole unauthenticated phase with a deadline.
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return
+	}
+	conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	if err := tlsConn.Handshake(); err != nil {
+		s.logSecurity("Rejected connection from %s: %v", ipAddr, err)
+		return
+	}
+
 	dhPrivate, dhPublic, err := generateDHKeyPair(s.dhParams)
 	if err != nil {
 		s.logSecurity("Failed DH key generation for %s: %v", ipAddr, err)
@@ -570,6 +694,7 @@ func (s *Server) handleClient(conn net.Conn) {
 	}
 	s.usernames[username] = client
 	s.mu.Unlock()
+	conn.SetDeadline(time.Time{})
 	client.username = username
 	s.join <- client
 	go func() {
@@ -1283,15 +1408,11 @@ func main() {
 	go server.run()
 	server.startIdleChecker()
 
-	cert, err := tls.LoadX509KeyPair("chat_public.pem", "server_private.pem")
-	if err != nil {
-		fmt.Println("Error loading TLS certificate/key:", err)
-		return
-	}
-
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
+		Certificates:          []tls.Certificate{server.tlsCert},
+		MinVersion:            tls.VersionTLS13,
+		ClientAuth:            tls.RequireAnyClientCert,
+		VerifyPeerCertificate: server.verifyAccessCert,
 	}
 
 	listener, err := tls.Listen("tcp", fmt.Sprintf(":%d", server.config.Port), tlsConfig)
@@ -1302,6 +1423,14 @@ func main() {
 
 	server.listener = listener
 	defer listener.Close()
+
+	if err := writeFileAtomic(accessFile, server.accessBundle, 0600); err != nil {
+		fmt.Printf("Error writing %s: %v\n", accessFile, err)
+		return
+	}
+	fmt.Printf("✓ Access file saved to: %s\n", accessFile)
+	fmt.Printf("⚠ COPY %s to client machines before connecting — it is SECRET, anyone holding it can join!\n", accessFile)
+	fmt.Println("⚠ Restarting the server invalidates the previous access file.")
 
 	fmt.Printf("✓ Encrypted chat server started on port %d (TLS enabled)\n", server.config.Port)
 	fmt.Printf("✓ Logging to: %s\n", server.config.LogFile)
@@ -1316,17 +1445,20 @@ func main() {
 
 	for {
 		conn, err := listener.Accept()
-		if tcpConn, ok := conn.(*tls.Conn).NetConn().(*net.TCPConn); ok {
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		}
 		if err != nil {
 			select {
 			case <-server.shutdown:
 				return
 			default:
 				fmt.Println("Error accepting connection:", err)
+				time.Sleep(100 * time.Millisecond)
 				continue
+			}
+		}
+		if tlsConn, ok := conn.(*tls.Conn); ok {
+			if tcpConn, ok := tlsConn.NetConn().(*net.TCPConn); ok {
+				tcpConn.SetKeepAlive(true)
+				tcpConn.SetKeepAlivePeriod(30 * time.Second)
 			}
 		}
 		server.wg.Add(1)
