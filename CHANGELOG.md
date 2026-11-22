@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **Docker image** — based on Alpine 3.24 without extra packages; the server binary now lives in `/usr/local/bin` (outside the data volume) so rebuilding the image updates the server; the health check was removed; the file documents a hardened `docker run` command (read-only filesystem, no capabilities, resource and log limits)
+
+---
+
 ## [2.1.0] - 2026-11-22
 
 ### Added
