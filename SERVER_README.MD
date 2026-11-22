@@ -336,7 +336,3 @@ commercial license. Contact the author for details.
 ## Support
 
 For issues, questions, or contributions, please open an issue on the project repository.
-
-## Version
-
-Current Version: 1.0.0

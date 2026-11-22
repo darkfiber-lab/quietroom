@@ -7,8 +7,9 @@ on:
       - main
     tags:
       - 'v*'
+# Read-only by default; only the release job below gets write access.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
 
@@ -72,6 +73,10 @@ jobs:
     name: Create GitHub Release
     needs: [version, build-cli, build-gui]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the release and upload files
+      id-token: write       # sign the build provenance (Sigstore)
+      attestations: write   # store the provenance attestation
 
     steps:
       - name: Checkout
@@ -110,6 +115,17 @@ jobs:
 
           echo "Release files:"
           ls -lah release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'release/*'
 
       - name: Extract changelog for this version
         id: changelog

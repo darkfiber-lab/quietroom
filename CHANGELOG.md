@@ -1,10 +1,14 @@
 # Changelog
 
-## [Unreleased]
+## [2.1.0] - 2026-11-22
+
+### Added
+- **Release verification** — every release includes `SHA256SUMS.txt` and a signed build provenance attestation (`gh attestation verify`); see "Verifying Downloads" in the README
 
 ### Changed
 - **Logging** — participant metadata (joins/leaves, successful logins, DMs, file transfers, member IP addresses) is no longer logged by default, including server console output. New `log_metadata` setting (default `false`) re-enables it for debugging. Rejected connections are still logged with their IP address
 - **Server certificate** — the server certificate now carries a random name per run instead of a fixed descriptive name
+- **CI** — release workflow runs with read-only token permissions by default; only the job that publishes the release gets write access
 
 ---
 

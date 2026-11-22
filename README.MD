@@ -117,6 +117,29 @@ For detailed setup instructions, configuration options, and troubleshooting:
                └────────────────┘
 ```
 
+## Verifying Downloads
+
+Every release includes a `SHA256SUMS.txt` file and a signed build provenance attestation.
+
+**Check a file against the published checksums** (run in the folder with the downloaded files):
+
+```bash
+# Linux
+sha256sum -c SHA256SUMS.txt --ignore-missing
+# macOS
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+# Windows (PowerShell): compare with the matching line in SHA256SUMS.txt
+Get-FileHash .\quietroom_client_gui-windows-amd64-vX.Y.Z.exe -Algorithm SHA256
+```
+
+For the strongest check, get the expected checksum from your server administrator out of band (for example together with `quietroom_access.pem`) instead of from the same download page.
+
+**Verify that a file was built by this repository's release workflow** (requires the GitHub CLI):
+
+```bash
+gh attestation verify quietroom-cli-linux-arm64-vX.Y.Z.zip -R darkfiber-lab/quietroom
+```
+
 ## Building from Source
 
 ```bash
@@ -162,7 +185,3 @@ Built with:
 - Go standard library crypto packages
 - RFC 3526 (DH parameters)
 - NIST recommendations for key sizes
-
-## Version
-
-Current Version: 1.0.0
