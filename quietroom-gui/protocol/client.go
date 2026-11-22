@@ -130,6 +130,69 @@ func sha256Hash(data []byte) []byte {
 	return hash[:]
 }
 
+// AccessFileName is the default name of the access file distributed by the server.
+const AccessFileName = "quietroom_access.pem"
+
+// LoadAccessBundle parses an access file: the pinned server certificate
+// followed by the master access certificate and its private key.
+func LoadAccessBundle(path string) (*x509.Certificate, tls.Certificate, error) {
+	var none tls.Certificate
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, none, fmt.Errorf("failed to read access file: %w", err)
+	}
+
+	var certs []*pem.Block
+	var key *pem.Block
+	for rest := data; ; {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		switch block.Type {
+		case "CERTIFICATE":
+			certs = append(certs, block)
+		case "PRIVATE KEY", "EC PRIVATE KEY":
+			if key == nil {
+				key = block
+			}
+		}
+	}
+	if len(certs) != 2 || key == nil {
+		return nil, none, fmt.Errorf("%s is not a valid access file (it must contain the server certificate and the access key) — get the current %s from your server administrator", path, AccessFileName)
+	}
+
+	serverCert, err := x509.ParseCertificate(certs[0].Bytes)
+	if err != nil {
+		return nil, none, fmt.Errorf("failed to parse server certificate: %w", err)
+	}
+	if _, ok := serverCert.PublicKey.(*rsa.PublicKey); !ok {
+		return nil, none, fmt.Errorf("server certificate does not contain an RSA public key")
+	}
+
+	accessPair, err := tls.X509KeyPair(pem.EncodeToMemory(certs[1]), pem.EncodeToMemory(key))
+	if err != nil {
+		return nil, none, fmt.Errorf("invalid access key: %w", err)
+	}
+	return serverCert, accessPair, nil
+}
+
+// accessError turns a server-side access key rejection into a clear message.
+func accessError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "pinned certificate"):
+		return fmt.Errorf("server certificate does not match your %s — either the server was restarted (get the new file) or someone is intercepting the connection (possible MITM)", AccessFileName)
+	case strings.Contains(msg, "remote error: tls") && strings.Contains(msg, "certificate"):
+		return fmt.Errorf("access denied — the server rejected your access key; your %s is wrong or outdated (the server may have been restarted)", AccessFileName)
+	}
+	return err
+}
+
 // Client manages a single connection to a QuietRoom server
 type Client struct {
 	conn       net.Conn
@@ -159,33 +222,16 @@ func NewClient(handler EventHandler) *Client {
 func (c *Client) Connect(host string, port int, certFile string, username string) error {
 	c.username = username
 
-	// Load pinned certificate
-	certPEM, err := os.ReadFile(certFile)
+	// Load the access file: pinned server certificate + master access key
+	pinnedCert, accessPair, err := LoadAccessBundle(certFile)
 	if err != nil {
-		return fmt.Errorf("failed to read cert file: %w", err)
+		return err
 	}
-
-	certPool := x509.NewCertPool()
-	certPool.AppendCertsFromPEM(certPEM)
-
-	// Parse the pinned cert for byte comparison
-	block, _ := pem.Decode(certPEM)
-	if block == nil {
-		return fmt.Errorf("failed to decode PEM block from cert file")
-	}
-	pinnedCert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse pinned certificate: %w", err)
-	}
-
-	// Extract RSA public key from pinned cert for DH signature verification
-	rsaPubKey, ok := pinnedCert.PublicKey.(*rsa.PublicKey)
-	if !ok {
-		return fmt.Errorf("certificate does not contain an RSA public key")
-	}
+	rsaPubKey := pinnedCert.PublicKey.(*rsa.PublicKey)
 
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
+		Certificates:       []tls.Certificate{accessPair},
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
 				return fmt.Errorf("no peer certificate")
@@ -208,14 +254,14 @@ func (c *Client) Connect(host string, port int, certFile string, username string
 	addr := fmt.Sprintf("%s:%d", host, port)
 	conn, err := tls.Dial("tcp", addr, tlsConfig)
 	if err != nil {
-		return fmt.Errorf("TLS connection failed: %w", err)
+		return fmt.Errorf("TLS connection failed: %w", accessError(err))
 	}
 	c.conn = conn
 
-	// DH key exchange
+	// DH key exchange (in TLS 1.3 a rejected access key surfaces on the first read)
 	if err := c.performDHExchange(rsaPubKey); err != nil {
 		conn.Close()
-		return err
+		return accessError(err)
 	}
 
 	// Login

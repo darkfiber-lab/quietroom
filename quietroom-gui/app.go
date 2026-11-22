@@ -64,7 +64,7 @@ func defaultConfig() AppConfig {
 				Name:     "Default Server",
 				Host:     "localhost",
 				Port:     37842,
-				CertFile: "chat_public.pem",
+				CertFile: "quietroom_access.pem",
 				Username: "User",
 			},
 		},

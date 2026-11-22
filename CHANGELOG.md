@@ -1,4 +1,15 @@
 # Changelog
+[Unreleased]
+
+### Changed
+- **Access file** — the server now generates `quietroom_access.pem` on every start, replacing `chat_public.pem`. It contains the server certificate and a master access key that clients present during the TLS handshake (mutual TLS). The file is secret and must be distributed to participants only; a server restart issues a new file and invalidates the previous one
+- **Clients** — CLI, GUI and the Python connector read `quietroom_access.pem` and show clear messages for an outdated or incomplete access file
+- **Server key** — the server private key is kept in memory only and is no longer written to disk
+- **Connection handling** — the initial handshake now has a timeout, and connection setup is more robust
+- **Log files** — log files are created with owner-only permissions; existing log files are corrected on start
+
+**Upgrade note:** server and all clients must be updated together; older clients cannot connect to this version.
+
 [1.2.1] - 2026-03-28
 
 - Updated .gitignore to upload icon files for the build
