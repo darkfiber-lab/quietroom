@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **Logging** — participant metadata (joins/leaves, successful logins, DMs, file transfers, member IP addresses) is no longer logged by default, including server console output. New `log_metadata` setting (default `false`) re-enables it for debugging. Rejected connections are still logged with their IP address
+- **Server certificate** — the server certificate now carries a random name per run instead of a fixed descriptive name
+
+---
+
 ## [2.0.0] - 2026-11-22
 
 **Breaking:** clients now need the new `quietroom_access.pem`, which the server generates on every start. The server and all clients (CLI, GUI, Python connector) must be updated together; 1.x clients cannot connect to a 2.0 server.

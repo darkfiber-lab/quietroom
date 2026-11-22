@@ -87,7 +87,7 @@ For detailed setup instructions, configuration options, and troubleshooting:
 
 - **Perfect Forward Secrecy**: Past sessions remain secure even if long-term keys are compromised
 - **No Message Persistence**: Messages are not stored on the server
-- **No User Tracking**: No logs of message content or metadata
+- **No User Tracking**: No logs of message content; participant metadata (who connected, DMs, file transfers, member IPs) is not logged unless the operator explicitly enables `log_metadata`
 - **Self-Hosted**: Complete control over your infrastructure
 
 ## System Requirements

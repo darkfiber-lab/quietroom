@@ -66,6 +66,11 @@ type ServerConfig struct {
 	MaxConnections         int `json:"max_connections"`
 	MaxConnectionsPerIP    int `json:"max_connections_per_ip"`
 	MaxNewConnPerIPPerMin  int `json:"max_new_connections_per_ip_per_minute"`
+
+	// LogMetadata records who connected, joined, left, sent DMs or files, and
+	// member IP addresses. Off by default: routine logs then contain no
+	// information about participants. Enable only temporarily for debugging.
+	LogMetadata bool `json:"log_metadata"`
 }
 
 const (
@@ -292,11 +297,16 @@ func generateSessionKeys() (*sessionKeys, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The certificate is visible to anyone who connects, so it carries a
+	// random name per run instead of anything that identifies the service.
+	nameBytes := make([]byte, 8)
+	if _, err := rand.Read(nameBytes); err != nil {
+		return nil, err
+	}
 	serverTmpl := &x509.Certificate{
 		SerialNumber: serverSerial,
 		Subject: pkix.Name{
-			CommonName:   "Self-Hosted Chat Server",
-			Organization: []string{"Private Chat"},
+			CommonName: hex.EncodeToString(nameBytes),
 		},
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.AddDate(10, 0, 0),
@@ -406,6 +416,8 @@ func loadConfig() ServerConfig {
 		MaxConnections:        defaultMaxConnections,
 		MaxConnectionsPerIP:   defaultMaxConnectionsPerIP,
 		MaxNewConnPerIPPerMin: defaultMaxNewConnPerIPPerMin,
+
+		LogMetadata: false,
 	}
 	data, err := os.ReadFile("server_config.json")
 	if err != nil {
@@ -478,6 +490,43 @@ func (s *Server) logSecurity(format string, args ...interface{}) {
 	fmt.Printf("[SECURITY] %s\n", msg)
 }
 
+// memberPlaceholder replaces participant details in logs when metadata
+// logging is off.
+const memberPlaceholder = "[member]"
+
+// logMeta writes to the general log only when metadata logging is enabled.
+// Use it for anything that reveals participants or their activity.
+func (s *Server) logMeta(format string, args ...interface{}) {
+	if s.config.LogMetadata {
+		s.logger.Printf(format, args...)
+	}
+}
+
+// logSecurityMeta writes a security event that identifies a participant
+// only when metadata logging is enabled.
+func (s *Server) logSecurityMeta(format string, args ...interface{}) {
+	if s.config.LogMetadata {
+		s.logSecurity(format, args...)
+	}
+}
+
+// peer returns addr for logs when metadata logging is enabled, otherwise a
+// placeholder. Use it for connections that already presented a valid access key.
+func (s *Server) peer(addr string) string {
+	if s.config.LogMetadata {
+		return addr
+	}
+	return memberPlaceholder
+}
+
+// member identifies a joined client in logs when metadata logging is enabled.
+func (s *Server) member(c *Client) string {
+	if s.config.LogMetadata {
+		return fmt.Sprintf("%s (%s)", c.username, c.ipAddr)
+	}
+	return memberPlaceholder
+}
+
 func (s *Server) run() {
 	for {
 		select {
@@ -489,8 +538,8 @@ func (s *Server) run() {
 			s.mu.Unlock()
 			joinMsg := fmt.Sprintf("*** %s joined the chat ***", client.username)
 			s.broadcastToLobby(joinMsg)
-			s.logger.Printf("User joined: %s from %s", client.username, client.ipAddr)
-			s.logSecurity("Successful authentication: %s from %s", client.username, client.ipAddr)
+			s.logMeta("User joined: %s from %s", client.username, client.ipAddr)
+			s.logSecurityMeta("Successful authentication: %s from %s", client.username, client.ipAddr)
 			if s.config.DecoyTraffic {
 				go s.sendDecoyTraffic(client)
 			}
@@ -530,7 +579,7 @@ func (s *Server) run() {
 
 			leaveMsg := fmt.Sprintf("*** %s left the chat ***", client.username)
 			s.broadcastToLobby(leaveMsg)
-			s.logger.Printf("User left: %s from %s", client.username, client.ipAddr)
+			s.logMeta("User left: %s from %s", client.username, client.ipAddr)
 		}
 	}
 }
@@ -708,13 +757,13 @@ func (s *Server) handleClient(conn net.Conn) {
 	var joined *Client
 	defer func() {
 		if r := recover(); r != nil {
-			s.logSecurity("Recovered from internal error while handling %s: %v", ipAddr, r)
+			s.logSecurity("Recovered from internal error while handling %s: %v", s.peer(ipAddr), r)
 			if joined != nil {
 				s.leave <- joined
 			}
 		}
 	}()
-	s.logger.Printf("New connection attempt from %s", ipAddr)
+	s.logMeta("New connection attempt from %s", ipAddr)
 
 	// Complete the TLS handshake (including access key verification) up
 	// front, and bound the whole unauthenticated phase with a deadline.
@@ -730,13 +779,13 @@ func (s *Server) handleClient(conn net.Conn) {
 
 	dhPrivate, dhPublic, err := generateDHKeyPair(s.dhParams)
 	if err != nil {
-		s.logSecurity("Failed DH key generation for %s: %v", ipAddr, err)
+		s.logSecurity("Failed DH key generation for %s: %v", s.peer(ipAddr), err)
 		return
 	}
 	dhPubBytes := dhPublic.Bytes()
 	signature, err := rsa.SignPSS(rand.Reader, s.privateKey, crypto.SHA256, sha256Hash(dhPubBytes), nil)
 	if err != nil {
-		s.logSecurity("Failed to sign DH public key for %s: %v", ipAddr, err)
+		s.logSecurity("Failed to sign DH public key for %s: %v", s.peer(ipAddr), err)
 		return
 	}
 	dhPubLen := make([]byte, 4)
@@ -749,17 +798,17 @@ func (s *Server) handleClient(conn net.Conn) {
 	conn.Write(signature)
 	var clientDHPubLen uint32
 	if err := binary.Read(conn, binary.BigEndian, &clientDHPubLen); err != nil {
-		s.logSecurity("Failed to read client DH pub len from %s: %v", ipAddr, err)
+		s.logSecurity("Failed to read client DH pub len from %s: %v", s.peer(ipAddr), err)
 		return
 	}
 	const maxDHPubKeySize = 4096
 	if clientDHPubLen > maxDHPubKeySize {
-		s.logSecurity("DoS attempt from %s: DH key size %d exceeds maximum %d", ipAddr, clientDHPubLen, maxDHPubKeySize)
+		s.logSecurity("DoS attempt from %s: DH key size %d exceeds maximum %d", s.peer(ipAddr), clientDHPubLen, maxDHPubKeySize)
 		return
 	}
 	clientDHPubBytes := make([]byte, clientDHPubLen)
 	if _, err := io.ReadFull(conn, clientDHPubBytes); err != nil {
-		s.logSecurity("Failed to read client DH pub from %s: %v", ipAddr, err)
+		s.logSecurity("Failed to read client DH pub from %s: %v", s.peer(ipAddr), err)
 		return
 	}
 	clientDHPub := new(big.Int).SetBytes(clientDHPubBytes)
@@ -767,20 +816,20 @@ func (s *Server) handleClient(conn net.Conn) {
 	one := big.NewInt(1)
 	pMinusOne := new(big.Int).Sub(s.dhParams.P, one)
 	if clientDHPub.Cmp(one) <= 0 || clientDHPub.Cmp(pMinusOne) >= 0 {
-		s.logSecurity("Invalid DH public key from %s (small subgroup attack attempt)", ipAddr)
+		s.logSecurity("Invalid DH public key from %s (small subgroup attack attempt)", s.peer(ipAddr))
 		return
 	}
 
 	sharedSecret := computeDHSharedSecret(dhPrivate, clientDHPub, s.dhParams.P)
-	s.logSecurity("Diffie-Hellman key exchange completed with %s", ipAddr)
+	s.logSecurityMeta("Diffie-Hellman key exchange completed with %s", ipAddr)
 	block, err := aes.NewCipher(sharedSecret)
 	if err != nil {
-		s.logSecurity("Failed to create cipher for %s: %v", ipAddr, err)
+		s.logSecurity("Failed to create cipher for %s: %v", s.peer(ipAddr), err)
 		return
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		s.logSecurity("Failed to create GCM for %s: %v", ipAddr, err)
+		s.logSecurity("Failed to create GCM for %s: %v", s.peer(ipAddr), err)
 		return
 	}
 	client := &Client{
@@ -799,33 +848,33 @@ func (s *Server) handleClient(conn net.Conn) {
 	conn.Write(welcomePacket)
 	usernamePacket, err := readObfuscatedPacket(conn)
 	if err != nil {
-		s.logSecurity("Failed to read username packet from %s: %v", ipAddr, err)
+		s.logSecurity("Failed to read username packet from %s: %v", s.peer(ipAddr), err)
 		return
 	}
 	usernameEnc := usernamePacket.Data
 	usernameBytes, err := client.decrypt(usernameEnc)
 	if err != nil {
-		s.logSecurity("Failed username decryption from %s: %v", ipAddr, err)
+		s.logSecurity("Failed username decryption from %s: %v", s.peer(ipAddr), err)
 		return
 	}
 	username := strings.TrimSpace(string(usernameBytes))
 	if username == "" {
-		s.logSecurity("Empty username from %s", ipAddr)
+		s.logSecurity("Empty username from %s", s.peer(ipAddr))
 		return
 	}
 	const maxUsernameLength = 32
 	if len(username) > maxUsernameLength {
-		s.logSecurity("Username too long (%d chars) from %s", len(username), ipAddr)
+		s.logSecurity("Username too long (%d chars) from %s", len(username), s.peer(ipAddr))
 		return
 	}
 	for _, ch := range username {
 		if ch < 32 || ch == 127 {
-			s.logSecurity("Username contains control character (0x%02X) from %s", ch, ipAddr)
+			s.logSecurity("Username contains control character (0x%02X) from %s", ch, s.peer(ipAddr))
 			return
 		}
 	}
 	if strings.TrimSpace(username) == "" {
-		s.logSecurity("Username is all whitespace from %s", ipAddr)
+		s.logSecurity("Username is all whitespace from %s", s.peer(ipAddr))
 		return
 	}
 	for _, ch := range username {
@@ -834,7 +883,7 @@ func (s *Server) handleClient(conn net.Conn) {
 			(ch >= '0' && ch <= '9') ||
 			ch == ' ' || ch == '_' || ch == '-' || ch == '.'
 		if !isValid {
-			s.logSecurity("Username contains invalid character '%c' (0x%04X) from %s", ch, ch, ipAddr)
+			s.logSecurity("Username contains invalid character '%c' (0x%04X) from %s", ch, ch, s.peer(ipAddr))
 			return
 		}
 	}
@@ -870,10 +919,10 @@ func (s *Server) handleClient(conn net.Conn) {
 		packet, err := readObfuscatedPacket(conn)
 		if err != nil {
 			if strings.Contains(err.Error(), "oversized packet dropped") {
-				s.logger.Printf("Dropped oversized packet from %s", client.username)
+				s.logger.Printf("Dropped oversized packet from %s", s.member(client))
 				continue
 			}
-			s.logger.Printf("Connection error from %s: %v", client.username, err)
+			s.logMeta("Connection error from %s: %v", client.username, err)
 			break
 		}
 		client.mu.Lock()
@@ -889,7 +938,7 @@ func (s *Server) handleClient(conn net.Conn) {
 		}
 		textBytes, err := client.decrypt(packet.Data)
 		if err != nil {
-			s.logSecurity("Decryption error from %s (%s): %v", client.username, ipAddr, err)
+			s.logSecurity("Decryption error from %s: %v", s.member(client), err)
 			continue
 		}
 		text := strings.TrimSpace(string(textBytes))
@@ -1029,7 +1078,7 @@ func (s *Server) handlePrivateMessage(client *Client, parts []string) {
 	dmMsg := fmt.Sprintf("[DM from %s]: %s", client.username, message)
 	s.sendToClient(targetClient, dmMsg)
 	s.sendToClient(client, fmt.Sprintf("[DM to %s]: %s", targetUser, message))
-	s.logger.Printf("DM: %s -> %s", client.username, targetUser)
+	s.logMeta("DM: %s -> %s", client.username, targetUser)
 }
 
 func (s *Server) handleJoinRoom(client *Client, parts []string) bool {
@@ -1321,7 +1370,7 @@ func (s *Server) handleFileTransferInit(client *Client, parts []string) {
 		targetUser, transferID)
 	s.sendToClient(client, senderMsg)
 
-	s.logger.Printf("File transfer initiated: %s -> %s (File: %s, ID: %s)", client.username, targetUser, baseFilename, transferID)
+	s.logMeta("File transfer initiated: %s -> %s (File: %s, ID: %s)", client.username, targetUser, baseFilename, transferID)
 
 	go func() {
 		time.Sleep(5 * time.Minute)
@@ -1380,7 +1429,7 @@ func (s *Server) handleFileAccept(client *Client, parts []string) {
 	}
 	packet := s.createObfuscatedPacket(0x01, encrypted)
 	transfer.sender.send(packet)
-	s.logger.Printf("File transfer accepted: %s -> %s (ID: %s)", transfer.sender.username, transfer.recipient.username, transferID)
+	s.logMeta("File transfer accepted: %s -> %s (ID: %s)", transfer.sender.username, transfer.recipient.username, transferID)
 
 	go func(id string) {
 		time.Sleep(10 * time.Minute)
@@ -1416,7 +1465,7 @@ func (s *Server) handleFileDecline(client *Client, parts []string) {
 	}
 	s.sendToClient(client, "*** File transfer declined. ***")
 	s.sendToClient(transfer.sender, fmt.Sprintf("*** %s declined the file transfer (ID: %s). ***", client.username, transferID))
-	s.logger.Printf("File transfer declined: %s -> %s (ID: %s)", transfer.sender.username, transfer.recipient.username, transferID)
+	s.logMeta("File transfer declined: %s -> %s (ID: %s)", transfer.sender.username, transfer.recipient.username, transferID)
 }
 
 func (s *Server) sendToClient(client *Client, message string) {
@@ -1476,7 +1525,7 @@ func (s *Server) handleFileData(client *Client, encryptedData []byte) {
 				encrypted, _ := activeTransfer.recipient.encrypt([]byte(msg))
 				packet := s.createObfuscatedPacket(0x03, encrypted)
 				activeTransfer.recipient.sendWait(packet, fileDataTimeout)
-				s.logger.Printf("File transfer stream started: %s -> %s (%s, %s bytes)", client.username, activeTransfer.recipient.username, filename, filesizeStr)
+				s.logMeta("File transfer stream started: %s -> %s (%s, %s bytes)", client.username, activeTransfer.recipient.username, filename, filesizeStr)
 			}
 		}
 		return
@@ -1500,7 +1549,7 @@ func (s *Server) handleFileData(client *Client, encryptedData []byte) {
 			finished.recipient.sendWait(packet, fileDataTimeout)
 			s.sendToClient(finished.sender, "*** File transfer stream completed. ***")
 			s.sendToClient(finished.recipient, "*** File transfer stream completed. Check hash! ***")
-			s.logger.Printf("File transfer completed: %s -> %s", client.username, finished.recipient.username)
+			s.logMeta("File transfer completed: %s -> %s", client.username, finished.recipient.username)
 		}
 		return
 	}
@@ -1573,7 +1622,7 @@ func (s *Server) startIdleChecker() {
                 for _, client := range stale {
                     s.logSecurity(
                         "Closing stale connection for %s (idle %.0fs)",
-                        client.username,
+                        s.member(client),
                         time.Since(client.lastActive).Seconds(),
                     )
                     client.conn.Close()
@@ -1629,6 +1678,11 @@ func main() {
 	fmt.Printf("✓ Encrypted chat server started on port %d (TLS enabled)\n", server.config.Port)
 	fmt.Printf("✓ Logging to: %s\n", server.config.LogFile)
 	fmt.Printf("✓ Security logging to: %s\n", server.config.SecurityLogFile)
+	if server.config.LogMetadata {
+		fmt.Println("⚠ Metadata logging is ON: logs record participants, DMs, file transfers and IP addresses")
+	} else {
+		fmt.Println("✓ Metadata logging off: logs contain no participant information")
+	}
 	if server.config.DecoyTraffic {
 		fmt.Printf("✓ Decoy traffic enabled (interval: %ds)\n", server.config.DecoyInterval)
 	}
