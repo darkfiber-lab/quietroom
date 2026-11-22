@@ -61,12 +61,105 @@ type ServerConfig struct {
 	DecoyInterval   int    `json:"decoy_interval_seconds"`
 	DecoyMinBytes   int    `json:"decoy_min_bytes"`
 	DecoyMaxBytes   int    `json:"decoy_max_bytes"`
+
+	// Connection limits, enforced before the TLS handshake. 0 = default.
+	MaxConnections         int `json:"max_connections"`
+	MaxConnectionsPerIP    int `json:"max_connections_per_ip"`
+	MaxNewConnPerIPPerMin  int `json:"max_new_connections_per_ip_per_minute"`
+}
+
+const (
+	defaultMaxConnections        = 100
+	defaultMaxConnectionsPerIP   = 10
+	defaultMaxNewConnPerIPPerMin = 30
+)
+
+// connLimiter caps concurrent connections (total and per IP) and the rate of
+// new connections per IP, so unauthenticated peers cannot exhaust the server.
+type connLimiter struct {
+	mu           sync.Mutex
+	total        int
+	perIP        map[string]*ipUsage
+	dropped      int
+	maxTotal     int
+	maxPerIP     int
+	maxRatePerIP int
+}
+
+type ipUsage struct {
+	active      int
+	windowStart time.Time
+	count       int
+}
+
+func newConnLimiter(cfg ServerConfig) *connLimiter {
+	pick := func(v, def int) int {
+		if v <= 0 {
+			return def
+		}
+		return v
+	}
+	return &connLimiter{
+		perIP:        make(map[string]*ipUsage),
+		maxTotal:     pick(cfg.MaxConnections, defaultMaxConnections),
+		maxPerIP:     pick(cfg.MaxConnectionsPerIP, defaultMaxConnectionsPerIP),
+		maxRatePerIP: pick(cfg.MaxNewConnPerIPPerMin, defaultMaxNewConnPerIPPerMin),
+	}
+}
+
+func (l *connLimiter) admit(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	u := l.perIP[ip]
+	if u == nil {
+		u = &ipUsage{windowStart: now}
+		l.perIP[ip] = u
+	}
+	if now.Sub(u.windowStart) >= time.Minute {
+		u.windowStart = now
+		u.count = 0
+	}
+	if l.total >= l.maxTotal || u.active >= l.maxPerIP || u.count >= l.maxRatePerIP {
+		l.dropped++
+		return false
+	}
+	u.count++
+	u.active++
+	l.total++
+	return true
+}
+
+func (l *connLimiter) release(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.total--
+	if u := l.perIP[ip]; u != nil {
+		u.active--
+	}
+}
+
+// sweep forgets idle IPs and returns how many connections were refused since
+// the last sweep.
+func (l *connLimiter) sweep() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for ip, u := range l.perIP {
+		if u.active <= 0 && time.Since(u.windowStart) >= time.Minute {
+			delete(l.perIP, ip)
+		}
+	}
+	dropped := l.dropped
+	l.dropped = 0
+	return dropped
 }
 
 type Client struct {
 	conn        net.Conn
 	username    string
-	outgoing    chan []byte
+	outgoing    chan []byte   // never closed; senders select on done instead
+	done        chan struct{} // closed once when the client leaves
+	doneOnce    sync.Once
 	sessionKey  []byte
 	gcm         cipher.AEAD
 	ipAddr      string
@@ -103,6 +196,7 @@ type Server struct {
 	tlsCert        tls.Certificate
 	accessCertRaw  []byte // DER of the master access certificate clients must present
 	accessBundle   []byte // contents of quietroom_access.pem for this run
+	limiter        *connLimiter
 	dhParams       *DHParams
 	config         ServerConfig
 	logger         *log.Logger
@@ -308,6 +402,10 @@ func loadConfig() ServerConfig {
 		DecoyInterval:   30,
 		DecoyMinBytes:   100,
 		DecoyMaxBytes:   500,
+
+		MaxConnections:        defaultMaxConnections,
+		MaxConnectionsPerIP:   defaultMaxConnectionsPerIP,
+		MaxNewConnPerIPPerMin: defaultMaxNewConnPerIPPerMin,
 	}
 	data, err := os.ReadFile("server_config.json")
 	if err != nil {
@@ -355,6 +453,7 @@ func NewServer() (*Server, error) {
 		tlsCert:        keys.tlsCert,
 		accessCertRaw:  keys.accessCertRaw,
 		accessBundle:   keys.accessBundle,
+		limiter:        newConnLimiter(config),
 		clients:        make(map[*Client]bool),
 		join:           make(chan *Client),
 		leave:          make(chan *Client),
@@ -400,7 +499,7 @@ func (s *Server) run() {
 			if s.clients[client] {
 				delete(s.clients, client)
 				delete(s.usernames, client.username)
-				close(client.outgoing)
+				client.markDone()
 			}
 			s.mu.Unlock()
 			s.roomsMu.Lock()
@@ -454,16 +553,60 @@ func (s *Server) sendDecoyTraffic(client *Client) {
 			decoyData := make([]byte, size)
 			rand.Read(decoyData)
 			packet := s.createObfuscatedPacket(0x02, decoyData)
-			select {
-			case client.outgoing <- packet:
+			if client.send(packet) {
 				client.mu.Lock()
 				client.lastActive = time.Now()
 				client.mu.Unlock()
-			default:
 			}
 		}
 	}
 }
+
+// markDone signals that the client has left. Safe to call more than once.
+func (c *Client) markDone() {
+	c.doneOnce.Do(func() { close(c.done) })
+}
+
+// send queues a packet without blocking. It returns false if the client has
+// left or its queue is full. It never panics: outgoing is never closed.
+func (c *Client) send(packet []byte) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	select {
+	case c.outgoing <- packet:
+		return true
+	case <-c.done:
+		return false
+	default:
+		return false
+	}
+}
+
+// sendWait queues a packet, waiting up to timeout for queue space. Used for
+// file data, where dropping a chunk would corrupt the transfer.
+func (c *Client) sendWait(packet []byte, timeout time.Duration) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case c.outgoing <- packet:
+		return true
+	case <-c.done:
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+// fileDataTimeout bounds how long a sender waits for a slow recipient's queue.
+const fileDataTimeout = 30 * time.Second
 
 func (s *Server) broadcastToLobby(msg string) {
 	s.mu.RLock()
@@ -474,12 +617,10 @@ func (s *Server) broadcastToLobby(msg string) {
 			continue
 		}
 		packet := s.createObfuscatedPacket(0x01, encrypted)
-		select {
-		case client.outgoing <- packet:
+		if client.send(packet) {
 			client.mu.Lock()
 			client.lastActive = time.Now()
 			client.mu.Unlock()
-		default:
 		}
 	}
 }
@@ -561,6 +702,18 @@ func (s *Server) handleClient(conn net.Conn) {
 	defer s.wg.Done()
 
 	ipAddr := conn.RemoteAddr().String()
+
+	// Backstop: a bug while handling one client must never take down the
+	// whole server (which, with per-run keys, would lock everyone out).
+	var joined *Client
+	defer func() {
+		if r := recover(); r != nil {
+			s.logSecurity("Recovered from internal error while handling %s: %v", ipAddr, r)
+			if joined != nil {
+				s.leave <- joined
+			}
+		}
+	}()
 	s.logger.Printf("New connection attempt from %s", ipAddr)
 
 	// Complete the TLS handshake (including access key verification) up
@@ -633,6 +786,7 @@ func (s *Server) handleClient(conn net.Conn) {
 	client := &Client{
 		conn:        conn,
 		outgoing:    make(chan []byte, 4096),
+		done:        make(chan struct{}),
 		sessionKey:  sharedSecret,
 		gcm:         gcm,
 		ipAddr:      ipAddr,
@@ -696,10 +850,16 @@ func (s *Server) handleClient(conn net.Conn) {
 	s.mu.Unlock()
 	conn.SetDeadline(time.Time{})
 	client.username = username
+	joined = client
 	s.join <- client
 	go func() {
-		for packet := range client.outgoing {
-			conn.Write(packet)
+		for {
+			select {
+			case packet := <-client.outgoing:
+				conn.Write(packet)
+			case <-client.done:
+				return
+			}
 		}
 	}()
 	welcomeText, _ := client.encrypt([]byte(fmt.Sprintf("Welcome to the chat, %s!", client.username)))
@@ -882,6 +1042,10 @@ func (s *Server) handleJoinRoom(client *Client, parts []string) bool {
 		s.sendToClient(client, "Room names must start with # (e.g., #general)")
 		return true
 	}
+	if !validRoomName(roomName) {
+		s.sendToClient(client, fmt.Sprintf("Invalid room name. Use # followed by 1-%d letters, digits, '_', '-' or '.' (e.g., #general)", maxRoomNameLength))
+		return true
+	}
 
 	password := ""
 	if len(parts) > 2 {
@@ -938,6 +1102,27 @@ func (s *Server) handleJoinRoom(client *Client, parts []string) bool {
 	return true
 }
 
+const maxRoomNameLength = 32
+
+// validRoomName accepts "#" followed by 1-32 ASCII letters, digits, '_', '-' or '.'.
+func validRoomName(name string) bool {
+	if !strings.HasPrefix(name, "#") {
+		return false
+	}
+	body := name[1:]
+	if len(body) == 0 || len(body) > maxRoomNameLength {
+		return false
+	}
+	for _, ch := range body {
+		ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) handleLeaveRoom(client *Client, parts []string) bool {
 	if len(parts) < 2 {
 		s.sendToClient(client, "Usage: /leave <#room>")
@@ -947,7 +1132,10 @@ func (s *Server) handleLeaveRoom(client *Client, parts []string) bool {
 	s.roomsMu.RLock()
 	room, exists := s.rooms[roomName]
 	s.roomsMu.RUnlock()
-	if !exists || !client.rooms[roomName] {
+	client.mu.Lock()
+	isMember := client.rooms[roomName]
+	client.mu.Unlock()
+	if !exists || !isMember {
 		s.sendToClient(client, fmt.Sprintf("You are not in room %s", roomName))
 		return true
 	}
@@ -1191,7 +1379,7 @@ func (s *Server) handleFileAccept(client *Client, parts []string) {
 		return
 	}
 	packet := s.createObfuscatedPacket(0x01, encrypted)
-	transfer.sender.outgoing <- packet
+	transfer.sender.send(packet)
 	s.logger.Printf("File transfer accepted: %s -> %s (ID: %s)", transfer.sender.username, transfer.recipient.username, transferID)
 
 	go func(id string) {
@@ -1237,10 +1425,7 @@ func (s *Server) sendToClient(client *Client, message string) {
 		return
 	}
 	packet := s.createObfuscatedPacket(0x01, encrypted)
-	select {
-	case client.outgoing <- packet:
-	default:
-	}
+	client.send(packet)
 }
 
 func (s *Server) broadcastToRoom(room *Room, message string) {
@@ -1290,27 +1475,33 @@ func (s *Server) handleFileData(client *Client, encryptedData []byte) {
 				msg := fmt.Sprintf("FILE_START|%s|%s|%s", filename, filesizeStr, activeTransfer.expectedHash)
 				encrypted, _ := activeTransfer.recipient.encrypt([]byte(msg))
 				packet := s.createObfuscatedPacket(0x03, encrypted)
-				activeTransfer.recipient.outgoing <- packet
+				activeTransfer.recipient.sendWait(packet, fileDataTimeout)
 				s.logger.Printf("File transfer stream started: %s -> %s (%s, %s bytes)", client.username, activeTransfer.recipient.username, filename, filesizeStr)
 			}
 		}
 		return
 	}
 	if dataStr == "FILE_END" {
+		// Find and remove the transfer under the lock, then send without it,
+		// so a slow recipient never stalls other transfers.
+		var finished *FileTransfer
 		s.transfersMu.Lock()
 		for id, transfer := range s.fileTransfers {
 			if transfer.sender == client {
-				encrypted, _ := transfer.recipient.encrypt([]byte("FILE_END"))
-				packet := s.createObfuscatedPacket(0x03, encrypted)
-				transfer.recipient.outgoing <- packet
-				s.sendToClient(transfer.sender, "*** File transfer stream completed. ***")
-				s.sendToClient(transfer.recipient, "*** File transfer stream completed. Check hash! ***")
+				finished = transfer
 				delete(s.fileTransfers, id)
-				s.logger.Printf("File transfer completed: %s -> %s", client.username, transfer.recipient.username)
 				break
 			}
 		}
 		s.transfersMu.Unlock()
+		if finished != nil {
+			encrypted, _ := finished.recipient.encrypt([]byte("FILE_END"))
+			packet := s.createObfuscatedPacket(0x03, encrypted)
+			finished.recipient.sendWait(packet, fileDataTimeout)
+			s.sendToClient(finished.sender, "*** File transfer stream completed. ***")
+			s.sendToClient(finished.recipient, "*** File transfer stream completed. Check hash! ***")
+			s.logger.Printf("File transfer completed: %s -> %s", client.username, finished.recipient.username)
+		}
 		return
 	}
 	s.transfersMu.RLock()
@@ -1328,7 +1519,7 @@ func (s *Server) handleFileData(client *Client, encryptedData []byte) {
 			return
 		}
 		packet := s.createObfuscatedPacket(0x03, encrypted)
-		activeTransfer.recipient.outgoing <- packet
+		activeTransfer.recipient.sendWait(packet, fileDataTimeout)
 	}
 }
 
@@ -1364,6 +1555,9 @@ func (s *Server) startIdleChecker() {
             case <-s.shutdown:
                 return
             case <-ticker.C:
+                if dropped := s.limiter.sweep(); dropped > 0 {
+                    s.logSecurity("Refused %d connection(s) over connection limits in the last minute", dropped)
+                }
                 s.mu.RLock()
                 stale := []*Client{}
                 for client := range s.clients {
@@ -1461,7 +1655,18 @@ func main() {
 				tcpConn.SetKeepAlivePeriod(30 * time.Second)
 			}
 		}
+		host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+		if err != nil {
+			host = conn.RemoteAddr().String()
+		}
+		if !server.limiter.admit(host) {
+			conn.Close() // refused before the TLS handshake: no crypto work done
+			continue
+		}
 		server.wg.Add(1)
-		go server.handleClient(conn)
+		go func(conn net.Conn, host string) {
+			defer server.limiter.release(host)
+			server.handleClient(conn)
+		}(conn, host)
 	}
 }

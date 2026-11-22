@@ -186,9 +186,9 @@ export const Chat = {
     li.className = 'nav-item'
     li.dataset.room = room
     li.innerHTML = `<span class="nav-icon">${hasPassword ? '🔐' : '🔊'}</span>
-        <span style="flex:1">${room}</span>
+        <span style="flex:1">${this._escapeText(room)}</span>
         <span class="leave-btn" title="Leave room" style="color:var(--text-muted);padding:0 4px;cursor:pointer">✕</span>
-        <span class="unread-badge hidden" data-room="${room}"></span>`
+        <span class="unread-badge hidden" data-room="${this._escapeText(room)}"></span>`
 
     li.querySelector('.leave-btn').addEventListener('click', e => {
         e.stopPropagation()
@@ -227,10 +227,10 @@ export const Chat = {
       li.innerHTML = `
         <span class="user-avatar" style="width:20px;height:20px;font-size:10px;
           background:transparent;border-color:${fg};color:${fg}">
-          ${partner[0].toUpperCase()}
+          ${this._escapeText(partner[0].toUpperCase())}
         </span>
-        ${partner}
-        <span class="unread-badge hidden" data-room="${key}"></span>`
+        ${this._escapeText(partner)}
+        <span class="unread-badge hidden" data-room="${this._escapeText(key)}"></span>`
       li.addEventListener('click', () => this.switchTo(key))
       document.getElementById('dm-list').appendChild(li)
     }
@@ -345,12 +345,12 @@ export const Chat = {
 
     el.innerHTML = `
       <div class="msg-avatar" style="background:${bg};border:1.5px solid ${fg};color:${fg}">
-        ${initial}
+        ${this._escapeText(initial)}
       </div>
       <div class="msg-body">
         <div class="msg-header">
           <span class="msg-username ${isOwn ? 'own' : ''}">${this._escapeText(username)}</span>
-          <span class="msg-ts">${msg.timestamp || ''}</span>
+          <span class="msg-ts">${this._escapeText(msg.timestamp || '')}</span>
         </div>
         <div class="msg-text">${safeText}</div>
       </div>`
@@ -372,7 +372,7 @@ export const Chat = {
   },
 
   updateUnreadBadge(channelKey, count) {
-    const badges = document.querySelectorAll(`.unread-badge[data-room="${channelKey}"]`)
+    const badges = document.querySelectorAll(`.unread-badge[data-room="${CSS.escape(channelKey)}"]`)
     badges.forEach(b => {
       if (count > 0) {
         b.textContent = count > 99 ? '99+' : count

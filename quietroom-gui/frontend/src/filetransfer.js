@@ -65,7 +65,7 @@ export const FileTransfer = {
     }
 
     try {
-      const path = await window.go.main.App.PickFile()
+      const path = await window.go.main.App.PickFileToSend()
       if (!path) return
       _pendingRecipient = recipient
       await window.go.main.App.InitiateFileTransfer(recipient, path)

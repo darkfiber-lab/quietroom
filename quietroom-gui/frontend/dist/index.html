@@ -1,10 +1,26 @@
+<!--
+Copyright (C) 2026 darkfiber-lab
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, version 3.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+-->
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'" />
   <title>QuietRoom</title>
-  <script type="module" crossorigin src="/assets/index-OxCzFrQC.js"></script>
+  <script type="module" crossorigin src="/assets/index-DbuSX_Th.js"></script>
   <link rel="stylesheet" crossorigin href="/assets/index-BZSZZ54b.css">
 </head>
 <body>
@@ -44,9 +60,9 @@
       </div>
 
       <div class="form-group">
-        <label>Certificate file (chat_public.pem)</label>
+        <label>Access file (quietroom_access.pem)</label>
         <div class="file-row">
-          <input type="text" id="input-cert" placeholder="chat_public.pem" readonly
+          <input type="text" id="input-cert" placeholder="quietroom_access.pem" readonly
                   autocorrect="off" autocapitalize="off" spellcheck="false" />
           <button class="btn btn-secondary" id="btn-browse-cert">Browse</button>
         </div>
@@ -109,12 +125,9 @@
       <div class="topbar" style="--wails-draggable: drag">
         <div class="topbar-title" id="topbar-title">Lobby</div>
         <div class="topbar-actions">
-          <button class="btn btn-ghost btn-sm" id="btn-list-users" title="List all online users"
-                  onclick="App.listUsers()">👥 Users</button>
-          <button class="btn btn-ghost btn-sm" id="btn-list-members" title="List members of current channel"
-                  onclick="App.listMembers()">👁 Members</button>
-          <button class="btn btn-ghost btn-sm" id="btn-list-rooms" title="List rooms"
-                  onclick="App.listRooms()">📋 Rooms</button>
+          <button class="btn btn-ghost btn-sm" id="btn-list-users" title="List all online users">👥 Users</button>
+          <button class="btn btn-ghost btn-sm" id="btn-list-members" title="List members of current channel">👁 Members</button>
+          <button class="btn btn-ghost btn-sm" id="btn-list-rooms" title="List rooms">📋 Rooms</button>
         </div>
       </div>
 
@@ -166,7 +179,7 @@
         <input type="password" id="join-room-password" placeholder="optional" />
       </div>
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick="App.closeModal('modal-join-room')">Cancel</button>
+        <button class="btn btn-ghost" data-close-modal="modal-join-room">Cancel</button>
         <button class="btn btn-primary" id="btn-confirm-join">Join</button>
       </div>
     </div>
@@ -183,7 +196,7 @@
         <ul id="dm-suggestions" class="suggestions-list hidden"></ul>
       </div>
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick="App.closeModal('modal-new-dm')">Cancel</button>
+        <button class="btn btn-ghost" data-close-modal="modal-new-dm">Cancel</button>
         <button class="btn btn-primary" id="btn-confirm-dm">Open DM</button>
       </div>
     </div>
@@ -251,7 +264,7 @@
       </div>
 
       <div class="modal-actions">
-        <button class="btn btn-ghost" onclick="App.closeModal('modal-settings')">Cancel</button>
+        <button class="btn btn-ghost" data-close-modal="modal-settings">Cancel</button>
         <button class="btn btn-primary" id="btn-save-settings">Save</button>
       </div>
     </div>
@@ -262,7 +275,7 @@
         <h3>Available Rooms</h3>
         <ul id="room-list-items" style="list-style:none;display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto"></ul>
         <div class="modal-actions">
-          <button class="btn btn-ghost" onclick="App.closeModal('modal-room-list')">Close</button>
+          <button class="btn btn-ghost" data-close-modal="modal-room-list">Close</button>
         </div>
       </div>
     </div>
@@ -273,7 +286,7 @@
         <h3>Online Users</h3>
         <ul id="user-list-items" style="list-style:none;display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto"></ul>
         <div class="modal-actions">
-          <button class="btn btn-ghost" onclick="App.closeModal('modal-user-list')">Close</button>
+          <button class="btn btn-ghost" data-close-modal="modal-user-list">Close</button>
         </div>
       </div>
     </div>

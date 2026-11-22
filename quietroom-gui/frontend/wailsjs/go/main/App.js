@@ -66,6 +66,10 @@ export function PickFile() {
   return window['go']['main']['App']['PickFile']();
 }
 
+export function PickFileToSend() {
+  return window['go']['main']['App']['PickFileToSend']();
+}
+
 export function RequestMemberList(arg1) {
   return window['go']['main']['App']['RequestMemberList'](arg1);
 }
