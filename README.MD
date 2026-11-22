@@ -110,8 +110,8 @@ For detailed setup instructions, configuration options, and troubleshooting:
 │          │   4. Encrypted Session    │          │
 └──────────┘                           └──────────┘
      │                                      │
-     │         ┌────────────────┐          │
-     └────────►│  AES-256-GCM   │◄─────────┘
+     │         ┌────────────────┐           │
+     └────────►│  AES-256-GCM   │◄──────────┘
                │  Encrypted     │
                │  Messages      │
                └────────────────┘
