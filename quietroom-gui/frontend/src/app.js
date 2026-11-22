@@ -251,6 +251,23 @@ export const App = {
     document.getElementById('btn-open-settings').addEventListener('click', () => {
       Settings.openModal(this.config)
     })
+
+    // Topbar actions and modal close buttons (no inline handlers: CSP blocks them)
+    document.getElementById('btn-list-users').addEventListener('click', () => this.listUsers())
+    document.getElementById('btn-list-members').addEventListener('click', () => this.listMembers())
+    document.getElementById('btn-list-rooms').addEventListener('click', () => this.listRooms())
+    document.querySelectorAll('[data-close-modal]').forEach(btn => {
+      btn.addEventListener('click', () => this.closeModal(btn.dataset.closeModal))
+    })
+
+    // Links in messages open in the system browser; the app window never navigates away
+    document.getElementById('messages').addEventListener('click', e => {
+      const link = e.target.closest('a[href]')
+      if (!link) return
+      e.preventDefault()
+      const href = link.getAttribute('href') || ''
+      if (/^https?:\/\//i.test(href)) window.runtime.BrowserOpenURL(href)
+    })
     // Room name autocomplete filtering
     document.getElementById('join-room-name').addEventListener('input', () => {
       if (this._roomSuggestions && this._roomSuggestions.length > 0) {
@@ -509,7 +526,7 @@ export const App = {
         const roomName = room.split(' ')[0]
         const li = document.createElement('li')
         li.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:var(--bg-input);border-radius:6px'
-        li.innerHTML = `<span style="font-size:13px">${room}</span>
+        li.innerHTML = `<span style="font-size:13px">${Chat._escapeText(room)}</span>
           <button class="btn btn-primary btn-sm">Join</button>`
         li.querySelector('button').addEventListener('click', () => {
           go().JoinRoom(roomName, '').then(() => {
@@ -536,7 +553,7 @@ export const App = {
         if (user === this.username) return
         const li = document.createElement('li')
         li.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:var(--bg-input);border-radius:6px'
-        li.innerHTML = `<span style="font-size:13px">${user}</span>
+        li.innerHTML = `<span style="font-size:13px">${Chat._escapeText(user)}</span>
             <button class="btn btn-primary btn-sm">DM</button>`
         li.querySelector('button').addEventListener('click', () => {
             Chat.openDM(user)
@@ -560,7 +577,7 @@ export const App = {
               if (user === this.username) return
               const li = document.createElement('li')
               li.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:var(--bg-input);border-radius:6px'
-              li.innerHTML = `<span style="font-size:13px">${user}</span>
+              li.innerHTML = `<span style="font-size:13px">${Chat._escapeText(user)}</span>
                   <button class="btn btn-primary btn-sm">DM</button>`
               li.querySelector('button').addEventListener('click', () => {
                   Chat.openDM(user)
