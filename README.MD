@@ -153,9 +153,16 @@ go build -o quietroom_server quietroom_server.go
 # Build client
 go build -o  quietroom_client quietroom_client.go
 
-# Run tests (if available)
-go test ./...
+# Attack tests: hostile clients against a real server process
+# (QUIETROOM_RACE=1 builds the server with the race detector)
+QUIETROOM_RACE=1 go test -count=1 ./tests/attack/
 ```
+
+The attack tests start real server instances on local ports and try to get
+in or break them: missing and forged access keys, access files from another
+run, invalid DH keys, hostile usernames and room names, malformed packets,
+file-transfer hijacking, reconnect races, slow readers, connection floods,
+and metadata in logs. They run in CI on every change.
 
 ## Contributing
 

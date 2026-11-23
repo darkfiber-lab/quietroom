@@ -1415,7 +1415,9 @@ func (s *Server) handleFileAccept(client *Client, parts []string) {
 		return
 	}
 
+	s.transfersMu.Lock() // read under the lock by the sender's handleFileData
 	transfer.accepted = true
+	s.transfersMu.Unlock()
 	s.sendToClient(client, "*** File transfer accepted. Waiting for file stream... ***")
 	confirmMsg := fmt.Sprintf("*** %s accepted your file transfer (ID: %s). ***", client.username, transferID)
 	s.sendToClient(transfer.sender, confirmMsg)
@@ -1449,9 +1451,12 @@ func (s *Server) handleFileDecline(client *Client, parts []string) {
 		return
 	}
 	transferID := parts[1]
+	// Only the recipient may decline: check before removing the transfer,
+	// so other members cannot cancel transfers that are not theirs.
 	s.transfersMu.Lock()
 	transfer, exists := s.fileTransfers[transferID]
-	if exists {
+	forOther := exists && transfer.recipient != client
+	if exists && !forOther {
 		delete(s.fileTransfers, transferID)
 	}
 	s.transfersMu.Unlock()
@@ -1459,7 +1464,7 @@ func (s *Server) handleFileDecline(client *Client, parts []string) {
 		s.sendToClient(client, "Transfer ID not found or expired.")
 		return
 	}
-	if transfer.recipient != client {
+	if forOther {
 		s.sendToClient(client, "This transfer is not for you.")
 		return
 	}
