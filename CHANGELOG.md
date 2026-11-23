@@ -2,17 +2,35 @@
 
 ## [Unreleased]
 
+### ⚠ Breaking
+- **Protocol 3** — the wire protocol was rebuilt. 3.x servers and clients do not talk to 2.x: update the server, the CLI and GUI clients and the Python connector together. The access file format is unchanged (the server certificate now uses ECDSA P-256 instead of RSA-4096); as always, the restart issues a new `quietroom_access.pem`.
+
 ### Added
-- **Attack tests** — `tests/attack/` runs hostile clients against a real, race-detector-enabled server process in CI: missing, forged and stale access keys, invalid DH keys, hostile usernames and room names, malformed packets, file-transfer hijacking, reconnect races, slow readers, connection floods, and a check that logs contain no member metadata
+- **Fast, reliable file transfers** — files of any size, with credit-based flow control (no fixed pauses), several transfers at once in each direction, and `/cancel <id>`. Chat stays responsive during transfers (chat is always sent before file data). Received data goes to a hidden `.part` file that is removed if a transfer fails. Locally a 200 MB file transfers in under a second.
+- **Receive limit** — clients decline files above a configurable size (`max_receive_mb`, default 8 GB)
+- **Room limits** — `max_rooms` (default 200) and `max_rooms_per_member` (default 20); empty rooms are removed
+- **Message rate limit** — about 20 messages per second per member (bursts up to 60); flooding members are told and their excess messages dropped
+- **Shared client library** — `client/` implements the protocol once for the CLI and the GUI
+- **Tests** — protocol unit tests and fuzzing (`wire/`); integration tests with a real server, the client library, the CLI in a pseudo-terminal and the Python connector (`tests/integration/`); GUI backend tests (`quietroom-gui/app_test.go`); attack tests with hostile clients (`tests/attack/`): missing, forged and stale access keys, malformed frames, spoofed fields, hostile names, flow-control abuse, floods, reconnect races, slow readers, and a check that logs contain no member metadata. All run in CI with the race detector.
+- **Python connector** — `on_presence` callback for members joining and leaving
 - **Security policy** — `SECURITY.md`; vulnerabilities can be reported privately via GitHub's "Report a vulnerability"
 
 ### Changed
+- **Framing** — every frame states its exact length (`| length | type | flags | padding length | payload | padding |`). The receiver never guesses where a frame ends, which removes the stream desynchronisation behind the old instability. Frames are padded to size classes (256 B … 64 KB) instead of 0–255 random bytes.
+- **Typed messages** — control messages are JSON with explicit types; the server sets sender names and timestamps itself, so message text can no longer be mistaken for commands or system notices, and members cannot impersonate each other
+- **Transfer IDs** — random 128-bit IDs instead of `sender_recipient_timestamp`
+- **Decoys** — sent at random intervals (0.5–1.5 × the configured interval) instead of a fixed rhythm
+- **Encryption** — the inner Diffie-Hellman + AES-GCM layer was removed: it protected the same two endpoints as TLS 1.3, which already provides forward secrecy. The server key is ECDSA P-256 (faster start and handshakes).
+- **Slow members** — a member that stops reading is disconnected once its queue is full or a write times out (30 s), instead of silently losing messages
+- **CLI** — asks for the username before connecting (and again if it is taken); the prompt shows the current room; no more local echo (your messages are shown as the server delivered them); UTF-8 input
+- **Python connector** — no longer needs the `cryptography` package; file offers are declined automatically
 - **Docker image** — the final image is built `FROM scratch` and contains only the static server binary (no OS packages, no shell); the preparation stage's base image is pinned by digest
 - **Dependencies** — `golang.org/x/crypto` v0.58.0, `golang.org/x/term` v0.47.0; minimum Go version 1.26
 - **CI** — all GitHub Actions pinned to commit SHAs; workflow inputs passed via environment variables; checkouts no longer persist credentials; releases are published with the GitHub CLI instead of a third-party action; Wails CLI pinned to v2.13.0; `npm ci` instead of `npm install`; `go mod download` + `go mod verify` instead of `go mod tidy` during builds
 
 ### Fixed
-- **File transfers** — `/decline` by a member who is not the recipient no longer cancels the transfer; the "accepted" state of a transfer is updated under its lock
+- **File transfers** — `/decline` by a member who is not the recipient no longer cancels the transfer
+- **Stream desynchronisation** — padding without a length field could swallow or leave behind bytes (for example when a decoy arrived within 10 ms, or TLS split a packet), corrupting every following message
 
 ---
 

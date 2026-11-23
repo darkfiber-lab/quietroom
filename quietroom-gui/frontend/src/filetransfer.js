@@ -81,7 +81,7 @@ export const FileTransfer = {
 
     document.getElementById('file-request-details').innerHTML = `
       <div><strong>From:</strong> ${_escHtml(data.senderName)}</div>
-      <div><strong>File:</strong> ${_escHtml(data.filename)}</div>
+      <div><strong>File:</strong> ${_escHtml(data.filename)} (${_escHtml(_formatBytes(data.filesize))})</div>
       <div class="file-request-hash"><strong>SHA-256:</strong> ${_escHtml(data.expectedHash)}</div>
       <div><strong>Transfer ID:</strong> ${_escHtml(data.transferID)}</div>`
   },
@@ -130,6 +130,11 @@ export const FileTransfer = {
     const p = Math.round(data.percent || 0)
     fill.style.width = `${p}%`
     pct.textContent = `${p}%`
+  },
+
+  failTransfer(data) {
+    document.getElementById('transfer-bar').classList.add('hidden')
+    Chat.appendSystem(`✗ File transfer${data.filename ? ' of ' + data.filename : ''} ended: ${data.reason}`)
   },
 
   completeReceive(data) {

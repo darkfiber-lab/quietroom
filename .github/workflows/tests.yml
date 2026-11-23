@@ -1,0 +1,134 @@
+# Copyright (C) 2026 darkfiber-lab
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, version 3.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# Tests for the server, the client library and the Python connector:
+#   - unit tests and short fuzzing of the protocol (wire) package
+#   - integration tests: real server + client library (chat, rooms, DMs,
+#     large, concurrent and interrupted file transfers, Python connector)
+#   - GUI backend tests: the GUI's Go layer driven like the frontend drives it
+#   - attack tests: hostile clients (access keys, malformed frames, spoofing,
+#     flow-control abuse, floods, reconnect races, log privacy)
+# The server is built with the race detector; a reported data race fails the run.
+
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: '29 5 * * 1'   # weekly, Monday 05:29 UTC: new Go releases
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  QUIETROOM_RACE: '1'
+
+jobs:
+  unit:
+    name: Unit and fuzz tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: false
+
+      - name: Vet
+        run: |
+          go vet ./wire/ ./client/ ./tests/...
+          go vet quietroom_server.go
+          go vet quietroom_client.go
+
+      - name: Unit tests
+        run: go test -race -count=1 ./wire/ ./client/
+
+      - name: Fuzz the frame reader and message decoder
+        run: |
+          for target in FuzzRead FuzzDecodeMsg FuzzParseCommand; do
+            go test ./wire/ -run=NONE -fuzz="^${target}\$" -fuzztime=60s
+          done
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: false
+
+      - name: Run integration tests (race-enabled server and client)
+        run: go test -race -count=1 -timeout 15m -v ./tests/integration/
+
+  gui:
+    name: GUI backend tests
+    runs-on: macos-latest   # the GUI's native dependencies build as-is on macOS
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: false
+
+      - name: Run GUI backend tests against a real server
+        working-directory: quietroom-gui
+        run: go test -race -count=1 -v ./...
+
+  attack-tests:
+    name: Attack tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache: false
+
+      - name: Run attack tests (race-enabled server)
+        run: go test -race -count=1 -timeout 15m -v ./tests/attack/

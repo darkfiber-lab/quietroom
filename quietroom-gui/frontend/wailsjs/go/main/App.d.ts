@@ -4,6 +4,8 @@ import {main} from '../models';
 
 export function AcceptFileTransfer(arg1:string):Promise<void>;
 
+export function CancelFileTransfer(arg1:string):Promise<void>;
+
 export function Connect(arg1:number):Promise<void>;
 
 export function ConnectCustom(arg1:string,arg2:number,arg3:string,arg4:string):Promise<void>;

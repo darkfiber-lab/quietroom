@@ -18,41 +18,35 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/binary"
-	"encoding/hex"
-	"math/big"
 	"net"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/darkfiber-lab/quietroom/client"
+	"github.com/darkfiber-lab/quietroom/tests/testserver"
+	"github.com/darkfiber-lab/quietroom/wire"
 )
 
-// forgeAccessCert creates a self-signed certificate that copies the subject
-// and validity of the real access certificate, with an attacker-owned key.
+const sha = "0000000000000000000000000000000000000000000000000000000000000000"
+
+// forgeAccessCert copies the subject and validity of the real access
+// certificate onto an attacker-owned key.
 func forgeAccessCert(t *testing.T, real tls.Certificate) tls.Certificate {
 	t.Helper()
 	orig, err := x509.ParseCertificate(real.Certificate[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	tmpl := &x509.Certificate{
-		SerialNumber: orig.SerialNumber,
-		Subject:      orig.Subject,
-		NotBefore:    orig.NotBefore,
-		NotAfter:     orig.NotAfter,
-		KeyUsage:     orig.KeyUsage,
-		ExtKeyUsage:  orig.ExtKeyUsage,
+		SerialNumber: orig.SerialNumber, Subject: orig.Subject,
+		NotBefore: orig.NotBefore, NotAfter: orig.NotAfter,
+		KeyUsage: orig.KeyUsage, ExtKeyUsage: orig.ExtKeyUsage,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -63,44 +57,37 @@ func forgeAccessCert(t *testing.T, real tls.Certificate) tls.Certificate {
 
 // TestAccessKeyRequired: only holders of the current access file get in.
 func TestAccessKeyRequired(t *testing.T) {
-	s := startServer(t, serverConfig{})
+	s := start(t, testserver.Config{})
 
-	if info, err := os.Stat(filepath.Join(s.dir, accessFileName)); err != nil {
+	if info, err := os.Stat(s.AccessFile); err != nil {
 		t.Fatal(err)
 	} else if mode := info.Mode().Perm(); mode != 0600 {
 		t.Errorf("access file mode = %o, want 600", mode)
 	}
 
 	t.Run("no client certificate", func(t *testing.T) {
-		if !handshakeRejected(s.dialTLS(nil)) {
-			t.Fatal("server accepted a TLS session without an access key")
+		if !rejected(dialTLS(s, s.ServerCert, nil)) {
+			t.Fatal("server accepted a session without an access key")
 		}
 	})
-
 	t.Run("forged access certificate", func(t *testing.T) {
-		forged := forgeAccessCert(t, s.access)
-		if !handshakeRejected(s.dialTLS([]tls.Certificate{forged})) {
+		if !rejected(dialTLS(s, s.ServerCert, []tls.Certificate{forgeAccessCert(t, s.Access)})) {
 			t.Fatal("server accepted a forged access certificate")
 		}
 	})
-
 	t.Run("access file from another server run", func(t *testing.T) {
-		other := startServer(t, serverConfig{})
-		if !handshakeRejected(s.dialTLS([]tls.Certificate{other.access})) {
+		other := start(t, testserver.Config{})
+		if !rejected(dialTLS(s, s.ServerCert, []tls.Certificate{other.Access})) {
 			t.Fatal("server accepted the access key of a different run")
 		}
-		// The client side notices too: the pinned server certificate of
-		// the stale file does not match.
-		stale := *other
-		stale.addr = s.addr
-		if conn, err := stale.dialTLS([]tls.Certificate{other.access}); err == nil {
-			conn.Close()
-			t.Fatal("client accepted a server certificate that does not match its access file")
+		// The client side notices too: the stale file's pin does not match.
+		if _, err := client.Dial(client.Config{Addr: s.Addr, AccessFile: other.AccessFile, Username: "stale"}); err == nil ||
+			!strings.Contains(err.Error(), "does not match") {
+			t.Fatalf("client with a stale access file: %v", err)
 		}
 	})
-
 	t.Run("plain TCP garbage", func(t *testing.T) {
-		conn, err := net.DialTimeout("tcp", s.addr, 5*time.Second)
+		conn, err := net.DialTimeout("tcp", s.Addr, 5*time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -108,90 +95,118 @@ func TestAccessKeyRequired(t *testing.T) {
 		conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
 		expectClosed(t, conn, 10*time.Second)
 	})
-
 	t.Run("valid access key", func(t *testing.T) {
-		m := s.login(t, uniqueName("member"))
-		m.sendText("/help")
-		m.expect("Available Commands")
+		m := s.Join(t, uniqueName("member"))
+		m.C.Request(wire.THelp, "")
+		m.Wait("help", 15*time.Second, testserver.Text(client.EvInfo, "Available Commands"))
 	})
-
-	s.assertHealthy()
+	healthy(t, s)
 }
 
-// TestHandshakeTimeout: a peer that connects and stays silent is dropped.
-func TestHandshakeTimeout(t *testing.T) {
+// TestSilentPeersDropped: peers that connect and say nothing are dropped
+// after the handshake timeout, with or without a valid access key.
+func TestSilentPeersDropped(t *testing.T) {
 	t.Parallel()
-	s := startServer(t, serverConfig{})
-	conn, err := net.DialTimeout("tcp", s.addr, 5*time.Second)
+	s := start(t, testserver.Config{})
+	var wg sync.WaitGroup
+	check := func(name string, conn net.Conn) {
+		defer wg.Done()
+		defer conn.Close()
+		start := time.Now()
+		expectClosed(t, conn, 30*time.Second)
+		t.Logf("%s dropped after %s", name, time.Since(start).Round(time.Second))
+	}
+	tcp, err := net.DialTimeout("tcp", s.Addr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	start := time.Now()
-	expectClosed(t, conn, 30*time.Second)
-	t.Logf("silent connection closed after %s", time.Since(start).Round(time.Second))
-	s.assertHealthy()
+	r := rawSession(t, s) // valid TLS, never sends hello
+	wg.Add(2)
+	go check("silent TCP", tcp)
+	go check("TLS without hello", r.conn)
+	wg.Wait()
+	healthy(t, s)
 }
 
-// TestDHKeyValidation: invalid or oversized DH public keys end the session.
-func TestDHKeyValidation(t *testing.T) {
-	s := startServer(t, serverConfig{})
-	p := dhPrime
+// TestMalformedFrames: broken frames before and after login end that
+// connection only.
+func TestMalformedFrames(t *testing.T) {
+	s := start(t, testserver.Config{})
+	bystander := s.Join(t, "bystander")
 	cases := map[string][]byte{
-		"zero":       {},
-		"one":        big.NewInt(1).Bytes(),
-		"p-1":        new(big.Int).Sub(p, big.NewInt(1)).Bytes(),
-		"p":          p.Bytes(),
-		"p+1":        new(big.Int).Add(p, big.NewInt(1)).Bytes(),
-		"all ones":   bytesOf(0xff, 256),
-		"4096 bytes": bytesOf(0x01, 4096),
+		"length 0":            {0, 0, 0, 0},
+		"length 4 GB":         frame(0xFFFFFFFF, wire.FrameControl, 0, 0, nil),
+		"length over max":     frame(wire.MaxFrame, wire.FrameControl, 0, 0, make([]byte, 64)),
+		"padding over frame":  frame(10, wire.FrameControl, 0, 9, make([]byte, 6)),
+		"unknown frame type":  frame(4, 0x7f, 0, 0, nil),
+		"flags set":           frame(4, wire.FrameControl, 0x80, 0, nil),
+		"not JSON":            controlFrame([]byte("hello there")),
+		"JSON without type":   controlFrame([]byte(`{"user":"x"}`)),
+		"JSON array":          controlFrame([]byte(`[1,2,3]`)),
+		"invalid UTF-8":       controlFrame([]byte("{\"t\":\"chat\",\"text\":\"\xff\xfe\"}")),
+		"wrong field type":    controlFrame([]byte(`{"t":"chat","size":"big"}`)),
+		"truncated frame":     frame(1000, wire.FrameControl, 0, 0, make([]byte, 10)),
+		"data frame as hello": frame(4+16, wire.FrameData, 0, 0, make([]byte, 16)),
 	}
-	for name, pub := range cases {
-		t.Run(name, func(t *testing.T) {
-			conn, err := s.dialTLS([]tls.Certificate{s.access})
-			if err != nil {
-				t.Fatal(err)
+	for name, b := range cases {
+		t.Run("before login/"+name, func(t *testing.T) {
+			r := rawSession(t, s)
+			r.write(b)
+			if name == "truncated frame" {
+				r.conn.CloseWrite()
 			}
-			defer conn.Close()
-			if _, err := s.readServerDH(conn); err != nil {
-				t.Fatal(err)
+			expectClosed(t, r.conn, 20*time.Second)
+		})
+		t.Run("after login/"+name, func(t *testing.T) {
+			r := rawLogin(t, s, uniqueName("fuzz"))
+			r.write(b)
+			if name == "truncated frame" {
+				r.conn.CloseWrite()
 			}
-			sendDHPublic(conn, pub)
-			expectClosed(t, conn, 10*time.Second)
+			if name == "data frame as hello" {
+				// A data frame for an unknown transfer is ignored, not fatal.
+				r.send(wire.Msg{T: wire.THelp})
+				r.waitFor("help", func(m wire.Msg) bool { return strings.Contains(m.Text, "Available Commands") })
+				return
+			}
+			expectClosed(t, r.conn, 20*time.Second)
 		})
 	}
 
-	t.Run("oversized length", func(t *testing.T) {
-		conn, err := s.dialTLS([]tls.Certificate{s.access})
-		if err != nil {
-			t.Fatal(err)
+	t.Run("wrong protocol version", func(t *testing.T) {
+		r := rawSession(t, s)
+		r.send(wire.Msg{T: wire.THello, V: 2, User: "old"})
+		m := r.next(10 * time.Second)
+		if m.T != wire.TError || m.Code != wire.CodeVersion {
+			t.Fatalf("got %+v", m)
 		}
-		defer conn.Close()
-		if _, err := s.readServerDH(conn); err != nil {
-			t.Fatal(err)
-		}
-		var n [4]byte
-		binary.BigEndian.PutUint32(n[:], 0xFFFFFFF0) // would be a 4 GB allocation
-		conn.Write(n[:])
-		expectClosed(t, conn, 10*time.Second)
+		expectClosed(t, r.conn, 10*time.Second)
+	})
+	t.Run("request before hello", func(t *testing.T) {
+		r := rawSession(t, s)
+		r.send(wire.Msg{T: wire.TChat, Text: "skip login"})
+		expectClosed(t, r.conn, 10*time.Second)
+	})
+	t.Run("unknown message type", func(t *testing.T) {
+		r := rawLogin(t, s, uniqueName("u"))
+		r.send(wire.Msg{T: "make_admin"})
+		r.waitFor("error", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "Unknown request") })
 	})
 
-	s.assertHealthy()
+	// The bystander never saw any of it.
+	bystander.C.Request(wire.THelp, "")
+	bystander.Wait("help", 15*time.Second, testserver.Text(client.EvInfo, "Available Commands"))
+	healthy(t, s)
 }
 
-func bytesOf(b byte, n int) []byte {
-	out := make([]byte, n)
-	for i := range out {
-		out[i] = b
-	}
-	return out
-}
-
-// TestUsernameValidation: hostile usernames are refused, names are unique.
-func TestUsernameValidation(t *testing.T) {
-	s := startServer(t, serverConfig{})
-	bad := map[string]string{
-		"empty":            "   ",
+// TestHostileUsernames: names that could inject markup, escapes or
+// confusables are refused, and names are unique.
+func TestHostileUsernames(t *testing.T) {
+	s := start(t, testserver.Config{})
+	for name, user := range map[string]string{
+		"empty":            "",
+		"spaces only":      "   ",
+		"leading space":    " admin",
 		"control char":     "ab\x07cd",
 		"newline":          "ab\ncd",
 		"too long":         strings.Repeat("a", 33),
@@ -199,213 +214,253 @@ func TestUsernameValidation(t *testing.T) {
 		"non-ascii":        "ädmin",
 		"ansi escape":      "\x1b[31mred",
 		"zero-width space": "ad​min",
-	}
-	for name, username := range bad {
+	} {
 		t.Run(name, func(t *testing.T) {
-			m := s.session(t)
-			m.expect("Enter your username")
-			m.sendText(username)
-			expectClosed(t, m.conn, 10*time.Second)
+			r := rawSession(t, s)
+			r.send(wire.Msg{T: wire.THello, V: wire.Version, User: user})
+			m := r.next(10 * time.Second)
+			if m.T != wire.TError || m.Code != wire.CodeInvalidUsername {
+				t.Fatalf("got %+v", m)
+			}
+			expectClosed(t, r.conn, 10*time.Second)
 		})
 	}
-
 	t.Run("duplicate", func(t *testing.T) {
 		name := uniqueName("taken")
-		s.login(t, name)
-		m := s.session(t)
-		m.expect("Enter your username")
-		m.sendText(name)
-		m.expect("Username already taken")
-		expectClosed(t, m.conn, 10*time.Second)
+		rawLogin(t, s, name)
+		r := rawSession(t, s)
+		r.send(wire.Msg{T: wire.THello, V: wire.Version, User: name})
+		if m := r.next(10 * time.Second); m.T != wire.TError || m.Code != wire.CodeUsernameTaken {
+			t.Fatalf("got %+v", m)
+		}
 	})
-
-	s.assertHealthy()
+	healthy(t, s)
 }
 
-// TestMalformedPackets: garbage from an authenticated member is survived,
-// and the member's session keeps working afterwards.
-func TestMalformedPackets(t *testing.T) {
-	s := startServer(t, serverConfig{})
-	m := s.login(t, uniqueName("fuzz"))
-	stillWorks := func() {
-		t.Helper()
-		m.sendText("/help")
-		m.expect("Available Commands")
+// TestSpoofing: fields a client sends about itself are never trusted.
+func TestSpoofing(t *testing.T) {
+	s := start(t, testserver.Config{})
+	mallory := rawLogin(t, s, "mallory")
+	alice := s.Join(t, "alice")
+
+	mallory.send(wire.Msg{T: wire.TChat, From: "alice", User: "alice", Time: "00:00:00", Text: "I am alice"})
+	e := alice.Wait("chat", 15*time.Second, testserver.Text(client.EvChat, "I am alice"))
+	if e.From != "mallory" || e.Time == "00:00:00" {
+		t.Fatalf("spoofed chat: %+v", e)
 	}
-
-	m.writePacket(0x01, bytesOf(0x41, 200)) // undecryptable text
-	m.writePacket(0x01, []byte{1, 2})       // shorter than a nonce
-	m.writePacket(0x01, nil)                // empty
-	m.writePacket(0x7f, bytesOf(0x00, 64))  // unknown packet type
-	m.writePacket(0x03, bytesOf(0x42, 300)) // undecryptable file data
-	stillWorks()
-
-	// File stream messages without a transfer are ignored.
-	m.writePacket(0x03, m.seal([]byte("FILE_START|evil.bin|1000")))
-	m.writePacket(0x03, m.seal([]byte("FILE_START|../../etc/passwd|-5")))
-	m.writePacket(0x03, m.seal(bytesOf(0x00, 4000)))
-	m.writePacket(0x03, m.seal([]byte("FILE_END")))
-	stillWorks()
-
-	// Declared length above the server's packet limit: dropped, stream kept.
-	big := make([]byte, 3+40000+1)
-	big[0] = 0x01
-	binary.BigEndian.PutUint16(big[1:3], 40000)
-	m.conn.Write(big)
-	stillWorks()
-
-	// A truncated packet followed by a disconnect.
-	t.Run("truncated", func(t *testing.T) {
-		v := s.login(t, uniqueName("trunc"))
-		hdr := []byte{0x01, 0x10, 0x00, 1, 2, 3}
-		v.conn.Write(hdr)
-		v.conn.Close()
-	})
-
-	s.assertHealthy()
+	mallory.send(wire.Msg{T: wire.TDM, To: "alice", From: "admin", Text: "trust me"})
+	e = alice.Wait("dm", 15*time.Second, testserver.Kind(client.EvDM))
+	if e.From != "mallory" {
+		t.Fatalf("spoofed DM sender: %+v", e)
+	}
+	// Presence and transfer messages are server-only.
+	for _, m := range []wire.Msg{
+		{T: wire.TJoined, User: "admin", Room: "#x"},
+		{T: wire.TWelcome, User: "alice"},
+		{T: wire.TFileOffered, ID: strings.Repeat("ab", 16)},
+		{T: wire.TFileDone, ID: strings.Repeat("ab", 16)},
+	} {
+		mallory.send(m)
+		mallory.waitFor("refusal of "+m.T, func(r wire.Msg) bool { return r.T == wire.TError && strings.Contains(r.Text, "Unknown request") })
+	}
+	healthy(t, s)
 }
 
-// TestCommandAbuse: room, DM and file-transfer commands cannot be used to
-// inject content, read other rooms or hijack other members' transfers.
-func TestCommandAbuse(t *testing.T) {
-	s := startServer(t, serverConfig{})
-	alice := s.login(t, uniqueName("alice"))
-	bob := s.login(t, uniqueName("bob"))
-	eve := s.login(t, uniqueName("eve"))
+// TestRoomAbuse: hostile room names, password rooms and membership checks.
+func TestRoomAbuse(t *testing.T) {
+	s := start(t, testserver.Config{})
+	alice := s.Join(t, "alice")
+	eve := rawLogin(t, s, "eve")
 
-	// ── invalid room names ──
-	{
-		for _, room := range []string{
-			"#<script>alert(1)</script>",
-			"#" + strings.Repeat("r", 33),
-			"#ünïcode",
-			"#a\x1b[2J",
-			"#",
-		} {
-			eve.sendText("/join " + room)
-			eve.expect("Invalid room name")
-		}
-		eve.sendText("/join noprefix")
-		eve.expect("must start with #")
+	for _, room := range []string{"#<script>alert(1)</script>", "#" + strings.Repeat("r", 33), "#ünïcode", "#a\x1b[2J", "#", "noprefix", ""} {
+		eve.send(wire.Msg{T: wire.TJoin, Room: room})
+		eve.waitFor("invalid room", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "Invalid room name") })
 	}
+	eve.send(wire.Msg{T: wire.TJoin, Room: "#x", Password: strings.Repeat("p", wire.MaxPasswordBytes+1)})
+	eve.waitFor("long password", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "Password too long") })
 
-	// ── password room ──
-	{
-		alice.sendText("/join #vault correct-horse")
-		alice.expect("Created and joined room #vault")
+	alice.C.Join("#vault", "correct horse")
+	alice.Wait("joined", 15*time.Second, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#vault" })
+	eve.send(wire.Msg{T: wire.TChat, Room: "#vault", Text: "let me in"})
+	eve.waitFor("not a member", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "not a member of #vault") })
+	eve.send(wire.Msg{T: wire.TLeave, Room: "#vault"})
+	eve.waitFor("not in room", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "not in room") })
 
-		eve.sendText("/join #vault")
-		eve.expect("password-protected")
-		eve.sendText("/join #vault wrong")
-		eve.expect("Incorrect password")
-		eve.sendText("/members #vault")
-		eve.expect("Room not found or access denied")
-
-		eve.sendText("[#vault] let me in")
-		eve.expect("You are not a member of #vault")
-
-		alice.sendText("[#vault] the-secret-payload")
-		alice.expect("the-secret-payload")
-		// Eve must not see it; a sync message proves her queue is drained.
-		eve.sendText("/help")
-		if got, err := eve.waitFor("the-secret-payload", 3*time.Second); err == nil {
-			t.Fatalf("non-member received a message from a password room: %q", got)
+	alice.C.Chat("#vault", "the-secret-payload")
+	eve.send(wire.Msg{T: wire.THelp}) // sync point
+	for {
+		m := eve.next(15 * time.Second)
+		if strings.Contains(m.Text, "the-secret-payload") {
+			t.Fatal("non-member received a password-room message")
+		}
+		if m.T == wire.TInfo && strings.Contains(m.Text, "Available Commands") {
+			break
 		}
 	}
+	healthy(t, s)
+}
 
-	// ── file transfer hijack ──
-	{
-		hash := hex.EncodeToString(sha256Sum([]byte("data")))
-		alice.sendText("/file " + bob.name + " report.pdf " + hash)
-		req := bob.expect("FILE TRANSFER REQUEST")
-		id := regexp.MustCompile(`Transfer ID: (\S+)`).FindStringSubmatch(req)
-		if id == nil {
-			t.Fatalf("no transfer ID in %q", req)
-		}
-		alice.expect("File transfer request sent")
+// sha256 hex of n zero bytes is not needed: the server does not verify file
+// content, only sizes and flow control. Recipients verify hashes.
 
-		eve.sendText("/accept " + id[1])
-		eve.expect("This transfer is not for you")
-		eve.sendText("/decline " + id[1])
-		eve.expect("This transfer is not for you")
+// offerRaw makes sender offer a file of size bytes to recipient and has the
+// recipient accept with the given window. Returns the transfer ID.
+func offerRaw(t *testing.T, sender, recipient *raw, size, window int64) [wire.IDLen]byte {
+	t.Helper()
+	sender.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: recipient.name, Name: "f.bin", Size: size, SHA256: sha})
+	offer := recipient.waitFor("offer", func(m wire.Msg) bool { return m.T == wire.TFileOffer })
+	sender.waitFor("offered", func(m wire.Msg) bool { return m.T == wire.TFileOffered })
+	recipient.send(wire.Msg{T: wire.TFileAccept, ID: offer.ID, Bytes: window})
+	sender.waitFor("accept", func(m wire.Msg) bool { return m.T == wire.TFileAccept })
+	id, _ := wire.ParseID(offer.ID)
+	return id
+}
 
-		// The intended recipient can still accept.
-		bob.sendText("/accept " + id[1])
-		bob.expect("File transfer accepted")
-		alice.expect("BEGIN_SEND|report.pdf|" + hash)
+func dataFrame(id [wire.IDLen]byte, n int) []byte {
+	f, err := wire.EncodeData(id, make([]byte, n))
+	if err != nil {
+		panic(err)
+	}
+	return f
+}
 
-		// A third party's stream messages do not reach Bob.
-		eve.writePacket(0x03, eve.seal([]byte("FILE_START|malware.exe|4")))
-		eve.writePacket(0x03, eve.seal([]byte("EVIL")))
+func cancelled(reason string) func(wire.Msg) bool {
+	return func(m wire.Msg) bool { return m.T == wire.TFileCancel && strings.Contains(m.Text, reason) }
+}
 
-		alice.writePacket(0x03, alice.seal([]byte("FILE_START|report.pdf|4")))
-		alice.writePacket(0x03, alice.seal([]byte("data")))
-		alice.writePacket(0x03, alice.seal([]byte("FILE_END")))
+// TestTransferAbuse: a malicious sender or recipient can only break its own
+// transfer, never the server or anyone else's transfer.
+func TestTransferAbuse(t *testing.T) {
+	s := start(t, testserver.Config{})
 
-		var stream []string
-		for len(stream) < 3 {
-			typ, msg, err := bob.next(15 * time.Second)
+	t.Run("sender exceeds credit", func(t *testing.T) {
+		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
+		id := offerRaw(t, a, b, 10<<20, 64<<10)
+		a.write(dataFrame(id, wire.DataChunk))
+		a.write(dataFrame(id, wire.DataChunk))
+		a.write(dataFrame(id, 64<<10-2*wire.DataChunk+1)) // one byte over the window
+		a.waitFor("cancel", cancelled("exceeded flow-control credit"))
+		b.waitFor("cancel", cancelled("exceeded flow-control credit"))
+	})
+	t.Run("sender sends more than announced", func(t *testing.T) {
+		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
+		id := offerRaw(t, a, b, 100, wire.InitialWindow)
+		a.write(dataFrame(id, 101))
+		b.waitFor("cancel", cancelled("more data than announced"))
+	})
+	t.Run("early file_end", func(t *testing.T) {
+		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
+		id := offerRaw(t, a, b, 1000, wire.InitialWindow)
+		a.write(dataFrame(id, 10))
+		a.send(wire.Msg{T: wire.TFileEnd, ID: wire.IDString(id)})
+		b.waitFor("cancel", cancelled("incomplete"))
+	})
+	t.Run("data before acceptance", func(t *testing.T) {
+		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
+		a.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: b.name, Name: "f.bin", Size: 100, SHA256: sha})
+		offered := a.waitFor("offered", func(m wire.Msg) bool { return m.T == wire.TFileOffered })
+		id, _ := wire.ParseID(offered.ID)
+		a.write(dataFrame(id, 10))
+		b.waitFor("cancel", cancelled("before acceptance"))
+	})
+	t.Run("recipient over-grants credit", func(t *testing.T) {
+		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
+		id := offerRaw(t, a, b, 100<<20, wire.InitialWindow)
+		b.send(wire.Msg{T: wire.TFileCredit, ID: wire.IDString(id), Bytes: wire.MaxWindow})
+		a.waitFor("cancel", cancelled("invalid flow-control credit"))
+	})
+	t.Run("oversized initial window", func(t *testing.T) {
+		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
+		a.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: b.name, Name: "f.bin", Size: 100, SHA256: sha})
+		offer := b.waitFor("offer", func(m wire.Msg) bool { return m.T == wire.TFileOffer })
+		b.send(wire.Msg{T: wire.TFileAccept, ID: offer.ID, Bytes: 1 << 40})
+		a.waitFor("cancel", cancelled("invalid flow-control window"))
+	})
+	t.Run("third party injects data", func(t *testing.T) {
+		a, b, e := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b")), rawLogin(t, s, uniqueName("e"))
+		id := offerRaw(t, a, b, 100, wire.InitialWindow)
+		e.write(dataFrame(id, 50)) // eve knows the ID: dropped, not relayed
+		a.write(dataFrame(id, 100))
+		a.send(wire.Msg{T: wire.TFileEnd, ID: wire.IDString(id)})
+		a.waitFor("done", func(m wire.Msg) bool { return m.T == wire.TFileDone })
+		// Bob received exactly the sender's 100 bytes, then file_end.
+		got := 0
+		b.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		for {
+			f, err := wire.Read(b.conn)
 			if err != nil {
-				t.Fatalf("file stream: %v (got %q)", err, stream)
+				t.Fatal(err)
 			}
-			if typ == 0x03 {
-				stream = append(stream, msg)
+			if f.Type == wire.FrameData {
+				_, d, _ := wire.SplitData(f.Payload)
+				got += len(d)
+				continue
+			}
+			if f.Type == wire.FrameControl {
+				if m, _ := wire.DecodeMsg(f.Payload); m.T == wire.TFileEnd {
+					break
+				}
 			}
 		}
-		want := []string{"FILE_START|report.pdf|4|" + hash, "data", "FILE_END"}
-		for i := range want {
-			if stream[i] != want[i] {
-				t.Fatalf("file stream = %q, want %q", stream, want)
-			}
+		if got != 100 {
+			t.Fatalf("recipient got %d bytes, want 100", got)
 		}
-	}
-
-	// ── bad file requests ──
-	{
-		eve.sendText("/file nobody x.txt " + strings.Repeat("a", 64))
-		eve.expect("is not online")
-		eve.sendText("/file " + eve.name + " x.txt " + strings.Repeat("a", 64))
-		eve.expect("cannot send files to yourself")
-		eve.sendText("/file " + bob.name + " x.txt nothex")
-		eve.expect("Invalid hash format")
-		eve.sendText("/accept no_such_id")
-		eve.expect("not found")
-	}
-
-	s.assertHealthy()
+	})
+	t.Run("hostile offers", func(t *testing.T) {
+		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
+		for _, m := range []wire.Msg{
+			{Name: "..", Size: 1, SHA256: sha},
+			{Name: "f", Size: 0, SHA256: sha},
+			{Name: "f", Size: -5, SHA256: sha},
+			{Name: "f", Size: 1, SHA256: "nothex"},
+		} {
+			m.T, m.Ref, m.To = wire.TFileOffer, "r", b.name
+			a.send(m)
+			a.waitFor("refusal", func(r wire.Msg) bool { return r.T == wire.TError && r.Ref == "r" })
+		}
+		a.send(wire.Msg{T: wire.TFileOffer, Ref: "p", To: b.name, Name: "../../etc/passwd", Size: 1, SHA256: sha})
+		offer := b.waitFor("offer", func(m wire.Msg) bool { return m.T == wire.TFileOffer })
+		if offer.Name != "passwd" {
+			t.Fatalf("path not stripped: %q", offer.Name)
+		}
+	})
+	t.Run("offer flood", func(t *testing.T) {
+		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
+		for i := 0; i < 10; i++ {
+			a.send(wire.Msg{T: wire.TFileOffer, Ref: "f", To: b.name, Name: "f", Size: 1, SHA256: sha})
+		}
+		a.waitFor("limit", func(m wire.Msg) bool {
+			return m.T == wire.TError && strings.Contains(m.Text, "Too many file transfers")
+		})
+	})
+	healthy(t, s)
 }
 
-func sha256Sum(b []byte) []byte {
-	h := sha256.Sum256(b)
-	return h[:]
-}
-
-// TestReconnectRace: members connecting, chatting and dropping at the same
-// time as broadcasts go out (the crash fixed in 2.0.0, H-1).
+// TestReconnectRace: members connecting, chatting and dropping while
+// broadcasts go out (the crash fixed in 2.0.0, H-1).
 func TestReconnectRace(t *testing.T) {
-	s := startServer(t, serverConfig{})
-	chatter := s.login(t, uniqueName("chatter"))
+	s := start(t, testserver.Config{})
+	chatter := rawLogin(t, s, "chatter")
 	stop := make(chan struct{})
 	var bg sync.WaitGroup
 	bg.Add(2)
-	go func() { // keep broadcasting
+	go func() {
 		defer bg.Done()
-		for i := 0; ; i++ {
+		for {
 			select {
 			case <-stop:
 				return
-			default:
+			case <-time.After(60 * time.Millisecond): // within the rate limit
 			}
-			if chatter.writePacket(0x01, chatter.seal([]byte("noise"))) != nil {
+			if chatter.write(mustMsg(wire.Msg{T: wire.TChat, Text: "noise"})) != nil {
 				return
 			}
-			time.Sleep(time.Millisecond)
 		}
 	}()
-	go func() { // drain the chatter's own copies
+	go func() { // drain the chatter's copies
 		defer bg.Done()
 		for {
-			if _, _, err := chatter.next(time.Minute); err != nil {
+			if _, err := chatter.tryNext(time.Minute); err != nil {
 				return
 			}
 		}
@@ -418,53 +473,101 @@ func TestReconnectRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for r := 0; r < rounds; r++ {
-				m := s.login(t, uniqueName("flap"))
-				m.sendText("/join #race")
-				m.sendText("[#race] hello")
-				m.sendText("hello lobby")
-				m.conn.Close() // abrupt disconnect, no /quit
+				conn, err := dialTLS(s, s.ServerCert, []tls.Certificate{s.Access})
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				name := uniqueName("flap")
+				conn.Write(mustMsg(wire.Msg{T: wire.THello, V: wire.Version, User: name}))
+				conn.Write(mustMsg(wire.Msg{T: wire.TJoin, Room: "#race"}))
+				conn.Write(mustMsg(wire.Msg{T: wire.TChat, Room: "#race", Text: "hello"}))
+				conn.Write(mustMsg(wire.Msg{T: wire.TChat, Text: "hello lobby"}))
+				conn.Close() // abrupt, no quit
 			}
 		}()
 	}
 	wg.Wait()
 	close(stop)
-	chatter.close()
+	chatter.conn.Close()
 	bg.Wait()
-	s.assertHealthy()
+	healthy(t, s)
 }
 
-// TestSlowReader: a member that never reads cannot stall the others.
+// TestSlowReader: a member that never reads cannot stall the others, and
+// is eventually disconnected instead of silently losing messages.
 func TestSlowReader(t *testing.T) {
-	s := startServer(t, serverConfig{})
-	sloth := s.login(t, uniqueName("sloth"))
-	_ = sloth // logged in, never reads again
-
-	talker := s.login(t, uniqueName("talker"))
-	listener := s.login(t, uniqueName("listener"))
-	go func() {
-		for {
-			if _, _, err := talker.next(time.Minute); err != nil {
-				return
+	s := start(t, testserver.Config{})
+	sloth := rawLogin(t, s, "sloth") // never reads again
+	talkers := make([]*raw, 3)
+	for i := range talkers {
+		talkers[i] = rawLogin(t, s, uniqueName("talker"))
+		go func(r *raw) {
+			for {
+				if _, err := r.tryNext(time.Minute); err != nil {
+					return
+				}
 			}
+		}(talkers[i])
+	}
+	listener := s.Join(t, "listener")
+	payload := strings.Repeat("x", wire.MaxTextBytes)
+	// The sloth is dropped once its queue overflows or a write to it times
+	// out (30 s), whichever comes first.
+	dropped := false
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) && !dropped {
+		for _, r := range talkers {
+			r.write(mustMsg(wire.Msg{T: wire.TChat, Text: payload}))
 		}
-	}()
-	payload := strings.Repeat("x", 1000)
-	for i := 0; i < 6000; i++ {
-		if err := talker.writePacket(0x01, talker.seal([]byte(payload))); err != nil {
-			t.Fatal(err)
+		time.Sleep(50 * time.Millisecond)
+		_, dropped = listener.TryWait(time.Millisecond, func(e client.Event) bool { return e.Kind == client.EvLeft && e.User == "sloth" })
+	}
+	if !dropped {
+		t.Fatal("a member that never reads was not disconnected")
+	}
+	listener.C.DM("listener", "still-alive")
+	if _, ok := listener.TryWait(15*time.Second, testserver.Text(client.EvDM, "still-alive")); !ok {
+		t.Fatal("other members stalled behind a slow reader")
+	}
+	_ = sloth
+	healthy(t, s)
+}
+
+// TestFlood: a member flooding messages is rate limited; others see only a
+// bounded share of the flood.
+func TestFlood(t *testing.T) {
+	s := start(t, testserver.Config{})
+	flooder := rawLogin(t, s, "flooder")
+	watcher := s.Join(t, "watcher")
+	msg := mustMsg(wire.Msg{T: wire.TChat, Text: "spam"})
+	start := time.Now()
+	for i := 0; i < 5000; i++ {
+		if flooder.write(msg) != nil {
+			break
 		}
 	}
-	talker.sendText("/msg " + listener.name + " still-alive")
-	if _, err := listener.waitFor("still-alive", 30*time.Second); err != nil {
-		t.Fatalf("other members stalled behind a slow reader: %v", err)
+	elapsed := time.Since(start)
+	flooder.waitFor("rate limit", func(m wire.Msg) bool { return m.T == wire.TError && m.Code == wire.CodeRateLimited })
+	time.Sleep(time.Second)
+	got := 0
+	for {
+		if _, ok := watcher.TryWait(200*time.Millisecond, testserver.Text(client.EvChat, "spam")); !ok {
+			break
+		}
+		got++
 	}
-	s.assertHealthy()
+	max := 60 + int((elapsed+time.Second).Seconds()*20) + 5
+	t.Logf("flood of 5000 in %s; watcher received %d (max %d)", elapsed.Round(time.Millisecond), got, max)
+	if got > max {
+		t.Fatalf("watcher received %d flood messages, limit is about %d", got, max)
+	}
+	healthy(t, s)
 }
 
 // TestConnectionLimits: per-IP concurrency and rate limits apply before TLS.
 func TestConnectionLimits(t *testing.T) {
-	s := startServer(t, serverConfig{MaxConnectionsPerIP: 3, MaxNewConnPerIPPerMin: 6})
-
+	s := start(t, testserver.Config{MaxConnectionsPerIP: 3, MaxNewConnPerIPPerMin: 6})
 	refused := func(conn net.Conn) bool {
 		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		_, err := conn.Read(make([]byte, 1))
@@ -472,14 +575,12 @@ func TestConnectionLimits(t *testing.T) {
 	}
 	dial := func() net.Conn {
 		t.Helper()
-		conn, err := net.DialTimeout("tcp", s.addr, 5*time.Second)
+		conn, err := net.DialTimeout("tcp", s.Addr, 5*time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return conn
 	}
-
-	// Three silent connections hold every per-IP slot (new: 3/6).
 	var held []net.Conn
 	for i := 0; i < 3; i++ {
 		c := dial()
@@ -493,21 +594,17 @@ func TestConnectionLimits(t *testing.T) {
 	} else {
 		c.Close()
 	}
-
-	// Free the slots; a member can log in again (new: 4/6).
 	for _, c := range held {
 		c.Close()
 	}
 	time.Sleep(500 * time.Millisecond)
-	m := s.login(t, uniqueName("ok"))
-	m.close()
+	m := s.Join(t, uniqueName("ok")) // 4 of 6 per minute
+	m.C.Close()
 	time.Sleep(500 * time.Millisecond)
-
-	// Rate limit: two more are admitted (6/6), the next is refused.
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 2; i++ { // 6 of 6
 		c := dial()
 		if refused(c) {
-			t.Fatalf("connection refused below the rate limit")
+			t.Fatal("connection refused below the rate limit")
 		}
 		c.Close()
 	}
@@ -516,37 +613,38 @@ func TestConnectionLimits(t *testing.T) {
 	} else {
 		c.Close()
 	}
-
-	select {
-	case <-s.exited:
-		t.Fatalf("server died:\n%s", s.output.String())
-	default:
+	if !s.Running() {
+		t.Fatalf("server died:\n%s", s.Output())
 	}
 }
 
 // TestLogsWithoutMetadata: with log_metadata off (the default), the logs
-// record nothing about members: no names, rooms, DMs or addresses.
+// record nothing about members: no names, rooms, DMs, files or addresses.
 func TestLogsWithoutMetadata(t *testing.T) {
-	s := startServer(t, serverConfig{})
-	a := s.login(t, "zorro_private")
-	b := s.login(t, "zelda_private")
-	a.sendText("/join #hideout")
-	a.expect("Created and joined room #hideout")
-	a.sendText("/msg zelda_private meet-at-noon")
-	b.expect("meet-at-noon")
-	hash := hex.EncodeToString(sha256Sum([]byte("x")))
-	a.sendText("/file zelda_private plans.txt " + hash)
-	b.expect("FILE TRANSFER REQUEST")
-	a.writePacket(0x01, bytesOf(0x41, 100)) // decryption error is logged
-	a.sendText("/help")
-	a.expect("Available Commands")
-	a.close()
-	b.close()
-	time.Sleep(500 * time.Millisecond)
-	s.stop()
+	s := start(t, testserver.Config{})
+	a := s.Join(t, "zorro_private")
+	b := s.Join(t, "zelda_private")
+	a.C.Join("#hideout", "")
+	a.Wait("joined", 15*time.Second, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#hideout" })
+	a.C.DM("zelda_private", "meet-at-noon")
+	b.Wait("dm", 15*time.Second, testserver.Text(client.EvDM, "meet-at-noon"))
+	p := a.Dir + "/plans.txt"
+	os.WriteFile(p, []byte("x"), 0600)
+	a.C.OfferFile("zelda_private", p)
+	b.Wait("offer", 15*time.Second, testserver.Kind(client.EvFileOffer))
+	r := rawLogin(t, s, "zack_private")
+	r.write(frame(4, 0x7f, 0, 0, nil)) // malformed frame: logged as a security event
+	expectClosed(t, r.conn, 10*time.Second)
+	a.C.Close()
+	b.C.Close()
+	time.Sleep(300 * time.Millisecond)
+	s.Stop()
 
-	logs := s.readLog("chat_server.log") + s.readLog("security.log")
-	for _, secret := range []string{"zorro", "zelda", "hideout", "meet-at-noon", "plans.txt", "127.0.0.1"} {
+	logs := s.ReadLog("chat_server.log") + s.ReadLog("security.log")
+	if !strings.Contains(logs, "Malformed frame from [member]") {
+		t.Errorf("security event not logged:\n%s", logs)
+	}
+	for _, secret := range []string{"zorro", "zelda", "zack", "hideout", "meet-at-noon", "plans.txt", "127.0.0.1"} {
 		if strings.Contains(logs, secret) {
 			t.Errorf("logs contain %q with log_metadata off:\n%s", secret, logs)
 		}

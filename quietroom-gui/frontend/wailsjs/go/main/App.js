@@ -6,6 +6,10 @@ export function AcceptFileTransfer(arg1) {
   return window['go']['main']['App']['AcceptFileTransfer'](arg1);
 }
 
+export function CancelFileTransfer(arg1) {
+  return window['go']['main']['App']['CancelFileTransfer'](arg1);
+}
+
 export function Connect(arg1) {
   return window['go']['main']['App']['Connect'](arg1);
 }

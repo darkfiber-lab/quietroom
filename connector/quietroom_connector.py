@@ -16,22 +16,21 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 quietroom_connector.py
 
-A persistent connection client for the QuietRoom encrypted chat protocol.
-Handles TLS, Diffie-Hellman key exchange, AES-256-GCM encryption, and the
-obfuscated packet framing. Exposes a clean callback-based interface for
-building bots, bridges, or any other automated client on top.
+A persistent connection client for QuietRoom (protocol 3). Handles TLS 1.3
+with the access key, the framed message protocol and keepalives, and exposes
+a callback-based interface for building bots, bridges and other automated
+clients. Uses only the Python standard library.
 
 Protocol notes
 --------------
-- Room messages are routed by a [#roomname] prefix in the message body.
-  The server validates sender membership before broadcasting and strips
-  the prefix before delivery, so recipients never see it.
-- The server closes idle connections after ~3 minutes of no traffic.
-  Decoy traffic (enabled by default) prevents this. If you disable decoy
-  traffic, the connector sends a minimal keepalive packet every 60 seconds
-  automatically.
-- Lobby messages carry no prefix. Any text sent via send_message() without
-  a room prefix goes to the lobby.
+- Every frame is | length (4) | type (1) | flags (1) | padding length (2) |
+  payload | padding |. Control frames carry one JSON message; decoy frames
+  are discarded; data frames carry file transfers (not supported by the
+  connector: file offers are declined automatically).
+- The server closes connections that send nothing for 3 minutes. Decoy
+  traffic (enabled by default) or a keepalive every 60 seconds prevents this.
+- Room messages are sent with send_room_message(); you must have joined the
+  room first.
 
 Usage
 -----
@@ -52,7 +51,7 @@ Usage
     # connection stays alive until conn.disconnect() or process exit
 """
 
-import hashlib
+import json
 import logging
 import os
 import re
@@ -63,10 +62,12 @@ import struct
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 log = logging.getLogger("quietroom.connector")
+
+PROTOCOL_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +75,11 @@ log = logging.getLogger("quietroom.connector")
 # ---------------------------------------------------------------------------
 
 class ConnectorError(Exception):
-    """Raised for unrecoverable connector errors (config, setup)."""
+    """Raised for unrecoverable connector errors (config, setup, login)."""
 
 
 class SecurityError(ConnectorError):
-    """Raised when a security check fails (cert pin, DH validation)."""
+    """Raised when a security check fails (access file, certificate pin)."""
 
 
 class ConnectionLostError(ConnectorError):
@@ -96,19 +97,17 @@ class ConnectorConfig:
     cert_file: str = "quietroom_access.pem"   # access file distributed by the server
     username: str = "Bot"
 
-    # Decoy traffic — mirrors the Go client behaviour to avoid traffic analysis.
-    # Also serves as a keepalive — the server closes idle connections after
-    # ~3 minutes. If decoy_traffic is False, a minimal keepalive is sent
-    # automatically every 60 seconds instead.
+    # Decoy traffic: random cover frames at random intervals around
+    # decoy_interval. Also keeps the connection alive.
     decoy_traffic: bool = True
-    decoy_interval: int = 30        # seconds between decoy bursts
+    decoy_interval: int = 30        # mean seconds between decoys
     decoy_min_bytes: int = 100
     decoy_max_bytes: int = 500
 
     # Keepalive interval used when decoy_traffic is False
     keepalive_interval: int = 60
 
-    # How long to wait for the server during handshake
+    # How long to wait for the server during connect and login
     connect_timeout: int = 30
 
 
@@ -118,7 +117,7 @@ class ConnectorConfig:
 
 @dataclass
 class ChatMessage:
-    """A parsed timestamped chat message from the lobby or a room."""
+    """A chat message from the lobby or a room."""
     timestamp: str
     sender: str
     text: str
@@ -127,77 +126,65 @@ class ChatMessage:
 
 @dataclass
 class DirectMessage:
-    """A parsed direct message."""
+    """A direct message."""
     sender: str
     text: str
 
 
 # ---------------------------------------------------------------------------
-# DH + AES-256-GCM — protocol crypto layer
+# Framing
 # ---------------------------------------------------------------------------
 
-# RFC 3526 2048-bit MODP group — must match server
-_DH_P = int(
-    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
-    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
-    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
-    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
-    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
-    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
-    "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
-    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
-    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
-    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
-    "15728E5A8AACAA68FFFFFFFFFFFFFFFF",
-    16,
-)
-_DH_G = 2
+FRAME_CONTROL = 0x01
+FRAME_DECOY   = 0x02
+FRAME_DATA    = 0x03
+
+_MAX_FRAME = 64 * 1024
+_MIN_FRAME = 256
+_HEADER = 4  # type, flags, padding length (after the length field)
 
 
-def _dh_generate_keypair() -> tuple[int, int]:
-    private = secrets.randbelow(_DH_P - 2) + 1
-    public = pow(_DH_G, private, _DH_P)
-    return private, public
+def _bucket(n: int) -> int:
+    size = _MIN_FRAME
+    while size < n:
+        size *= 2
+    return min(size, _MAX_FRAME)
 
 
-def _dh_validate_public(pub: int) -> bool:
-    """Reject trivial and small-subgroup values."""
-    return 1 < pub < (_DH_P - 1)
+def _encode_frame(frame_type: int, payload: bytes, min_size: int = 0) -> bytes:
+    """Build a padded frame (see the protocol notes above)."""
+    n = 4 + _HEADER + len(payload)
+    if n > _MAX_FRAME:
+        raise ValueError(f"payload too large: {len(payload)} bytes")
+    size = _bucket(max(n, min_size))
+    pad = size - n
+    return struct.pack(">IBBH", size - 4, frame_type, 0, pad) + payload + bytes(pad)
 
 
-def _dh_shared_secret(private: int, other_public: int) -> bytes:
-    shared = pow(other_public, private, _DH_P)
-    raw = shared.to_bytes((shared.bit_length() + 7) // 8, "big")
-    return hashlib.sha256(raw).digest()
+def _encode_msg(msg: dict) -> bytes:
+    return _encode_frame(FRAME_CONTROL, json.dumps(msg, separators=(",", ":")).encode())
 
 
-def _aes_gcm_encrypt(key: bytes, plaintext: bytes) -> bytes:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    nonce = secrets.token_bytes(12)
-    return nonce + AESGCM(key).encrypt(nonce, plaintext, None)
+def _read_exact(sock: ssl.SSLSocket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionLostError("Connection closed by server")
+        buf += chunk
+    return bytes(buf)
 
 
-def _aes_gcm_decrypt(key: bytes, data: bytes) -> bytes:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    if len(data) < 12:
-        raise ValueError("Ciphertext too short")
-    return AESGCM(key).decrypt(data[:12], data[12:], None)
-
-
-# ---------------------------------------------------------------------------
-# Packet framing
-# ---------------------------------------------------------------------------
-
-PKT_MESSAGE = 0x01
-PKT_DECOY   = 0x02
-PKT_FILE    = 0x03
-
-_MAX_PACKET_DATA = 32768
-
-
-def _make_packet(msg_type: int, data: bytes) -> bytes:
-    padding = secrets.token_bytes(secrets.randbelow(256))
-    return struct.pack(">BH", msg_type, len(data)) + data + padding
+def _read_frame(sock: ssl.SSLSocket) -> tuple[int, bytes]:
+    """Read exactly one frame. Returns (frame_type, payload)."""
+    (length,) = struct.unpack(">I", _read_exact(sock, 4))
+    if length < _HEADER or length > _MAX_FRAME - 4:
+        raise ConnectorError(f"protocol error: frame length {length}")
+    body = _read_exact(sock, length)
+    frame_type, flags, pad = struct.unpack(">BBH", body[:4])
+    if flags != 0 or pad > length - _HEADER or frame_type not in (FRAME_CONTROL, FRAME_DECOY, FRAME_DATA):
+        raise ConnectorError("protocol error: malformed frame (is the server QuietRoom 3?)")
+    return frame_type, body[_HEADER:length - pad]
 
 
 ACCESS_FILE_NAME = "quietroom_access.pem"
@@ -205,12 +192,12 @@ ACCESS_FILE_NAME = "quietroom_access.pem"
 _PEM_BLOCK_RE = re.compile(r"-----BEGIN ([A-Z ]+)-----.*?-----END \1-----", re.S)
 
 
-def _load_access_bundle(path: str) -> tuple[str, bytes, str]:
+def _load_access_bundle(path: str) -> tuple[bytes, str]:
     """
     Parse an access file: the pinned server certificate followed by the master
     access certificate and its private key.
 
-    Returns (server_cert_pem, server_cert_der, access_cert_and_key_pem).
+    Returns (server_cert_der, access_cert_and_key_pem).
     """
     with open(path, "r", encoding="ascii") as f:
         text = f.read()
@@ -230,8 +217,7 @@ def _load_access_bundle(path: str) -> tuple[str, bytes, str]:
             f"certificate and the access key). Get the current {ACCESS_FILE_NAME} "
             "from your server administrator."
         )
-    server_pem = certs[0]
-    return server_pem, ssl.PEM_cert_to_DER_cert(server_pem), certs[1] + key
+    return ssl.PEM_cert_to_DER_cert(certs[0]), certs[1] + key
 
 
 def _load_client_cert(ctx: ssl.SSLContext, cert_and_key_pem: str):
@@ -249,98 +235,16 @@ def _load_client_cert(ctx: ssl.SSLContext, cert_and_key_pem: str):
         os.unlink(tmp_path)
 
 
-def _read_exact(sock: ssl.SSLSocket, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionLostError("Connection closed by server")
-        buf += chunk
-    return buf
-
-
-def _read_packet(sock: ssl.SSLSocket) -> tuple[int, bytes]:
-    """Read one obfuscated packet. Returns (msg_type, payload)."""
-    header = _read_exact(sock, 3)
-    msg_type, data_len = struct.unpack(">BH", header)
-
-    if data_len > _MAX_PACKET_DATA:
-        raise ValueError(f"Oversized packet: {data_len} bytes")
-
-    data = _read_exact(sock, data_len)
-
-    # Drain padding with a short deadline
-    sock.settimeout(0.01)
-    try:
-        sock.recv(1024)
-    except (socket.timeout, ssl.SSLWantReadError, OSError):
-        pass
-    finally:
-        sock.settimeout(None)
-
-    return msg_type, data
-
-
-# ---------------------------------------------------------------------------
-# Message parsing
-# ---------------------------------------------------------------------------
-
-# [15:04:05] username: text  (lobby)
-# [15:04:05] [#roomname] username: text  (room)
-_CHAT_RE = re.compile(
-    r"^\[(\d{2}:\d{2}:\d{2})\] (?:\[(#\S+)\] )?(.+?): (.+)$",
-    re.DOTALL,
-)
-
-# [DM from username]: text
-_DM_RE = re.compile(r"^\[DM from ([^\]]+)\]:\s*(.*)", re.DOTALL)
-
-# [DM to username]: text  (echo of our own DM)
-_DM_SELF_RE = re.compile(r"^\[DM to ([^\]]+)\]:\s*(.*)", re.DOTALL)
-
-
-def _parse_message(text: str) -> Optional[ChatMessage]:
-    m = _CHAT_RE.match(text)
-    if m:
-        return ChatMessage(
-            timestamp=m.group(1),
-            room=m.group(2),      # None if lobby message
-            sender=m.group(3).strip(),
-            text=m.group(4).strip(),
-        )
-    return None
-
-
-def _parse_dm(text: str) -> Optional[DirectMessage]:
-    m = _DM_RE.match(text)
-    if m:
-        return DirectMessage(sender=m.group(1).strip(), text=m.group(2).strip())
-    return None
-
-
-def _is_system_message(text: str) -> bool:
-    """
-    Returns True for server notices, join/leave events, command responses
-    and anything else that isn't a chat message or DM.
-    """
-    if _CHAT_RE.match(text):
-        return False
-    if _DM_RE.match(text):
-        return False
-    if _DM_SELF_RE.match(text):
-        return False
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Callback type aliases
 # ---------------------------------------------------------------------------
 
-OnDMCallback          = Callable[[str, str], None]          # (sender, message)
-OnRoomMessageCallback = Callable[[str, str, str], None]     # (room, sender, message)
-OnMessageCallback     = Callable[[str], None]               # (raw_text) — all messages
+OnDMCallback            = Callable[[str, str], None]        # (sender, message)
+OnRoomMessageCallback   = Callable[[str, str, str], None]   # (room, sender, message)
+OnMessageCallback       = Callable[[str], None]             # (text) — every message, rendered as text
 OnSystemMessageCallback = Callable[[str], None]             # (text) — server notices only
-OnDisconnectCallback  = Callable[[Optional[Exception]], None]
+OnPresenceCallback      = Callable[[str, str, Optional[str]], None]  # (event "joined"/"left", user, room or None)
+OnDisconnectCallback    = Callable[[Optional[Exception]], None]
 
 
 # ---------------------------------------------------------------------------
@@ -361,24 +265,15 @@ class QuietRoomConnector:
     Callbacks are invoked from the internal receive thread — keep them short
     or hand off work to your own thread pool to avoid blocking the receive loop.
 
-    Room routing
+    Own messages
     ------------
-    The server routes outgoing messages based on a [#roomname] prefix in the
-    message body. Use send_room_message() to send to a room — it prepends the
-    prefix automatically. Use send_message() for lobby messages.
-
-    You must have joined a room with join_room() before sending to it.
-    The server validates membership and will return an error if you attempt
-    to send to a room you have not joined.
+    The server echoes your own chat and room messages back; callbacks do not
+    receive them (on_message still does).
     """
 
     def __init__(self, config: ConnectorConfig):
         self._cfg = config
         self._sock: Optional[ssl.SSLSocket] = None
-        self._session_key: Optional[bytes] = None
-
-        # Loaded from the access file at connect() time
-        self._server_cert_pem: Optional[str] = None
         self._server_cert_der: Optional[bytes] = None
         self._access_pem: Optional[str] = None
         self._send_lock = threading.Lock()
@@ -386,21 +281,18 @@ class QuietRoomConnector:
         self._shutdown_once = threading.Lock()
         self._did_shutdown = False
 
-        # Track joined rooms for validation
         self._joined_rooms: set[str] = set()
         self._rooms_lock = threading.Lock()
 
-        # Registered callbacks
-        self._dm_callbacks:           list[OnDMCallback]           = []
-        self._room_message_callbacks: list[OnRoomMessageCallback]  = []
-        self._message_callbacks:      list[OnMessageCallback]      = []
+        self._dm_callbacks:             list[OnDMCallback]            = []
+        self._room_message_callbacks:   list[OnRoomMessageCallback]   = []
+        self._message_callbacks:        list[OnMessageCallback]       = []
         self._system_message_callbacks: list[OnSystemMessageCallback] = []
-        self._disconnect_callbacks:   list[OnDisconnectCallback]   = []
+        self._presence_callbacks:       list[OnPresenceCallback]      = []
+        self._disconnect_callbacks:     list[OnDisconnectCallback]    = []
 
-        # Background threads
         self._recv_thread:  Optional[threading.Thread] = None
-        self._decoy_thread: Optional[threading.Thread] = None
-        self._keepalive_thread: Optional[threading.Thread] = None
+        self._noise_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Public: callback registration
@@ -427,8 +319,9 @@ class QuietRoomConnector:
 
     def on_message(self, callback: OnMessageCallback) -> "QuietRoomConnector":
         """
-        Register a callback for ALL decrypted text packets including DMs,
-        room messages, lobby messages, and server notices. Useful for logging.
+        Register a callback for ALL messages (chat, DMs, presence, notices),
+        rendered as one line of text in the classic format, e.g.
+        "[12:00:00] alice: hi" or "*** bob left the chat ***". Useful for logging.
         Signature: callback(text: str)
         Returns self for chaining.
         """
@@ -438,11 +331,21 @@ class QuietRoomConnector:
     def on_system_message(self, callback: OnSystemMessageCallback) -> "QuietRoomConnector":
         """
         Register a callback for server notices and command responses —
-        join/leave events, /users output, /rooms output, error messages, etc.
+        /users, /rooms and /members output, errors, and join/leave notices.
         Signature: callback(text: str)
         Returns self for chaining.
         """
         self._system_message_callbacks.append(callback)
+        return self
+
+    def on_presence(self, callback: OnPresenceCallback) -> "QuietRoomConnector":
+        """
+        Register a callback for members joining or leaving the chat or a room.
+        Signature: callback(event: "joined" | "left", user: str, room: str | None)
+        room is None when the member joined or left the chat itself.
+        Returns self for chaining.
+        """
+        self._presence_callbacks.append(callback)
         return self
 
     def on_disconnect(self, callback: OnDisconnectCallback) -> "QuietRoomConnector":
@@ -461,19 +364,19 @@ class QuietRoomConnector:
 
     def connect(self):
         """
-        Establish the TLS connection, perform the DH key exchange, log in,
-        and start the background receive loop. Blocks until login is complete.
+        Establish the TLS connection, log in, and start the background
+        receive loop. Blocks until login is complete.
 
         Raises:
-            FileNotFoundError     — cert_file not found
-            SecurityError         — certificate mismatch or DH validation failure
-            ConnectorError        — handshake or login failure
-            OSError               — network error during connect
+            FileNotFoundError — access file not found
+            SecurityError     — invalid access file, key rejected, certificate mismatch
+            ConnectorError    — login refused (e.g. username taken) or protocol mismatch
+            OSError           — network error during connect
         """
         self._validate_cert_file()
         self._sock = self._tls_connect()
         try:
-            self._perform_dh_exchange()
+            self._login()
         except (OSError, ConnectionLostError) as e:
             # In TLS 1.3 a rejected access key surfaces on the first read.
             msg = str(e).lower()
@@ -484,47 +387,17 @@ class QuietRoomConnector:
                     "(the server may have been restarted)."
                 ) from e
             raise
-        self._login()
 
-        self._recv_thread = threading.Thread(
-            target=self._receive_loop,
-            name="qr-recv",
-            daemon=True,
-        )
+        self._recv_thread = threading.Thread(target=self._receive_loop, name="qr-recv", daemon=True)
         self._recv_thread.start()
+        self._noise_thread = threading.Thread(target=self._noise_loop, name="qr-noise", daemon=True)
+        self._noise_thread.start()
 
-        if self._cfg.decoy_traffic:
-            self._decoy_thread = threading.Thread(
-                target=self._decoy_loop,
-                name="qr-decoy",
-                daemon=True,
-            )
-            self._decoy_thread.start()
-            log.debug("Decoy traffic started (interval: %ds)", self._cfg.decoy_interval)
-        else:
-            # No decoy traffic — start a minimal keepalive to prevent the
-            # server's idle checker from closing the connection
-            self._keepalive_thread = threading.Thread(
-                target=self._keepalive_loop,
-                name="qr-keepalive",
-                daemon=True,
-            )
-            self._keepalive_thread.start()
-            log.debug(
-                "Keepalive started (interval: %ds) — decoy traffic disabled",
-                self._cfg.keepalive_interval,
-            )
-
-        log.info(
-            "Connected to %s:%d as '%s'",
-            self._cfg.server_host,
-            self._cfg.server_port,
-            self._cfg.username,
-        )
+        log.info("Connected to %s:%d as '%s'", self._cfg.server_host, self._cfg.server_port, self._cfg.username)
 
     def disconnect(self, reason: Optional[Exception] = None):
         """
-        Gracefully disconnect: send /quit, close the socket, stop threads.
+        Gracefully disconnect: send quit, close the socket, stop threads.
         Safe to call multiple times.
         """
         with self._shutdown_once:
@@ -533,13 +406,12 @@ class QuietRoomConnector:
             self._did_shutdown = True
 
         self._shutdown.set()
-
         with self._rooms_lock:
             self._joined_rooms.clear()
 
         if self._sock:
             try:
-                self._send_message("/quit")
+                self._send({"t": "quit"})
             except Exception:
                 pass
             try:
@@ -562,7 +434,7 @@ class QuietRoomConnector:
 
     @property
     def joined_rooms(self) -> frozenset[str]:
-        """The set of rooms this connector is currently joined to."""
+        """The rooms this connector is in (as confirmed by the server)."""
         with self._rooms_lock:
             return frozenset(self._joined_rooms)
 
@@ -571,90 +443,83 @@ class QuietRoomConnector:
     # ------------------------------------------------------------------
 
     def send_message(self, text: str):
-        """
-        Send a chat message to the lobby.
-        Thread-safe. Raises OSError if the connection is lost.
-        """
-        self._send_message(text)
+        """Send a chat message to the lobby. Thread-safe."""
+        self._send({"t": "chat", "text": text})
 
     def send_room_message(self, room: str, text: str):
         """
-        Send a message to a specific room.
-        The room prefix [#roomname] is prepended automatically.
-        The server validates that this connector is a member of the room
-        before routing — join_room() must have been called first.
-
-        Thread-safe. Raises OSError if the connection is lost.
+        Send a message to a room you have joined. Thread-safe.
         Raises ValueError if room does not start with #.
         """
         if not room.startswith("#"):
             raise ValueError(f"Room name must start with #, got: {room!r}")
-        self._send_message(f"[{room}] {text}")
+        self._send({"t": "chat", "room": room, "text": text})
 
     def send_dm(self, recipient: str, text: str):
-        """
-        Send a direct message to a specific user.
-        Thread-safe. Raises OSError if the connection is lost.
-        """
-        self._send_message(f"/msg {recipient} {text}")
+        """Send a direct message to a specific user. Thread-safe."""
+        self._send({"t": "dm", "to": recipient, "text": text})
 
     def join_room(self, room: str, password: str = ""):
         """
-        Join a chat room. room must start with #.
-        The room is tracked locally so send_room_message() can validate it.
+        Join or create a room. room must start with #. joined_rooms is
+        updated when the server confirms the join.
         """
         if not room.startswith("#"):
             raise ValueError(f"Room name must start with #, got: {room!r}")
-        cmd = f"/join {room}"
+        msg = {"t": "join", "room": room}
         if password:
-            cmd += f" {password}"
-        self._send_message(cmd)
-        with self._rooms_lock:
-            self._joined_rooms.add(room)
-        log.debug("Joined room %s", room)
+            msg["password"] = password
+        self._send(msg)
 
     def leave_room(self, room: str):
         """Leave a chat room."""
         if not room.startswith("#"):
             raise ValueError(f"Room name must start with #, got: {room!r}")
-        self._send_message(f"/leave {room}")
-        with self._rooms_lock:
-            self._joined_rooms.discard(room)
-        log.debug("Left room %s", room)
+        self._send({"t": "leave", "room": room})
 
     def list_users(self):
-        """
-        Request the global online user list from the server.
-        The response arrives asynchronously via the on_system_message callback
-        as a string starting with 'Online Users'.
-        """
-        self._send_message("/users")
+        """Request the online user list; the answer arrives via on_system_message ('Online Users ...')."""
+        self._send({"t": "users"})
 
     def list_members(self, room: str):
         """
-        Request the member list for a room or the lobby.
-        room should be a #roomname or the string 'lobby'.
-        The response arrives asynchronously via the on_system_message callback
-        as a string starting with 'Members of'.
-
-        For password-protected rooms the server will return an access denied
-        message if this connector is not a member.
+        Request the member list for a #room or 'lobby'; the answer arrives via
+        on_system_message ('Members of ...'). Password rooms are only visible
+        to their members.
         """
-        self._send_message(f"/members {room}")
+        self._send({"t": "members", "room": room})
 
     def list_rooms(self):
-        """
-        Request the list of active rooms from the server.
-        The response arrives asynchronously via the on_system_message callback.
-        """
-        self._send_message("/rooms")
+        """Request the list of active rooms; the answer arrives via on_system_message."""
+        self._send({"t": "rooms"})
 
     def send_command(self, command: str):
         """
-        Send a raw command string. Use this for any server command not
-        covered by the named methods above.
+        Run a slash command (/msg, /join, /leave, /rooms, /users, /members,
+        /help, /quit). Plain text is sent to the lobby. File transfers are
+        not supported by the connector.
         """
-        self._send_message(command)
+        command = command.strip()
+        if not command.startswith("/"):
+            self.send_message(command)
+            return
+        parts = command.split(None, 2)
+        name = parts[0][1:].lower()
+        args = parts[1:]
+        if name == "msg" and len(args) == 2:
+            self.send_dm(args[0], args[1])
+        elif name == "join" and args:
+            self.join_room(args[0], args[1] if len(args) > 1 else "")
+        elif name == "leave" and args:
+            self.leave_room(args[0])
+        elif name in ("rooms", "users", "help"):
+            self._send({"t": name})
+        elif name == "members" and args:
+            self.list_members(args[0])
+        elif name == "quit":
+            self.disconnect()
+        else:
+            raise ValueError(f"Unsupported or malformed command: {command!r}")
 
     # ------------------------------------------------------------------
     # Internal: TLS + cert pinning
@@ -666,9 +531,7 @@ class QuietRoomConnector:
                 f"Access file '{self._cfg.cert_file}' not found. "
                 f"Copy {ACCESS_FILE_NAME} from the server."
             )
-        (self._server_cert_pem,
-         self._server_cert_der,
-         self._access_pem) = _load_access_bundle(self._cfg.cert_file)
+        self._server_cert_der, self._access_pem = _load_access_bundle(self._cfg.cert_file)
 
     def _tls_connect(self) -> ssl.SSLSocket:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -684,119 +547,43 @@ class QuietRoomConnector:
         tls_sock = ctx.wrap_socket(raw, server_hostname=self._cfg.server_host)
 
         # Certificate pinning — compare raw DER bytes
-        peer_der = tls_sock.getpeercert(binary_form=True)
-        if peer_der != self._server_cert_der:
+        if tls_sock.getpeercert(binary_form=True) != self._server_cert_der:
             tls_sock.close()
             raise SecurityError(
                 "Server certificate does not match the access file — either the server was "
                 "restarted (get the new file) or the connection is being intercepted (possible MITM)"
             )
-
         log.debug("TLS established and certificate pinned")
-        tls_sock.settimeout(None)
         return tls_sock
 
     # ------------------------------------------------------------------
-    # Internal: DH key exchange
-    # ------------------------------------------------------------------
-
-    def _perform_dh_exchange(self):
-        sock = self._sock
-
-        # Read server DH public key
-        (srv_pub_len,) = struct.unpack(">I", _read_exact(sock, 4))
-        if srv_pub_len > 4096:
-            raise ConnectorError("Server DH key too large")
-        srv_pub_bytes = _read_exact(sock, srv_pub_len)
-
-        # Read RSA-PSS signature
-        (sig_len,) = struct.unpack(">I", _read_exact(sock, 4))
-        if sig_len > 4096:
-            raise ConnectorError("Server signature too large")
-        signature = _read_exact(sock, sig_len)
-
-        # Verify signature against pinned certificate
-        from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.x509 import load_pem_x509_certificate
-
-        cert = load_pem_x509_certificate(self._server_cert_pem.encode())
-
-        try:
-            cert.public_key().verify(
-                signature,
-                srv_pub_bytes,
-                asym_padding.PSS(
-                    mgf=asym_padding.MGF1(hashes.SHA256()),
-                    salt_length=asym_padding.PSS.MAX_LENGTH,
-                ),
-                hashes.SHA256(),
-            )
-        except Exception as e:
-            raise SecurityError(f"Server authentication failed: {e}")
-
-        log.debug("Server RSA-PSS signature verified")
-
-        # Validate server DH public key — small subgroup attack prevention
-        srv_pub = int.from_bytes(srv_pub_bytes, "big")
-        if not _dh_validate_public(srv_pub):
-            raise SecurityError("Server sent invalid DH public key")
-
-        # Generate our keypair and send to server
-        my_priv, my_pub = _dh_generate_keypair()
-        my_pub_bytes = my_pub.to_bytes((my_pub.bit_length() + 7) // 8, "big")
-        sock.sendall(struct.pack(">I", len(my_pub_bytes)))
-        sock.sendall(my_pub_bytes)
-
-        self._session_key = _dh_shared_secret(my_priv, srv_pub)
-        log.debug("DH key exchange complete")
-
-    # ------------------------------------------------------------------
-    # Internal: login handshake
+    # Internal: login
     # ------------------------------------------------------------------
 
     def _login(self):
-        # Server sends "Enter your username:" prompt — read and discard
-        _read_packet(self._sock)
-
-        # Send our username
-        self._send_message(self._cfg.username)
-
-        # Read welcome message
-        _, data = _read_packet(self._sock)
-        welcome = self._decrypt(data)
-
-        # Check for username taken error
-        if "already taken" in welcome:
-            self._sock.close()
-            raise ConnectorError(welcome.strip())
-
-        log.debug("Server: %s", welcome.strip())
-
-        # Read help text
-        _read_packet(self._sock)
-
+        self._sock.settimeout(self._cfg.connect_timeout)
+        self._send({"t": "hello", "v": PROTOCOL_VERSION, "user": self._cfg.username})
+        while True:
+            frame_type, payload = _read_frame(self._sock)
+            if frame_type != FRAME_CONTROL:
+                continue
+            msg = json.loads(payload)
+            if msg.get("t") == "error":
+                self._sock.close()
+                raise ConnectorError(msg.get("text", "login refused"))
+            if msg.get("t") == "welcome":
+                break
+        self._sock.settimeout(None)
         log.debug("Login complete as '%s'", self._cfg.username)
-
-    # ------------------------------------------------------------------
-    # Internal: encryption
-    # ------------------------------------------------------------------
-
-    def _encrypt(self, text: str) -> bytes:
-        return _aes_gcm_encrypt(self._session_key, text.encode())
-
-    def _decrypt(self, data: bytes) -> str:
-        return _aes_gcm_decrypt(self._session_key, data).decode(errors="replace")
 
     # ------------------------------------------------------------------
     # Internal: send
     # ------------------------------------------------------------------
 
-    def _send_message(self, text: str):
-        encrypted = self._encrypt(text)
-        packet = _make_packet(PKT_MESSAGE, encrypted)
+    def _send(self, msg: dict):
+        frame = _encode_msg(msg)
         with self._send_lock:
-            self._sock.sendall(packet)
+            self._sock.sendall(frame)
 
     # ------------------------------------------------------------------
     # Internal: receive loop
@@ -807,162 +594,98 @@ class QuietRoomConnector:
         try:
             while not self._shutdown.is_set():
                 try:
-                    msg_type, data = _read_packet(self._sock)
-                except (ConnectionLostError, OSError) as e:
+                    frame_type, payload = _read_frame(self._sock)
+                except (ConnectorError, OSError) as e:
                     if not self._shutdown.is_set():
                         reason = e
                         log.error("Connection lost: %s", e)
                     break
-                except ValueError as e:
-                    log.warning("Bad packet: %s", e)
-                    continue
-
-                if msg_type == PKT_DECOY:
-                    continue
-                if msg_type == PKT_FILE:
-                    log.debug("File transfer packet received (ignored by connector)")
-                    continue
-
+                if frame_type != FRAME_CONTROL:
+                    continue  # decoys; file data is not supported
                 try:
-                    text = self._decrypt(data)
-                except Exception as e:
-                    log.warning("Decryption error: %s", e)
-                    continue
-
-                text = text.strip()
-                if not text:
-                    continue
-
-                self._dispatch(text)
-
+                    msg = json.loads(payload)
+                except ValueError as e:
+                    reason = ConnectorError(f"protocol error: {e}")
+                    break
+                if isinstance(msg, dict):
+                    self._dispatch(msg)
         finally:
             if not self._did_shutdown:
                 self.disconnect(reason)
 
-    def _dispatch(self, text: str):
-        """
-        Parse and route a decrypted server message to the appropriate callbacks.
-
-        Priority order:
-          1. on_message fires for everything
-          2. DMs → on_dm
-          3. Room messages → on_room_message
-          4. Everything else → on_system_message
-        """
-
-        # 1. Raw message — fires for everything
-        for cb in self._message_callbacks:
+    def _call(self, callbacks, *args):
+        for cb in callbacks:
             try:
-                cb(text)
+                cb(*args)
             except Exception:
-                log.exception("on_message callback raised")
+                log.exception("callback raised")
 
-        # 2. Direct message
-        dm = _parse_dm(text)
-        if dm:
-            for cb in self._dm_callbacks:
-                try:
-                    cb(dm.sender, dm.text)
-                except Exception:
-                    log.exception("on_dm callback raised")
-            return
-
-        # 3. Timestamped chat message (lobby or room)
-        msg = _parse_message(text)
-        if msg:
-            if msg.room is not None:
-                # Room message
-                for cb in self._room_message_callbacks:
-                    try:
-                        cb(msg.room, msg.sender, msg.text)
-                    except Exception:
-                        log.exception("on_room_message callback raised")
-            # Lobby messages have no dedicated callback beyond on_message
-            return
-
-        # 4. Own DM echo — [DM to username]: text
-        if _DM_SELF_RE.match(text):
-            # Suppress from system messages — it's just our own send confirmation
-            return
-
-        # 5. Server notice / command response / join+leave event
-        for cb in self._system_message_callbacks:
+    def _dispatch(self, msg: dict):
+        t = msg.get("t")
+        me = self._cfg.username
+        if t == "chat":
+            room, sender, text = msg.get("room") or None, msg.get("from", ""), msg.get("text", "")
+            prefix = f"[{room}] " if room else ""
+            self._call(self._message_callbacks, f"[{msg.get('time', '')}] {prefix}{sender}: {text}")
+            if sender != me and room:
+                self._call(self._room_message_callbacks, room, sender, text)
+        elif t == "dm":
+            sender, text = msg.get("from", ""), msg.get("text", "")
+            if sender == me:
+                self._call(self._message_callbacks, f"[DM to {msg.get('to', '')}]: {text}")
+            else:
+                self._call(self._message_callbacks, f"[DM from {sender}]: {text}")
+                self._call(self._dm_callbacks, sender, text)
+        elif t in ("joined", "left"):
+            user, room = msg.get("user", ""), msg.get("room") or None
+            if user == me and room:
+                with self._rooms_lock:
+                    if t == "joined":
+                        self._joined_rooms.add(room)
+                    else:
+                        self._joined_rooms.discard(room)
+            where = room if room else "the chat"
+            text = f"*** {user} {t} {where} ***"
+            self._call(self._message_callbacks, text)
+            self._call(self._system_message_callbacks, text)
+            self._call(self._presence_callbacks, t, user, room)
+        elif t in ("info", "error"):
+            text = msg.get("text", "")
+            self._call(self._message_callbacks, text)
+            self._call(self._system_message_callbacks, text)
+        elif t == "file_offer":
+            # Files are not supported: decline so the sender is not left waiting.
             try:
-                cb(text)
-            except Exception:
-                log.exception("on_system_message callback raised")
-
-        # Also track room joins/leaves from system messages to keep
-        # joined_rooms in sync with the server's actual state
-        self._track_room_events(text)
-
-    def _track_room_events(self, text: str):
-        """
-        Parse server join/leave notices to keep joined_rooms accurate.
-        The server sends these when another user joins/leaves a room the
-        connector is in, but we also use them to catch our own join/leave
-        confirmations so the local set stays correct even if join_room()
-        was called via send_command().
-        """
-        # "Joined room #roomname" or "Created and joined room #roomname"
-        m = re.match(r"(?:Created and )?[Jj]oined room (#\S+)", text)
-        if m:
-            with self._rooms_lock:
-                self._joined_rooms.add(m.group(1))
-            return
-
-        # "Left room #roomname - returned to lobby"
-        m = re.match(r"[Ll]eft room (#\S+)", text)
-        if m:
-            with self._rooms_lock:
-                self._joined_rooms.discard(m.group(1))
+                self._send({"t": "file_decline", "id": msg.get("id", "")})
+            except OSError:
+                pass
 
     def _fire_disconnect(self, reason: Optional[Exception]):
-        for cb in self._disconnect_callbacks:
+        self._call(self._disconnect_callbacks, reason)
+
+    # ------------------------------------------------------------------
+    # Internal: decoys and keepalive
+    # ------------------------------------------------------------------
+
+    def _noise_loop(self):
+        """
+        Sends decoy frames at random intervals (0.5x-1.5x decoy_interval) when
+        decoy traffic is enabled, otherwise a small keepalive frame every
+        keepalive_interval, so the server does not drop the idle connection.
+        """
+        while not self._shutdown.is_set():
+            if self._cfg.decoy_traffic:
+                mean = max(1, self._cfg.decoy_interval)
+                wait = mean / 2 + secrets.randbelow(mean * 1000 + 1) / 1000
+                size = self._cfg.decoy_min_bytes + secrets.randbelow(
+                    max(1, self._cfg.decoy_max_bytes - self._cfg.decoy_min_bytes + 1))
+            else:
+                wait, size = self._cfg.keepalive_interval, 0
+            if self._shutdown.wait(timeout=min(wait, 60)):
+                break
+            frame = _encode_frame(FRAME_DECOY, secrets.token_bytes(16), size)
             try:
-                cb(reason)
+                with self._send_lock:
+                    self._sock.sendall(frame)
             except Exception:
-                log.exception("on_disconnect callback raised")
-
-    # ------------------------------------------------------------------
-    # Internal: decoy traffic
-    # ------------------------------------------------------------------
-
-    def _decoy_loop(self):
-        while not self._shutdown.is_set():
-            self._shutdown.wait(timeout=self._cfg.decoy_interval)
-            if self._shutdown.is_set():
                 break
-            size = self._cfg.decoy_min_bytes + secrets.randbelow(
-                max(1, self._cfg.decoy_max_bytes - self._cfg.decoy_min_bytes)
-            )
-            packet = _make_packet(PKT_DECOY, secrets.token_bytes(size))
-            with self._send_lock:
-                try:
-                    self._sock.sendall(packet)
-                except Exception:
-                    break
-
-    # ------------------------------------------------------------------
-    # Internal: keepalive (used when decoy traffic is disabled)
-    # ------------------------------------------------------------------
-
-    def _keepalive_loop(self):
-        """
-        Sends a minimal decoy packet at keepalive_interval to prevent the
-        server's idle checker from closing the connection. Only runs when
-        decoy_traffic is False.
-        """
-        while not self._shutdown.is_set():
-            self._shutdown.wait(timeout=self._cfg.keepalive_interval)
-            if self._shutdown.is_set():
-                break
-            # Send a single small decoy packet — just enough to reset the
-            # server's idle timer without generating meaningful traffic
-            packet = _make_packet(PKT_DECOY, secrets.token_bytes(16))
-            with self._send_lock:
-                try:
-                    self._sock.sendall(packet)
-                    log.debug("Keepalive sent")
-                except Exception:
-                    break

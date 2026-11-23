@@ -93,14 +93,11 @@ sudo pacman -S gtk3 webkit2gtk
 ```
 quietroom-gui/
 ├── main.go                  # Wails entry point
-├── app.go                   # Go bindings exposed to the frontend
+├── app.go                   # Go bindings exposed to the frontend (uses ../client)
 ├── wails.json               # Wails project configuration
-├── go.mod                   # Go module definition
+├── go.mod                   # Go module (uses the repository root via replace: build from a full checkout)
 ├── build.sh                 # Build script
-├── protocol/
-│   ├── client.go            # TLS, DH key exchange, AES-GCM, packet framing
-│   ├── messages.go          # Server message parsing and event dispatching
-│   └── filetransfer.go      # File transfer state machine
+├── app_test.go              # Backend tests against a real server
 └── frontend/
     ├── index.html           # Application shell
     ├── package.json         # Frontend dependencies

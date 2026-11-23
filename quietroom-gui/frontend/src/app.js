@@ -493,6 +493,10 @@ export const App = {
     runtime.EventsOn('file_complete', data => {
       FileTransfer.completeReceive(data)
     })
+
+    runtime.EventsOn('file_failed', data => {
+      FileTransfer.failTransfer(data)
+    })
   },
 
   // ── Modal helpers ────────────────────────────────────────────

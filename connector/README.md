@@ -1,6 +1,6 @@
 # QuietRoom Connector
 
-A Python library for building automated clients on top of a QuietRoom server. Handles the full protocol stack — TLS, Diffie-Hellman key exchange, AES-256-GCM encryption, and obfuscated packet framing — and exposes a clean callback-based interface.
+A Python library for building automated clients on top of a QuietRoom server. Handles the full protocol stack (QuietRoom protocol 3: TLS 1.3 with the access key, framed and padded messages, decoys and keepalives) and exposes a clean callback-based interface. It uses only the Python standard library.
 
 The connector maintains a persistent connection for as long as it runs. The username it registers appears on the server from the moment `connect()` returns until `disconnect()` is called or the process exits.
 
@@ -8,11 +8,9 @@ The connector maintains a persistent connection for as long as it runs. The user
 
 ## Requirements
 
-```bash
-pip install cryptography
-```
+No packages to install: the connector uses only the Python standard library.
 
-Python 3.11 or higher. `quietroom_access.pem` must be copied from the server to the working directory. It is secret (it contains the access key) and is replaced every time the server restarts.
+Python 3.11 or higher, and a QuietRoom 3 server. `quietroom_access.pem` must be copied from the server to the working directory. It is secret (it contains the access key) and is replaced every time the server restarts.
 
 ---
 
@@ -57,7 +55,7 @@ All options are set via `ConnectorConfig`:
 | `cert_file` | str | `"quietroom_access.pem"` | Path to the access file (pinned server certificate + access key) |
 | `username` | str | `"Bot"` | Username to register on the server |
 | `decoy_traffic` | bool | `True` | Send random padding traffic at intervals |
-| `decoy_interval` | int | `30` | Seconds between decoy bursts |
+| `decoy_interval` | int | `30` | Mean seconds between decoys (each wait is random, 0.5–1.5 × this value) |
 | `decoy_min_bytes` | int | `100` | Minimum decoy payload size |
 | `decoy_max_bytes` | int | `500` | Maximum decoy payload size |
 | `keepalive_interval` | int | `60` | Seconds between keepalive packets when decoy traffic is disabled |
@@ -65,7 +63,7 @@ All options are set via `ConnectorConfig`:
 
 ### Keepalive behaviour
 
-The server closes idle connections after approximately 3 minutes of no traffic. When `decoy_traffic=True` (the default), decoy packets sent at `decoy_interval` prevent this. When `decoy_traffic=False`, the connector automatically sends a minimal keepalive packet every `keepalive_interval` seconds instead. You do not need to manage this manually.
+The server closes idle connections after approximately 3 minutes of no traffic. When `decoy_traffic=True` (the default), decoy frames sent around every `decoy_interval` seconds prevent this. When `decoy_traffic=False`, the connector automatically sends a minimal keepalive frame every `keepalive_interval` seconds instead. You do not need to manage this manually.
 
 ---
 
@@ -114,9 +112,24 @@ conn.on_system_message(handle_system)
 
 ---
 
+### `on_presence(callback)`
+
+Fired when a member joins or leaves the chat or a room. `room` is `None` when the member joined or left the chat itself.
+
+```python
+def handle_presence(event: str, user: str, room: str | None):
+    print(f"{user} {event} {room or 'the chat'}")
+
+conn.on_presence(handle_presence)
+```
+
+---
+
 ### `on_message(callback)`
 
-Fired for every decrypted text packet without exception — DMs, room messages, lobby messages, and server notices. Use this for logging or building a general-purpose client.
+Fired for every message without exception — DMs (including your own sent DMs), room and lobby messages (including your own), presence and server notices — rendered as one line of text, e.g. `[12:00:00] [#room] alice: hi`, `[DM from bob]: hello` or `*** carol left the chat ***`. Use this for logging or building a general-purpose client.
+
+`on_dm` and `on_room_message` never fire for your own messages.
 
 ```python
 conn.on_message(lambda text: print(f"RAW: {text}"))
@@ -217,11 +230,15 @@ conn.list_rooms()
 
 ### `send_command(command)`
 
-Send a raw command string for any server command not covered by the named methods.
+Run a slash command (`/msg`, `/join`, `/leave`, `/rooms`, `/users`, `/members`, `/help`, `/quit`). Plain text is sent to the lobby. Raises `ValueError` for unsupported or malformed commands.
 
 ```python
 conn.send_command("/help")
 ```
+
+### File transfers
+
+The connector does not support file transfers. Offers to the connector are declined automatically, so senders are not left waiting.
 
 ---
 
@@ -231,12 +248,12 @@ conn.send_command("/help")
 conn.connect()          # blocks until login complete, then starts background threads
 conn.is_connected       # True while receive loop is running
 conn.joined_rooms       # frozenset of rooms currently joined
-conn.disconnect()       # graceful shutdown: sends /quit, closes socket
+conn.disconnect()       # graceful shutdown: sends quit, closes socket
 ```
 
 `disconnect()` is safe to call multiple times and from any thread.
 
-`joined_rooms` is updated automatically as the connector joins and leaves rooms, including when join/leave confirmations arrive from the server.
+`joined_rooms` is updated when the server confirms a join or leave.
 
 ---
 
@@ -245,8 +262,8 @@ conn.disconnect()       # graceful shutdown: sends /quit, closes socket
 | Exception | When raised |
 |---|---|
 | `FileNotFoundError` | `cert_file` not found at `connect()` time |
-| `SecurityError` | Certificate mismatch, invalid access file, access key rejected by the server, or invalid DH key from server |
-| `ConnectorError` | Handshake, login failure, or username already taken |
+| `SecurityError` | Certificate mismatch, invalid access file, or access key rejected by the server |
+| `ConnectorError` | Login refused (username taken or invalid), or the server speaks another protocol version |
 | `ConnectionLostError` | Server closed the connection mid-session |
 | `OSError` | Network-level failure |
 
@@ -311,7 +328,8 @@ while conn.is_connected:
 ## Security notes
 
 - **Certificate pinning** — the connector compares the server's TLS certificate byte-for-byte against the certificate in `quietroom_access.pem` and refuses to connect if they do not match, blocking man-in-the-middle attacks.
-- **DH key validation** — the server's Diffie-Hellman public key is validated to be in the range `(1, P-1)` before computing the shared secret, blocking small subgroup attacks.
+- **TLS 1.3 only** — ephemeral keys per connection (forward secrecy); the connector presents the access key from `quietroom_access.pem`.
+- **Strict framing** — every frame states its exact length; malformed frames end the connection instead of being guessed around.
 - **Room membership validation** — the server validates that the connector is a member of a room before routing messages to it. Sending to a room you have not joined returns an error and the message is not delivered.
-- **Decoy traffic** — when enabled, random padding packets are sent at intervals to obscure communication patterns from traffic analysis.
-- All session keys are held in memory only and never written to disk.
+- **Padding and decoy traffic** — frames are padded to size classes, and random decoy frames at random intervals obscure communication patterns.
+- The access key is loaded through a private temporary file that is deleted immediately; session keys are held in memory only.

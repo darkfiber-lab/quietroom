@@ -49,7 +49,6 @@ from quietroom_connector import (
 )
 
 # Fired by server when a user fully disconnects from the chat
-_LEFT_RE = re.compile(r"^\*\*\*\s+(\S+)\s+left the chat\s+\*\*\*$")
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -416,16 +415,14 @@ class LLMBot:
         # Register callbacks on the connector
         self._conn.on_dm(self._handle_dm)
         self._conn.on_disconnect(self._handle_disconnect)
-        self._conn.on_message(self._handle_system_message)
+        self._conn.on_presence(self._handle_presence)
 
     def _handle_disconnect(self, reason: Optional[Exception]):
         log.info("Connector disconnected: %s", reason or "clean shutdown")
         self._shutdown.set()
     
-    def _handle_system_message(self, text: str):
-        m = _LEFT_RE.match(text.strip())
-        if m:
-            username = m.group(1)
+    def _handle_presence(self, event: str, username: str, room: Optional[str]):
+        if event == "left" and room is None:
             if self._history.clear(username):
                 log.info(
                     "User '%s' left — conversation history purged to prevent context leak",
