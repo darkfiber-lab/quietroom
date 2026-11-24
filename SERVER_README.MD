@@ -1,14 +1,14 @@
 # Secure Chat Server
 
-A military-grade encrypted chat server with end-to-end encryption, perfect forward secrecy, and advanced anti-surveillance features.
+A self-hosted encrypted chat server: TLS 1.3 with forward secrecy, a shared access key that keeps outsiders out, padded traffic and decoys against traffic analysis.
 
 ## Features
 
-- 🔐 **RSA-4096 Authentication** - Server identity verification
-- 🔑 **Diffie-Hellman Key Exchange** - Perfect forward secrecy with ephemeral keys
-- 🛡️ **AES-256-GCM Encryption** - Military-grade encryption for all messages
-- 🕵️ **Traffic Obfuscation** - TLS-like packet structure to evade Deep Packet Inspection
-- 🎭 **Decoy Traffic** - Hides activity patterns from traffic analysis
+- 🔐 **TLS 1.3 only** - Forward secrecy; clients pin the exact server certificate
+- 🔑 **Access key (mutual TLS)** - Connections without the current access key are refused during the handshake
+- 🕵️ **Traffic padding** - Every frame is padded to a size class, hiding message lengths
+- 🎭 **Decoy Traffic** - Random cover frames at random intervals hide activity patterns
+- 📁 **Flow-controlled file relay** - Files of any size; the server never stores them and buffers at most a few MB per transfer
 - 📝 **Privacy-preserving Logging** - Security events are logged without recording participants (metadata logging is opt-in)
 - 👥 **Multi-client Support** - Concurrent connections with thread-safe broadcasting
 
@@ -56,15 +56,14 @@ go run server.go
 You should see:
 ```
 ✓ Generated new server key and master access key (valid until server restart)
-✓ Initialized Diffie-Hellman parameters (2048-bit)
 ✓ Access file saved to: quietroom_access.pem
 ⚠ COPY quietroom_access.pem to client machines before connecting — it is SECRET, anyone holding it can join!
 ⚠ Restarting the server invalidates the previous access file.
-✓ Encrypted chat server started on port 37842
+✓ QuietRoom server (protocol 3) listening on port 37842 (TLS 1.3, access key required, silent to strangers)
 ✓ Logging to: chat_server.log
 ✓ Security logging to: security.log
-✓ Decoy traffic enabled (interval: 30s)
-✓ Traffic obfuscation active (TLS-like)
+✓ Metadata logging off: logs contain no participant information
+✓ Decoy traffic enabled (mean interval: 30s)
 ```
 
 ## Configuration
@@ -85,6 +84,8 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
   "max_connections": 100,
   "max_connections_per_ip": 10,
   "max_new_connections_per_ip_per_minute": 30,
+  "max_rooms": 200,
+  "max_rooms_per_member": 20,
   "log_metadata": false
 }
 ```
@@ -109,7 +110,7 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
 - **Logs**: 
   - Rejected connections (no or wrong access key), with IP address
   - Connection limit summaries
-  - Decryption errors and key exchange failures (participant shown as `[member]` unless `log_metadata` is enabled)
+  - Malformed frames and messages, flow-control violations (participant shown as `[member]` unless `log_metadata` is enabled)
   - Suspicious activity
 - **Example**: `"security.log"`, `"/var/log/chat/security.log"`
 
@@ -156,51 +157,62 @@ The server uses `server_config.json` for configuration. If it doesn't exist, a d
 - **Default**: `30`
 - **Note**: Refused connections are summarised once a minute in the security log
 
+#### `max_rooms` (integer)
+- **Description**: Maximum number of rooms on the server
+- **Default**: `200`
+- **Note**: Empty rooms are removed automatically
+
+#### `max_rooms_per_member` (integer)
+- **Description**: Maximum number of rooms one member can be in at the same time
+- **Default**: `20`
+
 #### `log_metadata` (boolean)
 - **Description**: Record information about participants in the logs: who joined and left, successful logins, DMs (sender → recipient), file transfers, and member IP addresses
 - **Default**: `false`
 - **Note**: Leave this off in normal operation. Logs are exactly the kind of record that can be seized or subpoenaed; with it off, logs contain no information about participants. Enable it only temporarily for debugging. The server prints a warning at startup while it is on.
 
-Unauthenticated connections must complete the TLS handshake, key exchange and username within 15 seconds or they are closed.
+Connections must complete the TLS handshake and log in within 15 seconds or they are closed. Members that send nothing for 3 minutes are disconnected (clients send keepalives automatically); members that stop reading are disconnected once their queue is full or a write times out (30 s).
 
-Room names must start with `#` followed by 1–32 letters, digits, `_`, `-` or `.`.
+Built-in limits (not configurable): messages up to 8 KB; about 20 messages per second per member (bursts up to 60); at most 4 file transfers per member in each direction; offers expire after 5 minutes, stalled transfers after 2 minutes.
+
+Usernames are 1–32 letters, digits, spaces, `_`, `-` or `.`. Room names start with `#` followed by 1–32 letters, digits, `_`, `-` or `.`.
 
 ## Security Features
 
-### Encryption Layers
+### Encryption and Access
 
-1. **RSA-4096 Authentication**
-   - Server generates a 4096-bit RSA key pair on every startup (kept in memory only)
-   - The server certificate is part of `quietroom_access.pem`, distributed to clients offline
-   - Clients pin it exactly, preventing man-in-the-middle attacks
+1. **TLS 1.3 only**
+   - Ephemeral key exchange per connection: forward secrecy
+   - The server generates a new certificate (ECDSA P-256, random name) on every start; its private key is kept in memory only
+   - The certificate is part of `quietroom_access.pem`; clients pin it exactly, preventing man-in-the-middle attacks
 
 2. **Access Key (mutual TLS)**
    - Server generates a master access key (ECDSA P-256) on every startup, stored in `quietroom_access.pem`
-   - Every client must present this key during the TLS handshake; connections without it are refused before any chat data is exchanged
+   - Every client must present this key during the TLS handshake; connections without it are refused before any QuietRoom protocol code runs
    - Rejected connections are recorded in the security log
    - A server restart rotates the key and revokes all previously distributed access files
 
-3. **Diffie-Hellman Key Exchange**
-   - 2048-bit MODP Group (RFC 3526)
-   - Ephemeral keys generated per session
-   - Perfect forward secrecy - past sessions stay secure even if RSA key is compromised
+3. **Silent to strangers (gate)**
+   - In TLS 1.3 a server normally shows its certificate to anyone who starts a handshake. QuietRoom does not: the client puts a gate token in the server name of its first TLS message, derived from the access key, the current minute and a random nonce
+   - The server reads that message before starting TLS; without a valid token it closes the connection without sending a single byte (no certificate, no TLS alert), so scanners and `openssl s_client` learn nothing
+   - Tokens are valid for ±5 minutes (clock skew) and only once (replays are refused)
+   - The port still accepts TCP connections; use a firewall if it must not appear open at all
 
-4. **AES-256-GCM**
-   - Session encryption using DH-derived keys
-   - Authenticated encryption prevents tampering
-   - 256-bit key strength
+4. **Trusted server**
+   - The server decrypts and relays messages and files (by design); it never stores them
 
-### Traffic Obfuscation
+### Protocol (version 3)
 
-- **TLS-like Packet Structure**: Makes traffic appear as HTTPS to Deep Packet Inspection
-- **Random Padding**: 0-255 bytes of random data per packet
-- **Variable Message Sizes**: Hides actual message length
+- Every frame states its exact length; the receiver never guesses where a frame ends, so the stream cannot get out of sync
+- Control messages are typed JSON; the server sets sender names and timestamps itself, so members cannot impersonate each other
+- File data flows in its own frames with credit-based flow control; chat is always sent before file data, so it stays responsive during transfers
+- See the [`wire`](wire/) package for the specification
 
-### Decoy Traffic
+### Traffic Padding and Decoys
 
-- Sends random encrypted packets at regular intervals
-- Makes it impossible to determine when real messages are sent
-- Configurable frequency and size
+- Every frame is padded to a size class (256 B, 512 B, 1 KB, ... 64 KB), hiding the length of messages
+- Decoy frames are sent at random intervals (0.5–1.5 × the configured interval) in both directions, hiding when real messages are sent
+- Decoy sizes are configurable
 
 ## Log Files
 
@@ -209,10 +221,11 @@ By default (`log_metadata: false`) the logs contain no information about partici
 ### Security Log (`security.log`), default
 
 ```
-[SECURITY] 2026/11/22 15:30:45 Server started with enhanced security features
-[SECURITY] 2026/11/22 15:31:02 Rejected connection from 203.0.113.7:51544: tls: client didn't provide a certificate
+[SECURITY] 2026/11/22 15:30:45 Server started (protocol 3)
+[SECURITY] 2026/11/22 15:31:02 Rejected connection from 203.0.113.7:51544: no gate token
+[SECURITY] 2026/11/22 15:31:40 Rejected connection from 198.51.100.4:40212: no TLS ClientHello: not a TLS ClientHello
 [SECURITY] 2026/11/22 15:32:00 Refused 12 connection(s) over connection limits in the last minute
-[SECURITY] 2026/11/22 15:33:10 Decryption error from [member]: cipher: message authentication failed
+[SECURITY] 2026/11/22 15:33:10 Malformed frame from [member]: malformed frame: unknown type 0x7f
 ```
 
 ### With `log_metadata: true`
@@ -220,7 +233,6 @@ By default (`log_metadata: false`) the logs contain no information about partici
 ```
 2026/11/22 15:30:46 User joined: Alice from 192.168.1.100:54321
 2026/11/22 15:30:58 DM: Alice -> Bob
-[SECURITY] 2026/11/22 15:30:46 Successful authentication: Alice from 192.168.1.100:54321
 ```
 
 ## Generated Files
@@ -298,12 +310,13 @@ netstat -tulpn | grep 37842
 
 ### Failed authentication attempts in logs
 
-**Problem**: `[SECURITY] Failed key exchange: Decryption failed`
+**Problem**: `Rejected connection from ...` in the security log
 
 **Solution**: 
-1. Ensure clients have the current `quietroom_access.pem` (a server restart replaces it)
-2. `Rejected connection from ...: access key not recognised` / `client didn't provide a certificate` means a client without a valid access file tried to connect
-3. Check for man-in-the-middle attacks
+1. `no gate token` / `no TLS ClientHello` is almost always an internet scanner; nothing was revealed to it
+2. `invalid or expired gate token` means a client with an old access file (a server restart replaces it) or a clock more than 5 minutes off; `replayed gate token` means someone re-sent a captured connection attempt
+3. `access key not recognised` / `client didn't provide a certificate` means a client passed the gate but presented a wrong access key
+4. `No valid hello` usually means an outdated client: QuietRoom 3 servers need QuietRoom 3 clients
 
 ## Security Best Practices
 
@@ -312,7 +325,7 @@ netstat -tulpn | grep 37842
 3. ✅ **Monitor security logs** - Watch for suspicious activity
 4. ✅ **Keep server updated** - Rebuild with latest Go version
 5. ✅ **Use strong system security** - Firewall, SELinux/AppArmor
-6. ✅ **Restrict file permissions** - `chmod 600 server_private.pem`
+6. ✅ **Protect the access file** - It is written with mode 600; keep it that way
 7. ✅ **Run as non-root user** - Create dedicated user account
 
 ## Performance
@@ -320,8 +333,9 @@ netstat -tulpn | grep 37842
 ### Resource Usage
 
 - **Memory**: ~10-20 MB base + ~1-2 MB per connected client
-- **CPU**: Minimal (<1% idle), ~5-10% during active encryption
-- **Network**: ~100-500 bytes/30s per client (decoy traffic)
+- **CPU**: Minimal when idle; file transfers are limited by network and disk, not the server
+- **Memory per transfer**: at most about 4 MB buffered (flow control)
+- **Network**: one decoy of 256–512 bytes per client per ~30 s in each direction
 
 ## License
 

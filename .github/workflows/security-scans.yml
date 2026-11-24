@@ -64,14 +64,14 @@ jobs:
         run: go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
 
       # Server and client are both package main in the repository root, so
-      # each is scanned in its own temporary module.
+      # each is scanned in its own temporary module (with the shared packages).
       - name: Scan
         env:
           PROGRAM: ${{ matrix.program }}
         run: |
           work="${RUNNER_TEMP}/vulncheck-${PROGRAM}"
           mkdir -p "${work}"
-          cp go.mod go.sum "quietroom_${PROGRAM}.go" "${work}/"
+          cp -R go.mod go.sum wire client "quietroom_${PROGRAM}.go" "${work}/"
           (cd "${work}" && govulncheck -format sarif ./... > "${GITHUB_WORKSPACE}/govulncheck-${PROGRAM}.sarif")
 
       - name: Upload results

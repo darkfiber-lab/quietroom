@@ -1,4 +1,3 @@
-
 /*
 Copyright (C) 2026 darkfiber-lab
 
@@ -17,20 +16,21 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 package main
 
 import (
-	goruntime "runtime"
-    "os/exec"
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"quietroom-gui/protocol"
-
+	"github.com/darkfiber-lab/quietroom/client"
+	"github.com/darkfiber-lab/quietroom/wire"
 	"github.com/gen2brain/beeep"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -46,14 +46,15 @@ type ServerProfile struct {
 
 // AppConfig is persisted to disk
 type AppConfig struct {
-	Profiles         []ServerProfile `json:"profiles"`
-	LastProfile      int             `json:"last_profile"`
-	SoundEnabled     bool            `json:"sound_enabled"`
-	DecoyEnabled     bool            `json:"decoy_enabled"`
-	DecoyInterval    int             `json:"decoy_interval"`
-	DecoyMinBytes    int             `json:"decoy_min_bytes"`
-	DecoyMaxBytes    int             `json:"decoy_max_bytes"`
-	DownloadDir      string          `json:"download_dir"`
+	Profiles      []ServerProfile `json:"profiles"`
+	LastProfile   int             `json:"last_profile"`
+	SoundEnabled  bool            `json:"sound_enabled"`
+	DecoyEnabled  bool            `json:"decoy_enabled"`
+	DecoyInterval int             `json:"decoy_interval"`
+	DecoyMinBytes int             `json:"decoy_min_bytes"`
+	DecoyMaxBytes int             `json:"decoy_max_bytes"`
+	DownloadDir   string          `json:"download_dir"`
+	MaxReceiveMB  int64           `json:"max_receive_mb"`
 }
 
 func defaultConfig() AppConfig {
@@ -83,27 +84,22 @@ type App struct {
 	ctx    context.Context
 	config AppConfig
 
-	client      *protocol.Client
+	client      *client.Client
 	clientMu    sync.RWMutex
 	connected   bool
 	username    string
 	currentRoom string
 
-	// File receive state
-	fileReceive   *protocol.FileReceiveState
-	fileReceiveMu sync.Mutex
+	pickedSendPath string // last path chosen via PickFileToSend
+	pickMu         sync.Mutex
 
-	// Pending file send state (path stored while waiting for BEGIN_SEND)
-	pendingFilePath string
-	pickedSendPath  string // last path chosen via PickFileToSend
-	pendingFileMu   sync.Mutex
-
-	decoyStop chan struct{}
+	// emit sends an event to the frontend (replaced in tests).
+	emit func(ctx context.Context, name string, data ...interface{})
 }
 
 // NewApp creates the application instance
 func NewApp() *App {
-	return &App{}
+	return &App{emit: runtime.EventsEmit}
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -113,10 +109,10 @@ func (a *App) startup(ctx context.Context) {
 
 func (a *App) shutdown(ctx context.Context) {
 	a.clientMu.RLock()
-	client := a.client
+	c := a.client
 	a.clientMu.RUnlock()
-	if client != nil {
-		client.Disconnect()
+	if c != nil {
+		c.Close()
 	}
 }
 
@@ -178,82 +174,64 @@ func (a *App) Connect(profileIndex int) error {
 	if profileIndex < 0 || profileIndex >= len(a.config.Profiles) {
 		return fmt.Errorf("invalid profile index")
 	}
-
-	a.clientMu.Lock()
-	if a.client != nil {
-		a.client.Disconnect()
-		a.client = nil
-	}
-	a.clientMu.Unlock()
-
-	profile := a.config.Profiles[profileIndex]
-	client := protocol.NewClient(a.handleProtocolEvent)
-
-	if err := client.Connect(profile.Host, profile.Port, profile.CertFile, profile.Username); err != nil {
+	p := a.config.Profiles[profileIndex]
+	if err := a.dial(p.Host, p.Port, p.CertFile, p.Username); err != nil {
 		return err
 	}
-
-	a.clientMu.Lock()
-	a.client = client
-	a.connected = true
-	a.username = profile.Username
-	a.currentRoom = ""
-	a.clientMu.Unlock()
-
 	a.config.LastProfile = profileIndex
 	a.saveConfig()
-
-	if a.config.DecoyEnabled {
-		a.startDecoy()
-	}
-
 	return nil
 }
 
 // ConnectCustom connects to a server with explicitly provided parameters
 func (a *App) ConnectCustom(host string, port int, certFile string, username string) error {
-	a.clientMu.Lock()
-	if a.client != nil {
-		a.client.Disconnect()
-		a.client = nil
-	}
-	a.clientMu.Unlock()
+	return a.dial(host, port, certFile, username)
+}
 
-	client := protocol.NewClient(a.handleProtocolEvent)
-	if err := client.Connect(host, port, certFile, username); err != nil {
+func (a *App) dial(host string, port int, certFile string, username string) error {
+	a.Disconnect()
+
+	maxReceive := a.config.MaxReceiveMB << 20
+	c, err := client.Dial(client.Config{
+		Addr:          net.JoinHostPort(host, strconv.Itoa(port)),
+		AccessFile:    certFile,
+		Username:      username,
+		DownloadDir:   a.config.DownloadDir,
+		MaxReceive:    maxReceive,
+		Decoys:        a.config.DecoyEnabled,
+		DecoyInterval: time.Duration(a.config.DecoyInterval) * time.Second,
+		DecoyMin:      a.config.DecoyMinBytes,
+		DecoyMax:      a.config.DecoyMaxBytes,
+		OnEvent:       a.handleEvent,
+	})
+	if err != nil {
 		return err
 	}
 
 	a.clientMu.Lock()
-	a.client = client
+	a.client = c
 	a.connected = true
-	a.username = username
+	a.username = c.Username()
 	a.currentRoom = ""
 	a.clientMu.Unlock()
 
-	if a.config.DecoyEnabled {
-		a.startDecoy()
-	}
-	// Emit connected event explicitly from here so the frontend
-    // receives it after Connect() has returned and the JS promise resolved
-    runtime.EventsEmit(a.ctx, "connected", map[string]interface{}{
-        "address":  fmt.Sprintf("%s:%d", host, port),
-        "username": username,
-    })
-
+	// Emitted here so the frontend receives it after the Connect promise resolved
+	a.emit(a.ctx, "connected", map[string]interface{}{
+		"address":  fmt.Sprintf("%s:%d", host, port),
+		"username": c.Username(),
+	})
 	return nil
 }
 
 // Disconnect disconnects from the current server
 func (a *App) Disconnect() {
-	a.stopDecoy()
 	a.clientMu.Lock()
-	client := a.client
+	c := a.client
 	a.client = nil
 	a.connected = false
 	a.clientMu.Unlock()
-	if client != nil {
-		client.Disconnect()
+	if c != nil {
+		c.Close()
 	}
 }
 
@@ -261,7 +239,16 @@ func (a *App) Disconnect() {
 func (a *App) IsConnected() bool {
 	a.clientMu.RLock()
 	defer a.clientMu.RUnlock()
-	return a.connected && a.client != nil && a.client.IsConnected()
+	return a.connected && a.client != nil
+}
+
+func (a *App) current() (*client.Client, error) {
+	a.clientMu.RLock()
+	defer a.clientMu.RUnlock()
+	if a.client == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	return a.client, nil
 }
 
 // ─────────────────────────────────────────────
@@ -270,77 +257,93 @@ func (a *App) IsConnected() bool {
 
 // SendMessage sends a text message to the lobby or current room
 func (a *App) SendMessage(text string) error {
-	a.clientMu.RLock()
-	currentRoom := a.currentRoom
-	a.clientMu.RUnlock()
-	if currentRoom != "" {
-		text = fmt.Sprintf("[%s] %s", currentRoom, text)
+	c, err := a.current()
+	if err != nil {
+		return err
 	}
-	return a.sendText(text)
+	return c.Chat(a.GetCurrentRoom(), text)
 }
 
 // SendDM sends a direct message to a specific user
 func (a *App) SendDM(recipient string, message string) error {
-	return a.sendText(fmt.Sprintf("/msg %s %s", recipient, message))
+	c, err := a.current()
+	if err != nil {
+		return err
+	}
+	return c.DM(recipient, message)
 }
 
-// JoinRoom joins a room with optional password
+// JoinRoom joins a room with optional password. The current room changes
+// only when the server confirms the join (our own room_joined event).
 func (a *App) JoinRoom(room string, password string) error {
 	if !strings.HasPrefix(room, "#") {
 		room = "#" + room
 	}
-	cmd := fmt.Sprintf("/join %s", room)
-	if password != "" {
-		cmd += " " + password
+	c, err := a.current()
+	if err != nil {
+		return err
 	}
-	// currentRoom is updated only when the server confirms the join
-	// (our own room_joined event), so a refused join never redirects messages.
-	return a.sendText(cmd)
+	return c.Join(room, password)
 }
 
-
 func (a *App) SetCurrentRoom(room string) {
-    a.clientMu.Lock()
-    a.currentRoom = room
-    a.clientMu.Unlock()
+	a.clientMu.Lock()
+	a.currentRoom = room
+	a.clientMu.Unlock()
 }
 
 // LeaveRoom leaves the specified room
 func (a *App) LeaveRoom(room string) error {
-    if err := a.sendText(fmt.Sprintf("/leave %s", room)); err != nil {
-        return err
-    }
-    a.clientMu.Lock()
-    if a.currentRoom == room {
-        a.currentRoom = ""
-    }
-    a.clientMu.Unlock()
-    return nil
+	c, err := a.current()
+	if err != nil {
+		return err
+	}
+	if err := c.Leave(room); err != nil {
+		return err
+	}
+	a.clientMu.Lock()
+	if a.currentRoom == room {
+		a.currentRoom = ""
+	}
+	a.clientMu.Unlock()
+	return nil
+}
+
+func (a *App) request(kind, room string) error {
+	c, err := a.current()
+	if err != nil {
+		return err
+	}
+	return c.Request(kind, room)
 }
 
 // ListRooms requests the room list from the server
-func (a *App) ListRooms() error {
-	return a.sendText("/rooms")
-}
+func (a *App) ListRooms() error { return a.request(wire.TRooms, "") }
 
 // ListUsers requests the user list from the server
-func (a *App) ListUsers() error {
-	return a.sendText("/users")
-}
+func (a *App) ListUsers() error { return a.request(wire.TUsers, "") }
 
-// SendCommand sends a raw command string (for advanced use)
+// RequestRoomList requests the room list (answered as a system message)
+func (a *App) RequestRoomList() error { return a.request(wire.TRooms, "") }
+
+// RequestUserList requests the user list
+func (a *App) RequestUserList() error { return a.request(wire.TUsers, "") }
+
+// RequestMemberList requests the members of a room or "lobby"
+func (a *App) RequestMemberList(target string) error { return a.request(wire.TMembers, target) }
+
+// SendCommand runs a slash command typed by the user.
 func (a *App) SendCommand(cmd string) error {
-	return a.sendText(cmd)
-}
-
-func (a *App) sendText(text string) error {
-	a.clientMu.RLock()
-	client := a.client
-	a.clientMu.RUnlock()
-	if client == nil {
-		return fmt.Errorf("not connected")
+	c, err := a.current()
+	if err != nil {
+		return err
 	}
-	return client.SendText(text)
+	// Files are only sent after picking them in the native dialog, so
+	// frontend content can never name an arbitrary local file.
+	if parsed, perr := wire.ParseCommand(cmd); perr == nil && parsed.Name == "file" {
+		return fmt.Errorf("use the Send File button to send files")
+	}
+	return c.Command(cmd, a.GetCurrentRoom())
 }
 
 // ─────────────────────────────────────────────
@@ -357,303 +360,215 @@ func (a *App) PickFileToSend() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	a.pendingFileMu.Lock()
+	a.pickMu.Lock()
 	a.pickedSendPath = path
-	a.pendingFileMu.Unlock()
+	a.pickMu.Unlock()
 	return path, nil
 }
 
-// InitiateFileTransfer starts the file transfer handshake
+// PickFile opens a native file picker (used to choose the access file).
+func (a *App) PickFile() (string, error) {
+	return runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "Select access file",
+	})
+}
+
+// InitiateFileTransfer offers the picked file to a member.
 func (a *App) InitiateFileTransfer(recipient string, filePath string) error {
-	a.pendingFileMu.Lock()
+	a.pickMu.Lock()
 	allowed := filePath != "" && filePath == a.pickedSendPath
 	a.pickedSendPath = ""
-	a.pendingFileMu.Unlock()
+	a.pickMu.Unlock()
 	if !allowed {
 		return fmt.Errorf("file must be selected with the file picker")
 	}
-
-	hash, err := protocol.ComputeFileHash(filePath)
+	c, err := a.current()
 	if err != nil {
-		return fmt.Errorf("cannot hash file: %w", err)
+		return err
 	}
-
-	basename := filepath.Base(filePath)
-	cmd := fmt.Sprintf("/file %s %s %s", recipient, basename, hash)
-
-	a.pendingFileMu.Lock()
-	a.pendingFilePath = filePath
-	a.pendingFileMu.Unlock()
-
-	return a.sendText(cmd)
+	_, err = c.OfferFile(recipient, filePath)
+	return err
 }
 
 // AcceptFileTransfer accepts an incoming file transfer
 func (a *App) AcceptFileTransfer(transferID string) error {
-	return a.sendText(fmt.Sprintf("/accept %s", transferID))
+	c, err := a.current()
+	if err != nil {
+		return err
+	}
+	return c.AcceptFile(transferID)
 }
 
 // DeclineFileTransfer declines an incoming file transfer
 func (a *App) DeclineFileTransfer(transferID string) error {
-	return a.sendText(fmt.Sprintf("/decline %s", transferID))
-}
-
-// PickFile opens a native file picker and returns the selected path
-func (a *App) PickFile() (string, error) {
-	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "Select file to send",
-	})
+	c, err := a.current()
 	if err != nil {
-		return "", err
+		return err
 	}
-	return path, nil
+	return c.DeclineFile(transferID)
+}
+
+// CancelFileTransfer stops a running transfer in either direction
+func (a *App) CancelFileTransfer(transferID string) error {
+	c, err := a.current()
+	if err != nil {
+		return err
+	}
+	return c.CancelFile(transferID)
 }
 
 // ─────────────────────────────────────────────
-// Protocol event handler
+// Protocol events -> frontend events
 // ─────────────────────────────────────────────
 
-func (a *App) handleProtocolEvent(evt protocol.Event) {
-	switch evt.Type {
-
-	case protocol.EvtConnected:
-		// Handled by ConnectCustom directly — do nothing here
-		// runtime.EventsEmit(a.ctx, "connected", map[string]interface{}{
-		// 	"address": evt.Text,
-		// 	"username": a.username,
-		// })
-
-	case protocol.EvtDisconnected:
+func (a *App) handleEvent(e client.Event) {
+	ts := e.Time
+	if ts == "" {
+		ts = time.Now().Format("15:04:05")
+	}
+	switch e.Kind {
+	case client.EvDisconnected:
 		a.clientMu.Lock()
 		a.connected = false
 		a.clientMu.Unlock()
-		a.stopDecoy()
-		runtime.EventsEmit(a.ctx, "disconnected", nil)
+		a.emit(a.ctx, "disconnected", nil)
 
-	case protocol.EvtError:
-		runtime.EventsEmit(a.ctx, "error", map[string]string{"message": evt.Text})
+	case client.EvChat:
+		a.emit(a.ctx, "message", map[string]interface{}{
+			"timestamp": ts,
+			"username":  e.From,
+			"text":      e.Text,
+			"room":      e.Room,
+			"isOwn":     e.Self,
+		})
+		if !e.Self {
+			a.notify("New message from " + e.From)
+		}
 
-	case protocol.EvtMessage:
-		if msg, ok := evt.Payload.(protocol.ChatMessage); ok {
-			runtime.EventsEmit(a.ctx, "message", map[string]interface{}{
-				"timestamp": msg.Timestamp,
-				"username":  msg.Username,
-				"text":      msg.Text,
-				"room":      msg.Room,
-				"isOwn":     msg.IsOwn,
-			})
-			if !msg.IsOwn {
-				a.notify("New message from " + msg.Username)
+	case client.EvDM:
+		partner, name := e.From, e.From
+		if e.Self {
+			partner, name = e.To, "You"
+		}
+		a.emit(a.ctx, "dm", map[string]interface{}{
+			"timestamp": ts,
+			"username":  name,
+			"text":      e.Text,
+			"partner":   partner,
+			"isOwn":     e.Self,
+		})
+		if !e.Self {
+			a.notify("DM from " + e.From)
+		}
+
+	case client.EvInfo, client.EvError:
+		a.emit(a.ctx, "system_message", map[string]interface{}{
+			"timestamp": ts,
+			"text":      e.Text,
+		})
+
+	case client.EvJoined:
+		if e.Room == "" {
+			a.emit(a.ctx, "user_joined", map[string]string{"username": e.User})
+			return
+		}
+		if e.Self {
+			a.clientMu.Lock()
+			a.currentRoom = e.Room // server confirmed our own join
+			a.clientMu.Unlock()
+		}
+		a.emit(a.ctx, "room_joined", map[string]string{"username": e.User, "room": e.Room})
+
+	case client.EvLeft:
+		if e.Room == "" {
+			a.emit(a.ctx, "user_left", map[string]string{"username": e.User})
+			return
+		}
+		if e.Self {
+			a.clientMu.Lock()
+			if a.currentRoom == e.Room {
+				a.currentRoom = ""
 			}
+			a.clientMu.Unlock()
 		}
+		a.emit(a.ctx, "room_left", map[string]string{"username": e.User, "room": e.Room})
 
-	case protocol.EvtPrivateMessage:
-		if msg, ok := evt.Payload.(protocol.ChatMessage); ok {
-			// Derive the conversation partner from sender or the __self__ prefix
-			partner := evt.Sender
-			if strings.HasPrefix(partner, "__self__") {
-				partner = strings.TrimPrefix(partner, "__self__")
-			}
-			runtime.EventsEmit(a.ctx, "dm", map[string]interface{}{
-				"timestamp": msg.Timestamp,
-				"username":  msg.Username,
-				"text":      msg.Text,
-				"partner":   partner,
-				"isOwn":     msg.IsOwn,
-			})
-			if !msg.IsOwn {
-				a.notify("DM from " + msg.Username)
-			}
-		}
+	case client.EvFileOffer:
+		t := e.Transfer
+		a.emit(a.ctx, "file_request", map[string]interface{}{
+			"transferID":   t.ID,
+			"filename":     t.Name,
+			"filesize":     t.Size,
+			"expectedHash": t.SHA256,
+			"senderName":   t.Peer,
+		})
+		a.notify("File transfer request from " + t.Peer)
 
-	case protocol.EvtSystemMessage:
-		if msg, ok := evt.Payload.(protocol.ChatMessage); ok {
-			runtime.EventsEmit(a.ctx, "system_message", map[string]interface{}{
-				"timestamp": msg.Timestamp,
-				"text":      msg.Text,
+	case client.EvFileStarted:
+		t := e.Transfer
+		if !t.Outgoing {
+			a.emit(a.ctx, "file_start", map[string]interface{}{
+				"filename":     t.Name,
+				"filesize":     t.Size,
+				"expectedHash": t.SHA256,
 			})
 		}
 
-	case protocol.EvtUserJoined:
-		runtime.EventsEmit(a.ctx, "user_joined", map[string]string{
-			"username": evt.Sender,
-		})
-
-	case protocol.EvtUserLeft:
-		runtime.EventsEmit(a.ctx, "user_left", map[string]string{
-			"username": evt.Sender,
-		})
-
-	case protocol.EvtRoomJoined:
-		a.clientMu.Lock()
-		if evt.Sender == a.username {
-			a.currentRoom = evt.Room // server confirmed our own join
-		}
-		a.clientMu.Unlock()
-		runtime.EventsEmit(a.ctx, "room_joined", map[string]string{
-			"username": evt.Sender,
-			"room":     evt.Room,
-		})
-
-	case protocol.EvtRoomLeft:
-		runtime.EventsEmit(a.ctx, "room_left", map[string]string{
-			"username": evt.Sender,
-			"room":     evt.Room,
-		})
-
-	case protocol.EvtFileRequest:
-		if payload, ok := evt.Payload.(protocol.FileRequestPayload); ok {
-			runtime.EventsEmit(a.ctx, "file_request", map[string]string{
-				"transferID":   payload.TransferID,
-				"filename":     payload.Filename,
-				"expectedHash": payload.ExpectedHash,
-				"senderName":   payload.SenderName,
+	case client.EvFileProgress:
+		t := e.Transfer
+		pct := float64(t.Done) / float64(t.Size) * 100
+		if t.Outgoing {
+			a.emit(a.ctx, "file_progress", map[string]interface{}{
+				"filename":   t.Name,
+				"bytesSent":  t.Done,
+				"totalBytes": t.Size,
+				"percent":    pct,
+				"done":       false,
 			})
-			a.notify("File transfer request from " + payload.SenderName)
+		} else {
+			a.emit(a.ctx, "file_receive_progress", map[string]interface{}{
+				"filename": t.Name,
+				"received": t.Done,
+				"total":    t.Size,
+				"percent":  pct,
+			})
 		}
 
-	case protocol.EvtFileBeginSend:
-		// Server confirmed accept — start sending the file
-		a.pendingFileMu.Lock()
-		filePath := a.pendingFilePath
-		a.pendingFilePath = ""
-		a.pendingFileMu.Unlock()
-
-		if filePath == "" {
-			runtime.EventsEmit(a.ctx, "error", map[string]string{
-				"message": "Received BEGIN_SEND with no pending file",
+	case client.EvFileComplete:
+		t := e.Transfer
+		if t.Outgoing {
+			a.emit(a.ctx, "file_progress", map[string]interface{}{
+				"filename":   t.Name,
+				"bytesSent":  t.Size,
+				"totalBytes": t.Size,
+				"percent":    100,
+				"done":       true,
+				"hash":       t.SHA256,
 			})
 			return
 		}
-
-		go func() {
-			a.clientMu.RLock()
-			client := a.client
-			a.clientMu.RUnlock()
-			if client == nil {
-				return
-			}
-
-			err := client.SendFile(filePath, func(p protocol.FileTransferProgress) {
-				runtime.EventsEmit(a.ctx, "file_progress", map[string]interface{}{
-					"filename":   p.Filename,
-					"bytesSent":  p.BytesSent,
-					"totalBytes": p.TotalBytes,
-					"percent":    p.Percent,
-					"done":       p.Done,
-					"hash":       p.Hash,
-				})
-			})
-			if err != nil {
-				runtime.EventsEmit(a.ctx, "error", map[string]string{
-					"message": "File transfer failed: " + err.Error(),
-				})
-			}
-		}()
-
-	case protocol.EvtFileStart:
-		if payload, ok := evt.Payload.(protocol.FileStartPayload); ok {
-			state, err := protocol.NewFileReceiveState(payload, a.config.DownloadDir)
-			if err != nil {
-				runtime.EventsEmit(a.ctx, "error", map[string]string{
-					"message": "Cannot prepare file receive: " + err.Error(),
-				})
-				return
-			}
-			a.fileReceiveMu.Lock()
-			a.fileReceive = state
-			a.fileReceiveMu.Unlock()
-			runtime.EventsEmit(a.ctx, "file_start", map[string]interface{}{
-				"filename":     payload.Filename,
-				"filesize":     payload.Filesize,
-				"expectedHash": payload.ExpectedHash,
-			})
+		a.emit(a.ctx, "file_complete", map[string]interface{}{
+			"filename":     t.Name,
+			"downloadPath": t.Path,
+			"actualHash":   t.ActualSHA256,
+			"expectedHash": t.SHA256,
+			"hashMatch":    t.OK,
+		})
+		if t.OK {
+			a.notify("File received: " + t.Name)
+		} else {
+			a.notify("File received but hash FAILED: " + t.Name)
 		}
 
-	case protocol.EvtFileChunk:
-		if data, ok := evt.Payload.([]byte); ok {
-			a.fileReceiveMu.Lock()
-			state := a.fileReceive
-			a.fileReceiveMu.Unlock()
-			if state != nil {
-				if err := state.Write(data); err != nil {
-					runtime.EventsEmit(a.ctx, "error", map[string]string{
-						"message": "Error writing received file: " + err.Error(),
-					})
-				} else {
-					pct := 0.0
-					if state.Filesize > 0 {
-						pct = float64(state.ReceivedSize) / float64(state.Filesize) * 100
-					}
-					runtime.EventsEmit(a.ctx, "file_receive_progress", map[string]interface{}{
-						"filename": state.Filename,
-						"received": state.ReceivedSize,
-						"total":    state.Filesize,
-						"percent":  pct,
-					})
-				}
-			}
+	case client.EvFileFailed:
+		name := ""
+		if e.Transfer != nil {
+			name = e.Transfer.Name
 		}
-
-	case protocol.EvtFileEnd:
-		a.fileReceiveMu.Lock()
-		state := a.fileReceive
-		a.fileReceive = nil
-		a.fileReceiveMu.Unlock()
-		if state != nil {
-			actualHash, hashMatch, _ := state.Finish()
-			runtime.EventsEmit(a.ctx, "file_complete", map[string]interface{}{
-				"filename":     state.Filename,
-				"downloadPath": state.DownloadPath,
-				"actualHash":   actualHash,
-				"expectedHash": state.ExpectedHash,
-				"hashMatch":    hashMatch,
-			})
-			if hashMatch {
-				a.notify("File received: " + state.Filename)
-			} else {
-				a.notify("File received but hash FAILED: " + state.Filename)
-			}
-		}
-	}
-}
-
-// ─────────────────────────────────────────────
-// Decoy traffic
-// ─────────────────────────────────────────────
-
-func (a *App) startDecoy() {
-	a.stopDecoy()
-	stop := make(chan struct{})
-	a.decoyStop = stop
-
-	go func() {
-		ticker := time.NewTicker(time.Duration(a.config.DecoyInterval) * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				a.clientMu.RLock()
-				client := a.client
-				a.clientMu.RUnlock()
-				if client == nil {
-					return
-				}
-				size := a.config.DecoyMinBytes + rand.Intn(
-					max(1, a.config.DecoyMaxBytes-a.config.DecoyMinBytes),
-				)
-				client.SendDecoy(size)
-			}
-		}
-	}()
-}
-
-func (a *App) stopDecoy() {
-	if a.decoyStop != nil {
-		close(a.decoyStop)
-		a.decoyStop = nil
+		a.emit(a.ctx, "file_failed", map[string]interface{}{
+			"filename": name,
+			"reason":   e.Text,
+		})
 	}
 }
 
@@ -662,30 +577,25 @@ func (a *App) stopDecoy() {
 // ─────────────────────────────────────────────
 
 func (a *App) notify(message string) {
-    if !a.config.SoundEnabled {
-        return
-    }
-    go func() {
-        beeep.Notify("QuietRoom", message, "")
-        if goruntime.GOOS == "darwin" {
-            exec.Command("afplay", "/System/Library/Sounds/Ping.aiff").Run()
-        }
-    }()
+	if !a.config.SoundEnabled {
+		return
+	}
+	go func() {
+		beeep.Notify("QuietRoom", message, "")
+		if goruntime.GOOS == "darwin" {
+			exec.Command("afplay", "/System/Library/Sounds/Ping.aiff").Run()
+		}
+	}()
 }
 
 // ─────────────────────────────────────────────
 // Utility
 // ─────────────────────────────────────────────
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 // GetUsername returns the currently connected username
 func (a *App) GetUsername() string {
+	a.clientMu.RLock()
+	defer a.clientMu.RUnlock()
 	return a.username
 }
 
@@ -698,33 +608,5 @@ func (a *App) GetCurrentRoom() string {
 
 // OpenDownloadDir opens the download directory in the OS file manager
 func (a *App) OpenDownloadDir() {
-    runtime.BrowserOpenURL(a.ctx, "file://"+a.config.DownloadDir)
-}
-
-// GetRooms sends /rooms and returns the result as a string for the frontend to parse
-func (a *App) RequestRoomList() error {
-    return a.sendText("/rooms")
-}
-
-// func (a *App) SwitchRoom(room string) {
-//     a.clientMu.Lock()
-//     a.currentRoom = room
-//     a.clientMu.Unlock()
-
-//     if room == "" {
-//         // Switching back to lobby — leave all rooms
-//         a.sendText("/leave")
-//     } else {
-//         // Re-join the room to make it active on the server side
-//         a.sendText(fmt.Sprintf("/join %s", room))
-//     }
-// }
-
-func (a *App) RequestUserList() error {
-    return a.sendText("/users")
-}
-
-func (a *App) RequestMemberList(target string) error {
-    cmd := fmt.Sprintf("/members %s", target)
-    return a.sendText(cmd)
+	runtime.BrowserOpenURL(a.ctx, "file://"+a.config.DownloadDir)
 }

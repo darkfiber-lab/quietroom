@@ -1,6 +1,6 @@
 # QuietRoom
 
-A privacy-focused encrypted chat system with end-to-end encryption, perfect forward secrecy, and traffic obfuscation features.
+A privacy-focused, self-hosted encrypted chat system: TLS 1.3 with forward secrecy, a shared access key that keeps outsiders out, padded traffic and decoys against traffic analysis.
 
 ## Rationale and Design Principles
 
@@ -26,15 +26,14 @@ This project does not seek to compete with large-scale platforms. It offers some
 
 ## Features
 
-- 🔐 **RSA-4096 Authentication** - Verify server identity and prevent impersonation
-- 🔑 **Diffie-Hellman Key Exchange** - Perfect forward secrecy with ephemeral session keys
-- 🛡️ **AES-256-GCM Encryption** - Strong encryption for all messages
-- 🕵️ **Traffic Obfuscation** - TLS-like packet structure to blend with normal HTTPS traffic
-- 🎭 **Decoy Traffic** - Optional feature to hide communication patterns
+- 🔐 **TLS 1.3 with forward secrecy** - All traffic encrypted; the server certificate is pinned by every client
+- 🔑 **Access key** - Only holders of the current `quietroom_access.pem` can connect; a server restart issues a new key
+- 🕵️ **Traffic padding** - Messages are padded to fixed size classes, so their length is hidden
+- 🎭 **Decoy Traffic** - Random cover messages at random intervals hide activity patterns
 - 💬 **Private Messaging** - Direct messages between users
 - 🚪 **Chat Rooms** - Create password-protected rooms for group conversations
-- 📁 **File Transfers** - Secure file sharing with integrity verification
-- 📝 **Security Logging** - Track authentication attempts and security events
+- 📁 **File Transfers** - Any size, with flow control, several at once, SHA-256 verification; chat stays responsive during transfers
+- 📝 **Security Logging** - Security events without participant metadata (unless explicitly enabled)
 
 ## Quick Start
 
@@ -54,8 +53,8 @@ This project does not seek to compete with large-scale platforms. It offers some
 
 2. Build and run the client:
    ```bash
-   go build -o  quietroom_client  quietroom_client.go
-   ./ quietroom_client
+   go build -o quietroom_client quietroom_client.go
+   ./quietroom_client
    ```
 
 3. Connect and start chatting!
@@ -71,21 +70,23 @@ For detailed setup instructions, configuration options, and troubleshooting:
 
 ### Encryption Layers
 
-1. **TLS 1.3 Transport Layer** - Encrypts all network traffic between client and server
-2. **RSA-4096 Authentication** - Server proves its identity to prevent man-in-the-middle attacks
-3. **Access Key (mutual TLS)** - Clients must present the master access key from `quietroom_access.pem`; connections without it are refused during the TLS handshake
-4. **Diffie-Hellman Key Exchange** - Generates unique session keys for perfect forward secrecy
-5. **AES-256-GCM Session Encryption** - Encrypts all messages with authenticated encryption
+1. **TLS 1.3** - Encrypts all traffic between client and server with ephemeral keys (forward secrecy)
+2. **Certificate Pinning** - Clients accept only the exact server certificate from `quietroom_access.pem`, which prevents man-in-the-middle attacks
+3. **Access Key (mutual TLS)** - Clients must present the master access key from `quietroom_access.pem`; connections without it are refused during the TLS handshake, before any QuietRoom code runs
+4. **Silent to strangers** - Without a valid gate token (derived from the access key) in the first TLS message, the server closes the connection without sending anything: scanners never see its certificate
+5. **Fresh keys per run** - The server generates new keys on every start and keeps its private key in memory only; a restart revokes every access file
+
+The server decrypts and relays messages: the operator's server is trusted by design. Messages are never stored.
 
 ### Traffic Protection
 
-- **Obfuscation**: Packets use TLS-like structure with random padding
-- **Decoy Traffic**: Optional random data transmission to mask activity patterns
-- **Certificate Pinning**: Clients verify exact server certificate to prevent substitution attacks
+- **Padding**: Every frame is padded to a size class (256 B, 512 B, 1 KB, ...), hiding message lengths
+- **Decoy Traffic**: Random cover frames at random intervals (both directions) mask activity patterns
+- **Limits**: Connection limits before TLS, message rate limits, room limits and flow-controlled file transfers keep one member from overwhelming the server
 
 ### Privacy Features
 
-- **Perfect Forward Secrecy**: Past sessions remain secure even if long-term keys are compromised
+- **Forward Secrecy**: TLS 1.3 session keys are ephemeral; recorded traffic stays secure even if a key file is later compromised
 - **No Message Persistence**: Messages are not stored on the server
 - **No User Tracking**: No logs of message content; participant metadata (who connected, DMs, file transfers, member IPs) is not logged unless the operator explicitly enables `log_metadata`
 - **Self-Hosted**: Complete control over your infrastructure
@@ -101,21 +102,19 @@ For detailed setup instructions, configuration options, and troubleshooting:
 ## Architecture
 
 ```
-┌──────────┐                           ┌──────────┐
-│  Client  │◄────── TLS 1.3 ──────────►│  Server  │
-│          │                           │          │
-│ • RSA    │   1. TLS Handshake        │ • RSA    │
-│ • DH     │   2. Certificate Pin      │ • DH     │
-│ • AES    │   3. DH Key Exchange      │ • AES    │
-│          │   4. Encrypted Session    │          │
-└──────────┘                           └──────────┘
-     │                                      │
-     │         ┌────────────────┐           │
-     └────────►│  AES-256-GCM   │◄──────────┘
-               │  Encrypted     │
-               │  Messages      │
-               └────────────────┘
+┌──────────────┐                                  ┌──────────────┐
+│    Client    │◄──────────── TLS 1.3 ───────────►│    Server    │
+│              │  1. Handshake: server cert       │              │
+│ access file: │     pinned, client presents      │ keys made at │
+│ • server cert│     the access key               │ every start  │
+│ • access key │  2. hello / welcome              │              │
+│              │  3. Framed messages (JSON) and   │ relays chat, │
+│              │     file data, padded; decoys    │ DMs, files   │
+└──────────────┘                                  └──────────────┘
 ```
+
+The protocol (version 3) is specified in the [`wire`](wire/) package. CLI and
+GUI share one client implementation in [`client`](client/).
 
 ## Verifying Downloads
 
@@ -151,18 +150,26 @@ cd quietroom
 go build -o quietroom_server quietroom_server.go
 
 # Build client
-go build -o  quietroom_client quietroom_client.go
+go build -o quietroom_client quietroom_client.go
 
-# Attack tests: hostile clients against a real server process
-# (QUIETROOM_RACE=1 builds the server with the race detector)
-QUIETROOM_RACE=1 go test -count=1 ./tests/attack/
+# Tests (QUIETROOM_RACE=1 builds the server with the race detector)
+go test ./wire/                                     # protocol unit tests
+QUIETROOM_RACE=1 go test -race ./tests/integration/ # real server + clients
+QUIETROOM_RACE=1 go test -race ./tests/attack/      # hostile clients
+(cd quietroom-gui && go test -race ./...)           # GUI backend
 ```
 
-The attack tests start real server instances on local ports and try to get
-in or break them: missing and forged access keys, access files from another
-run, invalid DH keys, hostile usernames and room names, malformed packets,
-file-transfer hijacking, reconnect races, slow readers, connection floods,
-and metadata in logs. They run in CI on every change.
+- **Integration tests** run real servers with the client library, the CLI
+  (in a pseudo-terminal) and the Python connector: chat, rooms, DMs, and
+  large, concurrent and interrupted file transfers.
+- **Attack tests** try to get in or break the server: missing, forged and
+  stale access keys, malformed frames, spoofed fields, hostile names,
+  flow-control abuse, floods, reconnect races, slow readers, and metadata
+  in logs.
+- The frame reader and message decoder are **fuzzed**
+  (`go test ./wire/ -fuzz=FuzzRead`).
+
+All of these run in CI on every change.
 
 ## Contributing
 
@@ -170,7 +177,7 @@ Contributions are welcome! Please ensure:
 - Code follows Go best practices
 - Security features are not weakened
 - Changes are well-documented
-- Tests pass (when available)
+- Tests pass (see Building from Source)
 
 ## Security Disclosure
 
@@ -189,6 +196,6 @@ commercial license. Contact the author for details.
 ## Acknowledgments
 
 Built with:
-- Go standard library crypto packages
-- RFC 3526 (DH parameters)
-- NIST recommendations for key sizes
+- Go standard library (crypto/tls, TLS 1.3)
+- Go standard library (crypto/pbkdf2 for room passwords)
+- golang.org/x/term (CLI terminal input)

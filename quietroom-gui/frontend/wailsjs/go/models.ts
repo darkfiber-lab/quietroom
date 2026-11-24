@@ -1,18 +1,3 @@
-// Copyright (C) 2026 darkfiber-lab
-
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published
-// by the Free Software Foundation, version 3.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-// See the GNU Affero General Public License for more details.
-
-// You should have received a copy of the GNU Affero General Public License
-// along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-
 export namespace main {
 	
 	export class ServerProfile {
@@ -44,6 +29,7 @@ export namespace main {
 	    decoy_min_bytes: number;
 	    decoy_max_bytes: number;
 	    download_dir: string;
+	    max_receive_mb: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new AppConfig(source);
@@ -59,6 +45,7 @@ export namespace main {
 	        this.decoy_min_bytes = source["decoy_min_bytes"];
 	        this.decoy_max_bytes = source["decoy_max_bytes"];
 	        this.download_dir = source["download_dir"];
+	        this.max_receive_mb = source["max_receive_mb"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

@@ -19,34 +19,20 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"crypto"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
+	"errors"
 	"fmt"
-	"io"
-	"math/big"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"strconv"
 
+	"github.com/darkfiber-lab/quietroom/client"
+	"github.com/darkfiber-lab/quietroom/wire"
 	"golang.org/x/term"
 )
 
@@ -58,6 +44,8 @@ type ClientConfig struct {
 	DecoyMinBytes     int          `json:"decoy_min_bytes"`
 	DecoyMaxBytes     int          `json:"decoy_max_bytes"`
 	SoundNotification bool         `json:"sound_notification"`
+	DownloadDir       string       `json:"download_dir"`
+	MaxReceiveMB      int64        `json:"max_receive_mb"`
 }
 
 type ServerInfo struct {
@@ -72,48 +60,6 @@ type Theme struct {
 	MessageColor   string `json:"message_color"`
 	TimestampColor string `json:"timestamp_color"`
 	ErrorColor     string `json:"error_color"`
-}
-
-type Client struct {
-	conn       net.Conn
-	sessionKey []byte
-	gcm        cipher.AEAD
-	config     ClientConfig
-	mu         sync.Mutex
-	stopDecoy  chan bool
-	username   string
-	currentRoom string
-	shutdown   chan bool
-	shutdownOnce sync.Once
-
-	pendingTransfer *FileTransferState
-	transferMu      sync.Mutex
-
-	lastSentMsg string
-	lastSentMu  sync.Mutex
-
-	// Input handling
-	inputBuffer string
-	inputMu     sync.Mutex
-	promptText  string
-}
-
-type FileTransferState struct {
-	transferID  string
-	filename    string
-	filesize    int64
-	isReceiving bool
-	progress    int64
-}
-
-type DHParams struct {
-	P *big.Int
-	G *big.Int
-}
-
-type ObfuscatedPacket struct {
-	Type byte
-	Data []byte
 }
 
 var colors = map[string]string{
@@ -134,387 +80,241 @@ var colors = map[string]string{
 	"bright_cyan":    "\033[96m",
 }
 
-func initDHParams() *DHParams {
-	pHex := "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF"
-	p := new(big.Int)
-	p.SetString(pHex, 16)
-	g := big.NewInt(2)
-	return &DHParams{P: p, G: g}
+const legacyAccessFile = "chat_public.pem"
+
+// UI is the terminal front end. All output goes through print, which keeps
+// the input line intact.
+type UI struct {
+	config ClientConfig
+	c      *client.Client
+
+	outMu       sync.Mutex
+	input       string
+	prompt      string
+	rawMode     bool
+	progressing bool // a progress line is on screen
+
+	roomMu      sync.Mutex
+	currentRoom string
 }
 
-func generateDHKeyPair(params *DHParams) (*big.Int, *big.Int, error) {
-	privateKey, err := rand.Int(rand.Reader, new(big.Int).Sub(params.P, big.NewInt(1)))
-	if err != nil {
-		return nil, nil, err
-	}
-	publicKey := new(big.Int).Exp(params.G, privateKey, params.P)
-	return privateKey, publicKey, nil
-}
-
-func computeDHSharedSecret(privateKey, otherPublicKey, p *big.Int) []byte {
-	sharedSecret := new(big.Int).Exp(otherPublicKey, privateKey, p)
-	secretBytes := sharedSecret.Bytes()
-	hash := sha256.Sum256(secretBytes)
-	return hash[:]
-}
-
-func (c *Client) colorize(color, text string) string {
+func (u *UI) colorize(color, text string) string {
 	if code, ok := colors[color]; ok {
 		return code + text + colors["reset"]
 	}
 	return text
 }
 
-func (c *Client) clearScreen() {
-	if runtime.GOOS == "windows" {
-		cmd := exec.Command("cmd", "/c", "cls")
-		cmd.Stdout = os.Stdout
-		cmd.Run()
-	} else {
-		cmd := exec.Command("clear")
-		cmd.Stdout = os.Stdout
-		cmd.Run()
-	}
-}
-
-func (c *Client) printSeparator() {
-	fmt.Println(c.colorize("gray", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
-}
-
-func (c *Client) playNotificationSound() {
-	if !c.config.SoundNotification {
-		return
-	}
-
-	go func() {
-		if runtime.GOOS == "windows" {
-			fmt.Print("\a")
-		} else if runtime.GOOS == "darwin" {
-			exec.Command("afplay", "/System/Library/Sounds/Ping.aiff").Run()
-		} else {
-			if err := exec.Command("paplay", "/usr/share/sounds/freedesktop/stereo/message.oga").Run(); err == nil {
-				return
-			}
-			if err := exec.Command("aplay", "/usr/share/sounds/alsa/Front_Center.wav").Run(); err == nil {
-				return
-			}
-			cmd := exec.Command("speaker-test", "-t", "sine", "-f", "1000", "-l", "1")
-			cmd.Start()
-			time.Sleep(100 * time.Millisecond)
-			cmd.Process.Kill()
-			if err := exec.Command("beep", "-f", "800", "-l", "100").Run(); err == nil {
-				return
-			}
-			fmt.Print("\a")
-		}
-	}()
-}
-
-// Redraw the current prompt and input buffer
-func (c *Client) redrawInputLine() {
-	c.inputMu.Lock()
-	currentInput := c.inputBuffer
-	c.inputMu.Unlock()
-
-	fmt.Print("\r\033[K") // Clear line
-	fmt.Print(c.colorize(c.config.Theme.SystemColor, c.promptText))
-	fmt.Print(currentInput)
-}
-
-// Print message and restore input line
-func (c *Client) printMessageSafe(msg string) {
-	c.playNotificationSound()
-
-	// Clear current line first
-	fmt.Print("\r\033[K")
-
-	// Print the message(s) - handle multi-line properly
-	lines := strings.Split(msg, "\n")
-	for i, line := range lines {
-		sanitized := sanitizeText(line)
-
-		// Don't print empty lines at the end
-		if sanitized == "" && i == len(lines)-1 {
-			continue
-		}
-
-		if sanitized == "" {
-			fmt.Println()
-			continue
-		}
-
-		// Ensure we're at the start of the line before printing
-		fmt.Print("\r")
-
-		// Check for different message formats
-		if strings.HasPrefix(sanitized, "***") {
-			fmt.Println(c.colorize(c.config.Theme.SystemColor, sanitized))
-		} else if strings.Contains(sanitized, "]") && strings.Contains(sanitized, ":") {
-			// This looks like a timestamped message
-			parts := strings.SplitN(sanitized, "]", 2)
-			if len(parts) == 2 {
-				timestamp := parts[0] + "]"
-				rest := parts[1]
-				userMsg := strings.SplitN(strings.TrimSpace(rest), ":", 2)
-				if len(userMsg) == 2 {
-					username := userMsg[0]
-					message := userMsg[1]
-					fmt.Print(c.colorize(c.config.Theme.TimestampColor, timestamp) + " ")
-					fmt.Print(c.colorize(c.config.Theme.UsernameColor, username) + ":")
-					fmt.Println(c.colorize(c.config.Theme.MessageColor, message))
-					continue
-				}
-			}
-			// If it didn't parse as a message, just print it
-			fmt.Println(c.colorize(c.config.Theme.SystemColor, sanitized))
-		} else {
-			// Regular system message
-			fmt.Println(c.colorize(c.config.Theme.SystemColor, sanitized))
-		}
-	}
-
-	// Restore the input line
-	c.redrawInputLine()
-}
-
-func (c *Client) printMessage(msg string) {
-	c.playNotificationSound()
-
-	if strings.Contains(msg, "\n") {
-		lines := strings.Split(msg, "\n")
-		for _, line := range lines {
-			sanitized := sanitizeText(line)
-			if sanitized != "" {
-				if strings.HasPrefix(sanitized, "***") {
-					fmt.Println(c.colorize(c.config.Theme.SystemColor, sanitized))
-				} else if strings.Contains(sanitized, "]") && strings.Contains(sanitized, ":") {
-					parts := strings.SplitN(sanitized, "]", 2)
-					if len(parts) == 2 {
-						timestamp := parts[0] + "]"
-						rest := parts[1]
-						userMsg := strings.SplitN(strings.TrimSpace(rest), ":", 2)
-						if len(userMsg) == 2 {
-							username := userMsg[0]
-							message := userMsg[1]
-							fmt.Print(c.colorize(c.config.Theme.TimestampColor, timestamp) + " ")
-							fmt.Print(c.colorize(c.config.Theme.UsernameColor, username) + ":")
-							fmt.Println(c.colorize(c.config.Theme.MessageColor, message))
-							continue
-						}
-					}
-					fmt.Println(c.colorize(c.config.Theme.SystemColor, sanitized))
-				} else {
-					fmt.Println(c.colorize(c.config.Theme.SystemColor, sanitized))
-				}
-			} else {
-				fmt.Println()
-			}
-		}
-		return
-	}
-
-	msg = sanitizeText(msg)
-
-	if strings.HasPrefix(msg, "***") {
-		fmt.Println(c.colorize(c.config.Theme.SystemColor, msg))
-	} else if strings.Contains(msg, "]") && strings.Contains(msg, ":") {
-		parts := strings.SplitN(msg, "]", 2)
-		if len(parts) == 2 {
-			timestamp := parts[0] + "]"
-			rest := parts[1]
-
-			userMsg := strings.SplitN(strings.TrimSpace(rest), ":", 2)
-			if len(userMsg) == 2 {
-				username := userMsg[0]
-				message := userMsg[1]
-
-				fmt.Print(c.colorize(c.config.Theme.TimestampColor, timestamp) + " ")
-				fmt.Print(c.colorize(c.config.Theme.UsernameColor, username) + ":")
-				fmt.Println(c.colorize(c.config.Theme.MessageColor, message))
-			} else {
-				fmt.Println(c.colorize(c.config.Theme.SystemColor, msg))
-			}
-		} else {
-			fmt.Println(c.colorize(c.config.Theme.SystemColor, msg))
-		}
-	} else {
-		fmt.Println(c.colorize(c.config.Theme.SystemColor, msg))
-	}
-}
-
-func (c *Client) encrypt(plaintext []byte) ([]byte, error) {
-	nonce := make([]byte, c.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, err
-	}
-	ciphertext := c.gcm.Seal(nonce, nonce, plaintext, nil)
-	return ciphertext, nil
-}
-
-func (c *Client) decrypt(ciphertext []byte) ([]byte, error) {
-	nonceSize := c.gcm.NonceSize()
-	if len(ciphertext) < nonceSize {
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-	nonce, ciphertextBytes := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	plaintext, err := c.gcm.Open(nil, nonce, ciphertextBytes, nil)
-	if err != nil {
-		return nil, err
-	}
-	return plaintext, nil
-}
-
-func (c *Client) createObfuscatedPacket(msgType byte, data []byte) []byte {
-	paddingSize := int(randomInt(256))
-	padding := make([]byte, paddingSize)
-	rand.Read(padding)
-
-	packet := make([]byte, 3+len(data)+paddingSize)
-	packet[0] = msgType
-	binary.BigEndian.PutUint16(packet[1:3], uint16(len(data)))
-	copy(packet[3:], data)
-	copy(packet[3+len(data):], padding)
-
-	return packet
-}
-
-func readObfuscatedPacket(conn net.Conn) (*ObfuscatedPacket, error) {
-	header := make([]byte, 3)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return nil, err
-	}
-
-	msgType := header[0]
-	dataLen := binary.BigEndian.Uint16(header[1:3])
-
-	const maxPacketDataSize = 4096
-	if dataLen > maxPacketDataSize {
-		return nil, fmt.Errorf("packet data too large: %d bytes (max %d)", dataLen, maxPacketDataSize)
-	}
-
-	data := make([]byte, dataLen)
-	if _, err := io.ReadFull(conn, data); err != nil {
-		return nil, err
-	}
-
-	conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-	padding := make([]byte, 1024)
-	conn.Read(padding)
-	conn.SetReadDeadline(time.Time{})
-
-	return &ObfuscatedPacket{Type: msgType, Data: data}, nil
-}
-
-func randomInt(max int64) int64 {
-	n, _ := rand.Int(rand.Reader, big.NewInt(max))
-	return n.Int64()
-}
-
+// sanitizeText removes control characters (including terminal escape
+// sequences) from text received from the server.
 func sanitizeText(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r < 32 || r == 127 {
+		if r < 32 || r == 127 || (r >= 0x80 && r < 0xa0) {
 			return -1
 		}
 		return r
 	}, s)
 }
 
-func (c *Client) sendDecoyTraffic() {
-	ticker := time.NewTicker(time.Duration(c.config.DecoyInterval) * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.stopDecoy:
-			return
-		case <-c.shutdown:
-			return
-		case <-ticker.C:
-			size := c.config.DecoyMinBytes + int(randomInt(int64(c.config.DecoyMaxBytes-c.config.DecoyMinBytes)))
-			decoyData := make([]byte, size)
-			rand.Read(decoyData)
-
-			packet := c.createObfuscatedPacket(0x02, decoyData)
-			c.conn.Write(packet)
-		}
+func (u *UI) eol() string {
+	if u.rawMode {
+		return "\r\n"
 	}
+	return "\n"
 }
 
-const (
-	accessFile       = "quietroom_access.pem"
-	legacyAccessFile = "chat_public.pem"
-)
-
-// loadAccessBundle parses quietroom_access.pem: the pinned server certificate
-// followed by the master access certificate and its private key.
-func loadAccessBundle(filename string) (*x509.Certificate, tls.Certificate, error) {
-	var none tls.Certificate
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, none, fmt.Errorf("failed to read %s: %v", filename, err)
+// print writes lines above the input line and redraws it.
+func (u *UI) print(color string, text string) {
+	u.outMu.Lock()
+	defer u.outMu.Unlock()
+	fmt.Print("\r\033[K")
+	u.progressing = false
+	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		fmt.Print(u.colorize(color, sanitizeText(line)) + u.eol())
 	}
+	u.redraw()
+}
 
-	var certs []*pem.Block
-	var key *pem.Block
-	for rest := data; ; {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		switch block.Type {
-		case "CERTIFICATE":
-			certs = append(certs, block)
-		case "PRIVATE KEY", "EC PRIVATE KEY":
-			if key == nil {
-				key = block
+// printChat renders one chat line with timestamp and name colors.
+func (u *UI) printChat(ts, prefix, name, text string) {
+	u.outMu.Lock()
+	defer u.outMu.Unlock()
+	fmt.Print("\r\033[K")
+	u.progressing = false
+	t := u.config.Theme
+	line := u.colorize(t.TimestampColor, "["+sanitizeText(ts)+"]") + " "
+	if prefix != "" {
+		line += u.colorize(t.SystemColor, sanitizeText(prefix)) + " "
+	}
+	line += u.colorize(t.UsernameColor, sanitizeText(name)) + ": " + u.colorize(t.MessageColor, sanitizeText(text))
+	fmt.Print(line + u.eol())
+	u.redraw()
+}
+
+// progress shows a single updating progress line.
+func (u *UI) progress(text string) {
+	u.outMu.Lock()
+	defer u.outMu.Unlock()
+	fmt.Print("\r\033[K" + u.colorize(u.config.Theme.SystemColor, sanitizeText(text)))
+	u.progressing = true
+}
+
+func (u *UI) redraw() {
+	fmt.Print("\r\033[K" + u.colorize(u.config.Theme.SystemColor, u.prompt) + u.input)
+}
+
+func (u *UI) notify() {
+	if !u.config.SoundNotification {
+		return
+	}
+	go func() {
+		switch runtime.GOOS {
+		case "darwin":
+			exec.Command("afplay", "/System/Library/Sounds/Ping.aiff").Run()
+		case "linux":
+			if exec.Command("paplay", "/usr/share/sounds/freedesktop/stereo/message.oga").Run() == nil {
+				return
 			}
-		}
-	}
-	if len(certs) != 2 || key == nil {
-		return nil, none, fmt.Errorf("%s is not a valid access file (it must contain the server certificate and the access key) — get the current %s from your server administrator", filename, accessFile)
-	}
-
-	serverCert, err := x509.ParseCertificate(certs[0].Bytes)
-	if err != nil {
-		return nil, none, fmt.Errorf("failed to parse server certificate: %v", err)
-	}
-	if _, ok := serverCert.PublicKey.(*rsa.PublicKey); !ok {
-		return nil, none, fmt.Errorf("server certificate does not contain an RSA public key")
-	}
-
-	accessPair, err := tls.X509KeyPair(pem.EncodeToMemory(certs[1]), pem.EncodeToMemory(key))
-	if err != nil {
-		return nil, none, fmt.Errorf("invalid access key: %v", err)
-	}
-	return serverCert, accessPair, nil
-}
-
-// joinedRoomFromServer recognises the server's own join confirmation
-// ("Joined room #x" / "Created and joined room #x"). The whole message must
-// match, so text relayed from other users can never trigger it.
-func joinedRoomFromServer(msg string) (string, bool) {
-	for _, prefix := range []string{"Created and joined room ", "Joined room "} {
-		if strings.HasPrefix(msg, prefix) {
-			room := strings.TrimPrefix(msg, prefix)
-			if strings.HasPrefix(room, "#") && len(room) > 1 && !strings.ContainsAny(room, " \t\r\n") {
-				return room, true
+			if exec.Command("aplay", "/usr/share/sounds/alsa/Front_Center.wav").Run() == nil {
+				return
 			}
+			fmt.Print("\a")
+		default:
+			fmt.Print("\a")
 		}
-	}
-	return "", false
+	}()
 }
 
-// describeConnError turns a server-side access rejection into a clear message.
-func describeConnError(err error) string {
-	msg := err.Error()
+func (u *UI) room() string {
+	u.roomMu.Lock()
+	defer u.roomMu.Unlock()
+	return u.currentRoom
+}
+
+func (u *UI) setRoom(r string) {
+	u.roomMu.Lock()
+	u.currentRoom = r
+	u.roomMu.Unlock()
+	u.outMu.Lock()
+	if r == "" {
+		u.prompt = "> "
+	} else {
+		u.prompt = r + " > "
+	}
+	u.outMu.Unlock()
+}
+
+func formatBytes(n int64) string {
 	switch {
-	case strings.Contains(msg, "pinned certificate"):
-		return "Server certificate does not match your " + accessFile + " — either the server was restarted (get the new file) or someone is intercepting the connection (possible MITM)."
-	case strings.Contains(msg, "remote error: tls") && strings.Contains(msg, "certificate"):
-		return "Access denied — the server rejected your access key. Your " + accessFile + " is wrong or outdated (the server may have been restarted)."
+	case n < 1024:
+		return fmt.Sprintf("%d B", n)
+	case n < 1<<20:
+		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	case n < 1<<30:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
 	}
-	return msg
+	return fmt.Sprintf("%.2f GB", float64(n)/(1<<30))
+}
+
+// onEvent renders protocol events. Calls never overlap.
+func (u *UI) onEvent(e client.Event) {
+	th := u.config.Theme
+	switch e.Kind {
+	case client.EvChat:
+		name := e.From
+		if e.Self {
+			name = "You"
+		} else {
+			u.notify()
+		}
+		prefix := ""
+		if e.Room != "" {
+			prefix = "[" + e.Room + "]"
+		}
+		u.printChat(e.Time, prefix, name, e.Text)
+	case client.EvDM:
+		if e.Self {
+			u.printChat(e.Time, "[DM to "+e.To+"]", "You", e.Text)
+		} else {
+			u.notify()
+			u.printChat(e.Time, "[DM]", e.From, e.Text)
+		}
+	case client.EvJoined:
+		switch {
+		case e.Room == "" && e.Self:
+		case e.Room == "":
+			u.print(th.SystemColor, fmt.Sprintf("*** %s joined the chat ***", e.User))
+		case e.Self:
+			u.setRoom(e.Room)
+			verb := "Joined"
+			if e.Created {
+				verb = "Created and joined"
+			}
+			u.print(th.SystemColor, fmt.Sprintf("%s room %s — messages now go to %s (/leave %s to return to the lobby)", verb, e.Room, e.Room, e.Room))
+		default:
+			u.print(th.SystemColor, fmt.Sprintf("*** %s joined %s ***", e.User, e.Room))
+		}
+	case client.EvLeft:
+		switch {
+		case e.Room == "":
+			u.print(th.SystemColor, fmt.Sprintf("*** %s left the chat ***", e.User))
+		case e.Self:
+			if u.room() == e.Room {
+				u.setRoom("")
+			}
+			u.print(th.SystemColor, fmt.Sprintf("Left room %s - returned to lobby", e.Room))
+		default:
+			u.print(th.SystemColor, fmt.Sprintf("*** %s left %s ***", e.User, e.Room))
+		}
+	case client.EvInfo:
+		u.print(th.SystemColor, e.Text)
+	case client.EvError:
+		u.print(th.ErrorColor, "✗ "+e.Text)
+	case client.EvFileOffer:
+		t := e.Transfer
+		u.notify()
+		u.print(th.SystemColor, fmt.Sprintf("*** FILE TRANSFER REQUEST ***\nSender: %s\nFile: %s (%s)\nSHA-256: %s\nTransfer ID: %s\n\nTo accept, type: /accept %s\nTo decline, type: /decline %s",
+			t.Peer, t.Name, formatBytes(t.Size), t.SHA256, t.ID, t.ID, t.ID))
+	case client.EvFileOffered:
+		t := e.Transfer
+		u.print(th.SystemColor, fmt.Sprintf("*** File offer sent to %s: %s (%s) ***\nTransfer ID: %s\nSHA-256: %s\nWaiting for the recipient to accept... (/cancel %s to withdraw)",
+			t.Peer, t.Name, formatBytes(t.Size), t.ID, t.SHA256, t.ID))
+	case client.EvFileStarted:
+		t := e.Transfer
+		if t.Outgoing {
+			u.print(th.SystemColor, fmt.Sprintf("%s accepted — sending %s (%s)", t.Peer, t.Name, formatBytes(t.Size)))
+		} else {
+			u.print(th.SystemColor, fmt.Sprintf("Receiving %s (%s) from %s\nExpected SHA-256: %s", t.Name, formatBytes(t.Size), t.Peer, t.SHA256))
+		}
+	case client.EvFileProgress:
+		t := e.Transfer
+		verb := "Receiving"
+		if t.Outgoing {
+			verb = "Sending"
+		}
+		pct := float64(t.Done) / float64(t.Size) * 100
+		u.progress(fmt.Sprintf("%s %s: %.1f%% (%s of %s)", verb, t.Name, pct, formatBytes(t.Done), formatBytes(t.Size)))
+	case client.EvFileComplete:
+		t := e.Transfer
+		if t.Outgoing {
+			u.print(th.SystemColor, fmt.Sprintf("✓ File sent: %s (%s)\n✓ Recipient should verify hash: %s", t.Name, formatBytes(t.Size), t.SHA256))
+			return
+		}
+		u.notify()
+		if t.OK {
+			u.print(th.SystemColor, fmt.Sprintf("✓ File received: %s (%s)\n  Saved to: %s\n  SHA-256: %s\n✓ Hash verification PASSED - file integrity verified!", t.Name, formatBytes(t.Size), t.Path, t.ActualSHA256))
+		} else {
+			u.print(th.ErrorColor, fmt.Sprintf("✗ Hash verification FAILED - file may be corrupted!\n  Saved to: %s\n  Expected: %s\n  Got:      %s", t.Path, t.SHA256, t.ActualSHA256))
+		}
+	case client.EvFileFailed:
+		name := "file"
+		if e.Transfer != nil {
+			name = e.Transfer.Name
+		}
+		u.print(th.ErrorColor, fmt.Sprintf("✗ File transfer of %s ended: %s", name, e.Text))
+	case client.EvDisconnected:
+		u.print(th.ErrorColor, "*** Disconnected: "+e.Text+" ***")
+	}
 }
 
 func loadConfig() ClientConfig {
@@ -534,776 +334,229 @@ func loadConfig() ClientConfig {
 		DecoyMinBytes:     100,
 		DecoyMaxBytes:     500,
 		SoundNotification: false,
+		DownloadDir:       "downloads",
+		MaxReceiveMB:      8192,
 	}
-
 	data, err := os.ReadFile("client_config.json")
 	if err != nil {
 		configData, _ := json.MarshalIndent(config, "", "  ")
 		os.WriteFile("client_config.json", configData, 0644)
 		return config
 	}
-
 	if err := json.Unmarshal(data, &config); err != nil {
 		fmt.Println("⚠ Error parsing config, using defaults")
-		return config
 	}
-
+	if config.DownloadDir == "" {
+		config.DownloadDir = "downloads"
+	}
 	return config
 }
 
-func computeFileHash(filepath string) (string, error) {
-	file, err := os.Open(filepath)
-	if err != nil {
-		return "", err
+func clearScreen() {
+	cmd := exec.Command("clear")
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/c", "cls")
 	}
-	defer file.Close()
-
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-
-	return hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-// Patched sendFile with better flow control and error handling
-func (c *Client) sendFile(filePath string) {
-	cleanPath := filePath
-
-	c.transferMu.Lock()
-	if c.pendingTransfer != nil && c.pendingTransfer.filename != "" {
-		cleanPath = c.pendingTransfer.filename
-		c.pendingTransfer.filename = ""
-	}
-	c.transferMu.Unlock()
-
-	cleanPath = filepath.Clean(cleanPath)
-
-	fileInfo, err := os.Stat(cleanPath)
-	if err != nil {
-		c.printMessageSafe("✗ Error: Cannot access file: " + err.Error())
-		return
-	}
-
-	if fileInfo.IsDir() {
-		c.printMessageSafe("✗ Error: Cannot send directories")
-		return
-	}
-
-	const maxFileSize = 100 * 1024 * 1024 // 100MB limit (adjust as needed)
-	if fileInfo.Size() > maxFileSize {
-		c.printMessageSafe(fmt.Sprintf("✗ Error: File too large (max 100MB, file is %.2fMB)", float64(fileInfo.Size())/1024/1024))
-		return
-	}
-
-	c.printMessageSafe("Computing file hash...")
-	fileHash, err := computeFileHash(cleanPath)
-	if err != nil {
-		c.printMessageSafe("✗ Error computing file hash: " + err.Error())
-		return
-	}
-
-	file, err := os.Open(cleanPath)
-	if err != nil {
-		c.printMessageSafe("✗ Error opening file: " + err.Error())
-		return
-	}
-	defer file.Close()
-
-	filename := fileInfo.Name()
-	filesize := fileInfo.Size()
-
-	metadata := fmt.Sprintf("FILE_START|%s|%d", filename, filesize)
-	encrypted, _ := c.encrypt([]byte(metadata))
-	packet := c.createObfuscatedPacket(0x03, encrypted)
-
-	c.mu.Lock()
-	_, writeErr := c.conn.Write(packet)
-	c.mu.Unlock()
-	if writeErr != nil {
-		c.printMessageSafe("✗ Network error: cannot start transfer")
-		return
-	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	c.printMessageSafe(fmt.Sprintf("Sending file: %s (%.2f KB)", filename, float64(filesize)/1024))
-	c.printMessageSafe(fmt.Sprintf("SHA-256: %s", fileHash))
-
-	const chunkSize = 3900
-	buffer := make([]byte, chunkSize)
-	var totalSent int64
-
-	for {
-		n, err := file.Read(buffer)
-		if n > 0 {
-			chunk := buffer[:n]
-			encrypted, err := c.encrypt(chunk)
-			if err != nil {
-				c.printMessageSafe("✗ Encryption error during transfer")
-				return
-			}
-
-			packet := c.createObfuscatedPacket(0x03, encrypted)
-
-			c.mu.Lock()
-			_, writeErr := c.conn.Write(packet)
-			c.mu.Unlock()
-
-			if writeErr != nil {
-				c.printMessageSafe("✗ Network error during transfer: " + writeErr.Error())
-				c.printMessageSafe("✗ File transfer aborted")
-				return
-			}
-
-			time.Sleep(30 * time.Millisecond) // Increased for better backpressure
-
-			totalSent += int64(n)
-			progress := float64(totalSent) / float64(filesize) * 100
-
-			fmt.Print("\r\033[K")
-			fmt.Printf("Progress: %.1f%% ", progress)
-			if progress >= 100.0 || n == 0 {
-				fmt.Println()
-				c.redrawInputLine()
-			}
-		}
-
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			c.printMessageSafe("\n✗ Error reading file: " + err.Error())
-			return
-		}
-	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	endMarker := "FILE_END"
-	encrypted, _ = c.encrypt([]byte(endMarker))
-	packet = c.createObfuscatedPacket(0x03, encrypted)
-
-	c.mu.Lock()
-	_, writeErr = c.conn.Write(packet)
-	c.mu.Unlock()
-	if writeErr != nil {
-		c.printMessageSafe("✗ Network error sending FILE_END")
-		return
-	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	c.printMessageSafe("✓ File sent successfully")
-	c.printMessageSafe("✓ Recipient should verify hash: " + fileHash)
+	cmd.Stdout = os.Stdout
+	cmd.Run()
 }
 
 func main() {
 	config := loadConfig()
-
-	client := &Client{
-		config:     config,
-		stopDecoy:  make(chan bool),
-		shutdown:   make(chan bool),
-		promptText: "> ",
+	u := &UI{config: config, prompt: "> "}
+	th := config.Theme
+	fail := func(msg string) {
+		fmt.Println(u.colorize(th.ErrorColor, "✗ "+msg))
+		os.Exit(1)
 	}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	clearScreen()
 
-	go func() {
-		<-sigChan
-		fmt.Println("\n✓ Shutting down client gracefully...")
-		client.shutdownOnce.Do(func() { close(client.shutdown) })
-		if client.conn != nil {
-			client.conn.Close()
-		}
-		os.Exit(0)
-	}()
-
-	client.clearScreen()
-
-	if _, err := os.Stat(accessFile); os.IsNotExist(err) {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Error: "+accessFile+" not found!"))
+	if _, err := os.Stat(client.AccessFileName); os.IsNotExist(err) {
 		if _, err := os.Stat(legacyAccessFile); err == nil {
-			fmt.Println(client.colorize(config.Theme.SystemColor, legacyAccessFile+" is from an older server version and no longer works."))
+			fmt.Println(u.colorize(th.SystemColor, legacyAccessFile+" is from an older server version and no longer works."))
 		}
-		fmt.Println(client.colorize(config.Theme.SystemColor, "Please copy "+accessFile+" from your server administrator to this directory."))
-		os.Exit(1)
+		fail(client.AccessFileName + " not found! Copy it from your server administrator to this directory.")
 	}
-
-	pinnedCert, accessPair, err := loadAccessBundle(accessFile)
-	if err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Error loading access file: "+err.Error()))
-		os.Exit(1)
+	if _, err := client.LoadAccess(client.AccessFileName); err != nil {
+		fail("Error loading access file: " + err.Error())
 	}
-	publicKey := pinnedCert.PublicKey.(*rsa.PublicKey)
-
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Loaded server certificate and access key"))
-
-	dhParams := initDHParams()
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Initialized Diffie-Hellman parameters"))
+	fmt.Println(u.colorize(th.SystemColor, "✓ Loaded server certificate and access key"))
 
 	fmt.Println()
-	fmt.Println(client.colorize(config.Theme.SystemColor, "Available servers:"))
-
-	if len(config.Servers) == 1 {
-		srv := config.Servers[0]
-		fmt.Printf("  1. %s (%s:%d)\n", srv.Name, srv.Address, srv.Port)
-	} else {
-		for i, srv := range config.Servers {
-			fmt.Printf("  %d. %s (%s:%d)\n", i+1, srv.Name, srv.Address, srv.Port)
-		}
+	fmt.Println(u.colorize(th.SystemColor, "Available servers:"))
+	for i, srv := range config.Servers {
+		fmt.Printf("  %d. %s (%s:%d)\n", i+1, srv.Name, srv.Address, srv.Port)
 	}
-
 	fmt.Println()
 	if len(config.Servers) == 1 {
-		fmt.Print(client.colorize(config.Theme.SystemColor, "Press Enter to connect, or enter custom address: "))
+		fmt.Print(u.colorize(th.SystemColor, "Press Enter to connect, or enter custom address: "))
 	} else {
-		fmt.Print(client.colorize(config.Theme.SystemColor, "Select server (1-"+fmt.Sprintf("%d", len(config.Servers))+") or enter custom address: "))
+		fmt.Print(u.colorize(th.SystemColor, fmt.Sprintf("Select server (1-%d) or enter custom address: ", len(config.Servers))))
 	}
-
 	scanner := bufio.NewScanner(os.Stdin)
 	if !scanner.Scan() {
 		os.Exit(1)
 	}
-
 	input := strings.TrimSpace(scanner.Text())
 	var serverAddr string
-
 	var selection int
 	if _, err := fmt.Sscanf(input, "%d", &selection); err == nil && selection > 0 && selection <= len(config.Servers) {
 		srv := config.Servers[selection-1]
 		serverAddr = fmt.Sprintf("%s:%d", srv.Address, srv.Port)
 	} else if input != "" {
 		serverAddr = input
-	} else {
+	} else if len(config.Servers) > 0 {
 		serverAddr = fmt.Sprintf("%s:%d", config.Servers[0].Address, config.Servers[0].Port)
+	} else {
+		fail("No server configured")
 	}
 
-	fmt.Println(client.colorize(config.Theme.SystemColor, "Connecting to "+serverAddr+"..."))
-
-	tlsConfig := &tls.Config{
-		// Chain verification is replaced by exact pinning of the server
-		// certificate from the access file (see VerifyPeerCertificate).
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS13,
-		Certificates:       []tls.Certificate{accessPair},
-
-		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return fmt.Errorf("no peer certificate presented")
-			}
-			if !bytes.Equal(rawCerts[0], pinnedCert.Raw) {
-				return fmt.Errorf("peer certificate does not match the expected pinned certificate")
-			}
-			return nil
-		},
-	}
-
-	conn, err := tls.Dial("tcp", serverAddr, tlsConfig)
-	if err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ TLS connection failed: "+describeConnError(err)))
-		os.Exit(1)
-	}
-	defer conn.Close()
-
-	client.conn = conn
-	if tcpConn, ok := conn.NetConn().(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Secure TLS connection established"))
-
-	var serverDHPubLen uint32
-	if err := binary.Read(conn, binary.BigEndian, &serverDHPubLen); err != nil {
-		// In TLS 1.3 a rejected access key surfaces on the first read.
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Connection failed: "+describeConnError(err)))
-		os.Exit(1)
-	}
-
-	const maxDHPubKeySize = 4096
-	if serverDHPubLen > maxDHPubKeySize {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ DH exchange failed: key size too large (possible DoS attack)"))
-		os.Exit(1)
-	}
-
-	serverDHPubBytes := make([]byte, serverDHPubLen)
-	if _, err := io.ReadFull(conn, serverDHPubBytes); err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ DH exchange failed"))
-		os.Exit(1)
-	}
-
-	var sigLen uint32
-	if err := binary.Read(conn, binary.BigEndian, &sigLen); err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Signature verification failed"))
-		os.Exit(1)
-	}
-
-	const maxRSASignatureSize = 4096
-	if sigLen > maxRSASignatureSize {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Signature verification failed: signature too large (possible DoS attack)"))
-		os.Exit(1)
-	}
-
-	signature := make([]byte, sigLen)
-	if _, err := io.ReadFull(conn, signature); err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Signature verification failed"))
-		os.Exit(1)
-	}
-
-	hash := sha256.Sum256(serverDHPubBytes)
-	if err := rsa.VerifyPSS(publicKey, crypto.SHA256, hash[:], signature, nil); err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Server authentication failed - possible MITM attack!"))
-		os.Exit(1)
-	}
-
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Server authenticated via RSA signature"))
-
-	serverDHPub := new(big.Int).SetBytes(serverDHPubBytes)
-
-	dhPrivate, dhPublic, err := generateDHKeyPair(dhParams)
-	if err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ DH key generation failed"))
-		os.Exit(1)
-	}
-
-	clientDHPubBytes := dhPublic.Bytes()
-	clientDHPubLen := make([]byte, 4)
-	binary.BigEndian.PutUint32(clientDHPubLen, uint32(len(clientDHPubBytes)))
-	conn.Write(clientDHPubLen)
-	conn.Write(clientDHPubBytes)
-
-	sharedSecret := computeDHSharedSecret(dhPrivate, serverDHPub, dhParams.P)
-
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Diffie-Hellman key exchange completed"))
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Perfect forward secrecy enabled"))
-
-	block, err := aes.NewCipher(sharedSecret)
-	if err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ Cipher setup failed"))
-		os.Exit(1)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		fmt.Println(client.colorize(config.Theme.ErrorColor, "✗ GCM setup failed"))
-		os.Exit(1)
-	}
-
-	client.sessionKey = sharedSecret
-	client.gcm = gcm
-
-	client.clearScreen()
-	client.printSeparator()
-	fmt.Println(client.colorize(config.Theme.SystemColor, "                         WELCOME TO QUIETROOM"))
-	fmt.Println(client.colorize(config.Theme.SystemColor, "    SECURE ENCRYPTED CHAT - "+serverAddr+" - E2E ENCRYPTED + PFS"))
-	client.printSeparator()
-	fmt.Println()
-
-	if client.config.DecoyTraffic {
-		go client.sendDecoyTraffic()
-		fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Decoy traffic active"))
-	}
-
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Traffic obfuscation active"))
-
-	if client.config.SoundNotification {
-		fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Sound notifications enabled"))
-	}
-
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Type /help for available commands"))
-	fmt.Println(client.colorize(config.Theme.SystemColor, "✓ Press Ctrl+C or type /quit to disconnect"))
-	fmt.Println()
-
-	done := make(chan bool)
-
-	// Reader goroutine - handles incoming messages
-	go func() {
-		var receivingFile bool
-		var outFile *os.File
-		var expectedSize int64
-		var receivedSize int64
-		var receivedHash = sha256.New()
-		var expectedHash string
-
-		for {
-			select {
-			case <-client.shutdown:
-				client.shutdownOnce.Do(func() { close(client.shutdown) })
-				done <- true
-				return
-			default:
-			}
-
-			packet, err := readObfuscatedPacket(conn)
-			if err != nil {
-				client.printMessageSafe("*** Connection to server lost ***")
-				client.shutdownOnce.Do(func() { close(client.shutdown) })
-				done <- true
-				return
-			}
-
-			if packet.Type == 0x02 {
-				continue
-			}
-
-			if packet.Type == 0x03 {
-				msg, err := client.decrypt(packet.Data)
-				if err != nil {
-					continue
-				}
-
-				msgStr := string(msg)
-
-				if strings.HasPrefix(msgStr, "FILE_START|") {
-					parts := strings.Split(msgStr, "|")
-					if len(parts) >= 3 {
-						filename := filepath.Base(parts[1])
-						expectedSize, err = strconv.ParseInt(parts[2], 10, 64)
-						if err != nil || expectedSize <= 0 {
-							client.mu.Lock()
-							client.printMessageSafe("*** File transfer cancelled: invalid file size received ***")
-							client.mu.Unlock()
-							continue
-						}
-
-						if len(parts) == 4 {
-							expectedHash = parts[3]
-						}
-
-						os.MkdirAll("downloads", 0755)
-
-						downloadPath := fmt.Sprintf("downloads/%s", filename)
-
-						if _, err := os.Stat(downloadPath); err == nil {
-							ext := ""
-							name := filename
-							if idx := strings.LastIndex(filename, "."); idx != -1 {
-								name = filename[:idx]
-								ext = filename[idx:]
-							}
-
-							counter := 1
-							for {
-								downloadPath = fmt.Sprintf("downloads/%s%d%s", name, counter, ext)
-								if _, err := os.Stat(downloadPath); os.IsNotExist(err) {
-									break
-								}
-								counter++
-							}
-
-							client.mu.Lock()
-							client.printMessageSafe(fmt.Sprintf("File already exists. Saving as: %s", downloadPath))
-							client.mu.Unlock()
-						}
-
-						outFile, err = os.Create(downloadPath)
-						if err != nil {
-							client.mu.Lock()
-							client.printMessageSafe(fmt.Sprintf("✗ Error creating file: %s", err.Error()))
-							client.mu.Unlock()
-							continue
-						}
-
-						receivingFile = true
-						receivedSize = 0
-						receivedHash.Reset()
-						client.mu.Lock()
-						client.printMessageSafe(fmt.Sprintf("Receiving file: %s (%.2f KB)", filename, float64(expectedSize)/1024))
-						if expectedHash != "" {
-							client.printMessageSafe(fmt.Sprintf("Expected SHA-256: %s", expectedHash))
-						}
-						client.mu.Unlock()
-					}
-					continue
-				}
-
-				if msgStr == "FILE_END" {
-					if outFile != nil {
-						outFile.Close()
-
-						actualHash := hex.EncodeToString(receivedHash.Sum(nil))
-						client.mu.Lock()
-						client.printMessageSafe(fmt.Sprintf("✓ File received successfully (%.2f KB)", float64(receivedSize)/1024))
-						client.printMessageSafe(fmt.Sprintf("SHA-256: %s", actualHash))
-
-						if expectedHash != "" {
-							if actualHash == expectedHash {
-								client.printMessageSafe("✓ Hash verification PASSED - file integrity verified!")
-							} else {
-								client.printMessageSafe("✗ Hash verification FAILED - file may be corrupted!")
-								client.printMessageSafe(fmt.Sprintf("Expected: %s", expectedHash))
-								client.printMessageSafe(fmt.Sprintf("Got:      %s", actualHash))
-							}
-						} else {
-							client.printMessageSafe("⚠ No expected hash provided - cannot verify integrity")
-						}
-						client.mu.Unlock()
-						outFile = nil
-					}
-					receivingFile = false
-					receivedSize = 0
-					expectedHash = ""
-					continue
-				}
-
-				if receivingFile && outFile != nil {
-					_, err := outFile.Write(msg)
-					if err == nil {
-						receivedHash.Write(msg)
-						receivedSize += int64(len(msg))
-						if expectedSize > 0 {
-							progress := float64(receivedSize) / float64(expectedSize) * 100
-							if int(progress*10)%10 == 0 || receivedSize == expectedSize {
-								fmt.Print("\r\033[K")
-								if receivedSize == expectedSize {
-									fmt.Printf("Progress: 100.0%% \n")
-									client.redrawInputLine()
-								} else {
-									fmt.Printf("Progress: %.1f%% ", progress)
-								}
-							}
-						}
-					}
-				}
-				continue
-			}
-
-			msg, err := client.decrypt(packet.Data)
-			if err != nil {
-				continue
-			}
-
-			msgStr := string(msg)
-
-			if strings.HasPrefix(msgStr, "BEGIN_SEND|") {
-				client.transferMu.Lock()
-				pending := client.pendingTransfer
-				client.transferMu.Unlock()
-
-				if pending == nil || pending.filename == "" {
-					// Server sent BEGIN_SEND with no transfer we initiated — ignore
-					continue
-				}
-
-				client.mu.Lock()
-				client.printMessageSafe("Starting file transfer...")
-				client.mu.Unlock()
-				go client.sendFile(pending.filename)
-				continue
-			}
-
-			// Switch the current room only once the server confirms the join
-			if room, ok := joinedRoomFromServer(msgStr); ok {
-				client.mu.Lock()
-				client.currentRoom = room
-				client.mu.Unlock()
-			}
-
-			client.mu.Lock()
-			client.lastSentMu.Lock()
-			isOwnMessage := false
-			if client.lastSentMsg != "" && strings.Contains(msgStr, client.lastSentMsg) {
-				isOwnMessage = true
-				client.lastSentMsg = ""
-			}
-			client.lastSentMu.Unlock()
-
-			if !isOwnMessage {
-				client.printMessageSafe(msgStr)
-			}
-			client.mu.Unlock()
+	var c *client.Client
+	for c == nil {
+		fmt.Print(u.colorize(th.SystemColor, "Enter your username: "))
+		if !scanner.Scan() {
+			os.Exit(1)
 		}
-	}()
+		name := strings.TrimSpace(scanner.Text())
+		fmt.Println(u.colorize(th.SystemColor, "Connecting to "+serverAddr+"..."))
+		var err error
+		c, err = client.Dial(client.Config{
+			Addr:          serverAddr,
+			AccessFile:    client.AccessFileName,
+			Username:      name,
+			DownloadDir:   config.DownloadDir,
+			MaxReceive:    config.MaxReceiveMB << 20,
+			Decoys:        config.DecoyTraffic,
+			DecoyInterval: time.Duration(config.DecoyInterval) * time.Second,
+			DecoyMin:      config.DecoyMinBytes,
+			DecoyMax:      config.DecoyMaxBytes,
+			OnEvent:       u.onEvent,
+		})
+		if err != nil {
+			var le *client.LoginError
+			if errors.As(err, &le) && (le.Code == wire.CodeUsernameTaken || le.Code == wire.CodeInvalidUsername) {
+				fmt.Println(u.colorize(th.ErrorColor, "✗ "+le.Text))
+				continue
+			}
+			fail(err.Error())
+		}
+	}
+	u.c = c
 
-	// Put terminal in raw mode for proper character-by-character input
+	clearScreen()
+	sep := u.colorize("gray", strings.Repeat("━", 78))
+	fmt.Println(sep)
+	fmt.Println(u.colorize(th.SystemColor, "                         WELCOME TO QUIETROOM"))
+	fmt.Println(u.colorize(th.SystemColor, "   "+serverAddr+" - TLS 1.3 + ACCESS KEY - logged in as "+c.Username()))
+	fmt.Println(sep)
+	fmt.Println()
+	if config.DecoyTraffic {
+		fmt.Println(u.colorize(th.SystemColor, "✓ Decoy traffic active"))
+	}
+	fmt.Println(u.colorize(th.SystemColor, "✓ Type /help for available commands"))
+	fmt.Println(u.colorize(th.SystemColor, "✓ Press Ctrl+C or type /quit to disconnect"))
+	fmt.Println()
+
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
-		fmt.Println("Failed to set raw mode:", err)
-		os.Exit(1)
+		fail("Failed to set raw terminal mode: " + err.Error())
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	restore := func() { term.Restore(int(os.Stdin.Fd()), oldState) }
+	u.outMu.Lock()
+	u.rawMode = true
+	u.redraw()
+	u.outMu.Unlock()
 
-	// Input handling with raw terminal mode
-	inputChan := make(chan string)
+	var quitting sync.Once
+	quit := func(code int) {
+		quitting.Do(func() {})
+		restore()
+		fmt.Println()
+		c.Close()
+		fmt.Println(u.colorize("gray", strings.Repeat("━", 78)))
+		fmt.Println(u.colorize(th.SystemColor, "Disconnected from server"))
+		os.Exit(code)
+	}
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		buf := make([]byte, 1)
+		<-sigChan
+		quit(0)
+	}()
+	go func() {
+		<-c.Done()
+		time.Sleep(100 * time.Millisecond) // let the disconnect event print
+		stopped := true
+		quitting.Do(func() { stopped = false })
+		if stopped {
+			return // the user quit: quit() exits
+		}
+		restore()
+		fmt.Println()
+		os.Exit(1)
+	}()
+
+	lines := make(chan string)
+	go func() {
+		buf := make([]byte, 64)
 		for {
 			n, err := os.Stdin.Read(buf)
 			if err != nil || n == 0 {
-				close(inputChan)
+				close(lines)
 				return
 			}
-
-			b := buf[0]
-
-			if b == 13 || b == 10 { // Enter
-				client.inputMu.Lock()
-				text := client.inputBuffer
-				client.inputBuffer = ""
-				client.inputMu.Unlock()
-
-				fmt.Print("\r\033[K")
-				if text != "" {
-					inputChan <- text
-				} else {
-					fmt.Print(client.colorize(client.config.Theme.SystemColor, client.promptText))
+			for _, b := range buf[:n] {
+				u.outMu.Lock()
+				switch {
+				case b == 13 || b == 10: // Enter
+					text := u.input
+					u.input = ""
+					fmt.Print("\r\033[K")
+					u.redraw()
+					u.outMu.Unlock()
+					if strings.TrimSpace(text) != "" {
+						lines <- text
+					}
+					continue
+				case b == 127 || b == 8: // Backspace (UTF-8 aware)
+					r := []rune(u.input)
+					if len(r) > 0 {
+						u.input = string(r[:len(r)-1])
+					}
+					u.redraw()
+				case b == 3: // Ctrl+C
+					u.outMu.Unlock()
+					quit(0)
+				case b == 21: // Ctrl+U: clear line
+					u.input = ""
+					u.redraw()
+				case b >= 32 && b != 127: // printable, including UTF-8 bytes
+					u.input += string([]byte{b})
+					fmt.Print(string([]byte{b}))
 				}
-			} else if b == 127 || b == 8 { // Backspace
-				client.inputMu.Lock()
-				if len(client.inputBuffer) > 0 {
-					client.inputBuffer = client.inputBuffer[:len(client.inputBuffer)-1]
-				}
-				client.inputMu.Unlock()
-				client.redrawInputLine()
-			} else if b == 3 { // Ctrl+C
-				term.Restore(int(os.Stdin.Fd()), oldState)
-				fmt.Println("\n✓ Shutting down client gracefully...")
-				client.shutdownOnce.Do(func() { close(client.shutdown) })
-				if client.conn != nil {
-					client.conn.Close()
-				}
-				os.Exit(0)
-			} else if b >= 32 && b < 127 { // Printable characters
-				client.inputMu.Lock()
-				client.inputBuffer += string(b)
-				client.inputMu.Unlock()
-				fmt.Print(string(b))
+				u.outMu.Unlock()
 			}
 		}
 	}()
 
-	// Display initial prompt
-	fmt.Print(client.colorize(config.Theme.SystemColor, client.promptText))
-
-	// Message sender loop
-	for {
-		select {
-		case text, ok := <-inputChan:
-			if !ok {
-				goto cleanup
-			}
-
-			originalText := text
-
-			if strings.HasPrefix(text, "/file ") {
-				parts := strings.SplitN(text, " ", 3)
-
-				if len(parts) >= 3 {
-					targetUser := parts[1]
-					filePath := strings.TrimSpace(parts[2])
-
-					if (strings.HasPrefix(filePath, "\"") && strings.HasSuffix(filePath, "\"")) ||
-						(strings.HasPrefix(filePath, "'") && strings.HasSuffix(filePath, "'")) {
-						filePath = filePath[1 : len(filePath)-1]
-					}
-
-					absPath, err := filepath.Abs(filePath)
-					if err != nil {
-						client.printMessageSafe("✗ Error: Invalid file path: " + err.Error())
-						continue
-					}
-
-					cleanPath := filepath.Clean(absPath)
-
-					if _, err := os.Stat(cleanPath); os.IsNotExist(err) {
-						client.printMessageSafe("✗ Error: File not found: " + cleanPath)
-						continue
-					}
-
-					fileHash, err := computeFileHash(cleanPath)
-					if err != nil {
-						client.printMessageSafe("✗ Error: Cannot access file: " + err.Error())
-						continue
-					}
-
-					basename := filepath.Base(cleanPath)
-					text = fmt.Sprintf("/file %s %s %s", targetUser, basename, fileHash)
-
-					client.transferMu.Lock()
-					if client.pendingTransfer == nil {
-						client.pendingTransfer = &FileTransferState{}
-					}
-					client.pendingTransfer.filename = cleanPath
-					client.transferMu.Unlock()
-				} else {
-					client.printMessageSafe("✗ Usage: /file <username> <filepath>")
-					client.printMessageSafe("   Tip: Use quotes for paths with spaces")
-					continue
+	for text := range lines {
+		text = strings.TrimSpace(text)
+		if text == "/quit" {
+			quit(0)
+		}
+		if strings.HasPrefix(strings.ToLower(text), "/file ") {
+			u.print(th.SystemColor, "Computing file hash...")
+			go func(line string) {
+				if err := c.Command(line, ""); err != nil {
+					u.print(th.ErrorColor, "✗ "+err.Error())
 				}
-			}
-
-			// Auto-prefix room messages
-			if !strings.HasPrefix(text, "/") {
-				client.mu.Lock()
-				currentRoom := client.currentRoom
-				client.mu.Unlock()
-				if currentRoom != "" {
-					text = fmt.Sprintf("[%s] %s", currentRoom, text)
-				}
-			}
-			
-			// Track current room for auto-prefixing. Joins take effect when the
-			// server confirms them (see joinedRoomFromServer); leaving is immediate.
-			if strings.HasPrefix(text, "/leave ") {
-				parts := strings.Fields(text)
-				if len(parts) >= 2 {
-					client.mu.Lock()
-					if client.currentRoom == parts[1] {
-						client.currentRoom = ""
-					}
-					client.mu.Unlock()
-				}
-			}
-
-			encrypted, err := client.encrypt([]byte(text))
-			if err != nil {
-				client.printMessageSafe("✗ Encryption error")
-				continue
-			}
-
-			packet := client.createObfuscatedPacket(0x01, encrypted)
-			_, err = conn.Write(packet)
-			if err != nil {
-				client.printMessageSafe("✗ Send error")
-				goto cleanup
-			}
-
-			// Show local echo for regular messages (not commands)
-			if !strings.HasPrefix(originalText, "/") && strings.TrimSpace(originalText) != "" {
-				// Display our own message locally
-				timestamp := time.Now().Format("15:04:05")
-				localMsg := fmt.Sprintf("[%s] You: %s", timestamp, originalText)
-
-				fmt.Print("\r\033[K")
-				fmt.Println(client.colorize(client.config.Theme.SystemColor, localMsg))
-
-				// Mark message to suppress server echo
-				client.lastSentMu.Lock()
-				client.lastSentMsg = originalText
-				client.lastSentMu.Unlock()
-			}
-
-			if strings.TrimSpace(text) == "/quit" {
-				goto cleanup
-			}
-
-			// Redraw prompt after sending
-			client.redrawInputLine()
-
-		case <-client.shutdown:
-			goto cleanup
+			}(text)
+			continue
+		}
+		if err := c.Command(text, u.room()); err != nil {
+			u.print(th.ErrorColor, "✗ "+err.Error())
 		}
 	}
-
-cleanup:
-	term.Restore(int(os.Stdin.Fd()), oldState)
-	close(client.stopDecoy)
-	<-done
-
-	fmt.Println()
-	client.printSeparator()
-	fmt.Println(client.colorize(config.Theme.SystemColor, "Disconnected from server"))
+	quit(0)
 }

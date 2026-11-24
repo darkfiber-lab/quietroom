@@ -13,9 +13,10 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 // Package attack runs hostile clients against a real QuietRoom server
-// process: missing or forged access keys, protocol abuse, malformed input,
-// connection floods and reconnect races. Every test ends by checking that the
-// server is still alive and still serves legitimate members.
+// process: missing or forged access keys, malformed frames and messages,
+// spoofed fields, flow-control abuse, connection floods and reconnect races.
+// Every test ends by checking that the server is still alive and still
+// serves legitimate members.
 //
 // Run: go test -count=1 ./tests/attack/
 // Set QUIETROOM_RACE=1 to build the server with the race detector; any
@@ -24,284 +25,86 @@ package attack
 
 import (
 	"bytes"
-	"crypto"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
-	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
-	"math/big"
 	"net"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
+
+	"github.com/darkfiber-lab/quietroom/tests/testserver"
+	"github.com/darkfiber-lab/quietroom/wire"
 )
 
-const accessFileName = "quietroom_access.pem"
-
-// serverBinary is built once by TestMain.
-var serverBinary string
+var bin string
 
 func TestMain(m *testing.M) {
-	os.Exit(run(m))
-}
-
-func run(m *testing.M) int {
 	dir, err := os.MkdirTemp("", "quietroom-attack-")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "temp dir:", err)
-		return 1
+		panic(err)
 	}
-	defer os.RemoveAll(dir)
-
-	serverBinary = filepath.Join(dir, "quietroom_server")
-	args := []string{"build"}
-	if os.Getenv("QUIETROOM_RACE") == "1" {
-		args = append(args, "-race")
-	}
-	args = append(args, "-o", serverBinary, "quietroom_server.go")
-	cmd := exec.Command("go", args...)
-	cmd.Dir = filepath.Join("..", "..")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	bin, err = testserver.Build(dir)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "building server:", err)
-		return 1
+		os.Exit(1)
 	}
-	return m.Run()
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
-// ── Server process ──────────────────────────────────────────────────────
-
-type serverConfig struct {
-	Port                  int  `json:"port"`
-	DecoyTraffic          bool `json:"decoy_traffic"`
-	DecoyInterval         int  `json:"decoy_interval_seconds"`
-	MaxConnections        int  `json:"max_connections,omitempty"`
-	MaxConnectionsPerIP   int  `json:"max_connections_per_ip,omitempty"`
-	MaxNewConnPerIPPerMin int  `json:"max_new_connections_per_ip_per_minute,omitempty"`
-	LogMetadata           bool `json:"log_metadata"`
+func start(t *testing.T, cfg testserver.Config) *testserver.Server {
+	return testserver.Start(t, bin, cfg)
 }
 
-type server struct {
-	t      *testing.T
-	dir    string
-	addr   string
-	cmd    *exec.Cmd
-	output *syncBuffer
-	exited chan struct{}
-
-	serverCert *x509.Certificate
-	access     tls.Certificate
-}
-
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-func freePort(t *testing.T) int {
+// healthy checks that the server survived and still admits a member.
+func healthy(t *testing.T, s *testserver.Server) {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+	s.CheckOutput(t)
+	m := s.Join(t, uniqueName("probe"))
+	m.C.Close()
 }
 
-// startServer runs a fresh server process in its own directory. High
-// connection limits are used unless the config says otherwise, because all
-// test connections come from 127.0.0.1.
-func startServer(t *testing.T, cfg serverConfig) *server {
-	t.Helper()
-	dir := t.TempDir()
-	cfg.Port = freePort(t)
-	if cfg.MaxConnections == 0 {
-		cfg.MaxConnections = 1000
-	}
-	if cfg.MaxConnectionsPerIP == 0 {
-		cfg.MaxConnectionsPerIP = 1000
-	}
-	if cfg.MaxNewConnPerIPPerMin == 0 {
-		cfg.MaxNewConnPerIPPerMin = 100000
-	}
-	data, _ := json.Marshal(cfg)
-	if err := os.WriteFile(filepath.Join(dir, "server_config.json"), data, 0600); err != nil {
-		t.Fatal(err)
-	}
+// ── Raw connections ─────────────────────────────────────────────────
 
-	s := &server{
-		t:      t,
-		dir:    dir,
-		addr:   fmt.Sprintf("127.0.0.1:%d", cfg.Port),
-		output: &syncBuffer{},
-		exited: make(chan struct{}),
-	}
-	s.cmd = exec.Command(serverBinary)
-	s.cmd.Dir = dir
-	s.cmd.Stdout = s.output
-	s.cmd.Stderr = s.output
-	if err := s.cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		s.cmd.Wait()
-		close(s.exited)
-	}()
-	t.Cleanup(s.stop)
-
-	// The access file is written once the listener is bound.
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		if bundle, err := os.ReadFile(filepath.Join(dir, accessFileName)); err == nil {
-			s.serverCert, s.access, err = parseAccessBundle(bundle)
-			if err != nil {
-				t.Fatalf("access file: %v", err)
-			}
-			break
-		}
-		select {
-		case <-s.exited:
-			t.Fatalf("server exited during startup:\n%s", s.output.String())
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("server did not start:\n%s", s.output.String())
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return s
+// dialTLS connects with the given client certificates, passes the gate
+// with a valid token and pins the server certificate like the real clients do.
+func dialTLS(s *testserver.Server, pin *x509.Certificate, certs []tls.Certificate) (*tls.Conn, error) {
+	return dialTLSName(s, pin, certs, wire.GateToken(s.GateKey, time.Now()))
 }
 
-func (s *server) stop() {
-	select {
-	case <-s.exited:
-	default:
-		s.cmd.Process.Signal(syscall.SIGTERM)
-		select {
-		case <-s.exited:
-		case <-time.After(10 * time.Second):
-			s.cmd.Process.Kill()
-			<-s.exited
-		}
-	}
-	if out := s.output.String(); strings.Contains(out, "DATA RACE") {
-		s.t.Errorf("server reported a data race:\n%s", out)
-	}
-}
-
-// assertHealthy checks that the server process is running, logged no panic
-// or data race, and still admits a legitimate member.
-func (s *server) assertHealthy() {
-	s.t.Helper()
-	select {
-	case <-s.exited:
-		s.t.Fatalf("server process died:\n%s", s.output.String())
-	default:
-	}
-	out := s.output.String()
-	for _, bad := range []string{"panic:", "DATA RACE", "fatal error:"} {
-		if strings.Contains(out, bad) {
-			s.t.Fatalf("server output contains %q:\n%s", bad, out)
-		}
-	}
-	c := s.login(s.t, uniqueName("probe"))
-	c.close()
-}
-
-func (s *server) readLog(name string) string {
-	data, _ := os.ReadFile(filepath.Join(s.dir, name))
-	return string(data)
-}
-
-func parseAccessBundle(data []byte) (*x509.Certificate, tls.Certificate, error) {
-	var certs []*pem.Block
-	var key *pem.Block
-	for {
-		var b *pem.Block
-		b, data = pem.Decode(data)
-		if b == nil {
-			break
-		}
-		switch b.Type {
-		case "CERTIFICATE":
-			certs = append(certs, b)
-		case "PRIVATE KEY":
-			key = b
-		}
-	}
-	if len(certs) != 2 || key == nil {
-		return nil, tls.Certificate{}, errors.New("expected 2 certificates and 1 private key")
-	}
-	serverCert, err := x509.ParseCertificate(certs[0].Bytes)
-	if err != nil {
-		return nil, tls.Certificate{}, err
-	}
-	access, err := tls.X509KeyPair(pem.EncodeToMemory(certs[1]), pem.EncodeToMemory(key))
-	return serverCert, access, err
-}
-
-// ── Client side ─────────────────────────────────────────────────────────
-
-// dialTLS connects with the given client certificates (none, forged, valid)
-// and pins the server certificate like the real clients do.
-func (s *server) dialTLS(certs []tls.Certificate) (*tls.Conn, error) {
+// dialTLSName is dialTLS with a chosen server name (gate token).
+func dialTLSName(s *testserver.Server, pin *x509.Certificate, certs []tls.Certificate, serverName string) (*tls.Conn, error) {
 	cfg := &tls.Config{
 		MinVersion:         tls.VersionTLS13,
 		InsecureSkipVerify: true, // replaced by the exact pin below
+		ServerName:         serverName,
 		Certificates:       certs,
 		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
-			if len(raw) == 0 || !bytes.Equal(raw[0], s.serverCert.Raw) {
+			if len(raw) == 0 || !bytes.Equal(raw[0], pin.Raw) {
 				return errors.New("server certificate does not match pin")
 			}
 			return nil
 		},
 	}
-	d := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := tls.DialWithDialer(d, "tcp", s.addr, cfg)
-	if err != nil {
-		return nil, err
-	}
-	// In TLS 1.3 the server verifies the client certificate after the
-	// client's handshake completes; a rejection arrives on the first read.
-	return conn, nil
+	return tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", s.Addr, cfg)
 }
 
-// handshakeRejected reports whether the server refuses the TLS session:
-// either the handshake fails or the first read returns an error/EOF.
-func handshakeRejected(conn *tls.Conn, err error) bool {
+// rejected reports whether the server refuses the TLS session: the
+// handshake fails or the first read returns an error (TLS 1.3 reports a
+// rejected client certificate after the client's handshake completes).
+func rejected(conn *tls.Conn, err error) bool {
 	if err != nil {
 		return true
 	}
 	defer conn.Close()
+	conn.Write(mustMsg(wire.Msg{T: wire.THello, V: wire.Version, User: uniqueName("x")}))
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	_, rerr := conn.Read(make([]byte, 1))
+	_, rerr := wire.Read(conn)
 	return rerr != nil && !isTimeout(rerr)
 }
 
@@ -310,198 +113,170 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
-var dhPrime = func() *big.Int {
-	p, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
-	return p
-}()
-
-// readServerDH reads the server's DH public key and verifies its signature
-// against the pinned server certificate.
-func (s *server) readServerDH(conn net.Conn) (*big.Int, error) {
-	readBlock := func() ([]byte, error) {
-		var n uint32
-		if err := binary.Read(conn, binary.BigEndian, &n); err != nil {
-			return nil, err
-		}
-		if n > 4096 {
-			return nil, fmt.Errorf("block too large: %d", n)
-		}
-		b := make([]byte, n)
-		_, err := io.ReadFull(conn, b)
-		return b, err
-	}
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
-	pub, err := readBlock()
-	if err != nil {
-		return nil, fmt.Errorf("server DH key: %w", err)
-	}
-	sig, err := readBlock()
-	if err != nil {
-		return nil, fmt.Errorf("server DH signature: %w", err)
-	}
-	rsaKey, ok := s.serverCert.PublicKey.(*rsa.PublicKey)
-	if !ok {
-		return nil, errors.New("server key is not RSA")
-	}
-	h := sha256.Sum256(pub)
-	if err := rsa.VerifyPSS(rsaKey, crypto.SHA256, h[:], sig, nil); err != nil {
-		return nil, fmt.Errorf("server DH signature invalid: %w", err)
-	}
-	return new(big.Int).SetBytes(pub), nil
-}
-
-func sendDHPublic(conn net.Conn, pub []byte) error {
-	var n [4]byte
-	binary.BigEndian.PutUint32(n[:], uint32(len(pub)))
-	if _, err := conn.Write(n[:]); err != nil {
-		return err
-	}
-	_, err := conn.Write(pub)
-	return err
-}
-
-// member is an authenticated, logged-in test client.
-type member struct {
+// raw is a hand-driven protocol session for sending what real clients never would.
+type raw struct {
 	t    *testing.T
 	name string
 	conn *tls.Conn
-	gcm  cipher.AEAD
-	buf  []byte
 }
 
-// session performs TLS with the valid access key and the DH exchange.
-func (s *server) session(t *testing.T) *member {
+// rawSession opens a TLS session with the valid access key, without login.
+func rawSession(t *testing.T, s *testserver.Server) *raw {
 	t.Helper()
-	conn, err := s.dialTLS([]tls.Certificate{s.access})
+	conn, err := dialTLS(s, s.ServerCert, []tls.Certificate{s.Access})
 	if err != nil {
-		t.Fatalf("dial with valid access key: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
-	serverPub, err := s.readServerDH(conn)
-	if err != nil {
-		conn.Close()
-		t.Fatalf("DH exchange: %v", err)
-	}
-	priv, err := rand.Int(rand.Reader, new(big.Int).Sub(dhPrime, big.NewInt(1)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	pub := new(big.Int).Exp(big.NewInt(2), priv, dhPrime)
-	if err := sendDHPublic(conn, pub.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-	secret := sha256.Sum256(new(big.Int).Exp(serverPub, priv, dhPrime).Bytes())
-	block, _ := aes.NewCipher(secret[:])
-	gcm, _ := cipher.NewGCM(block)
-	m := &member{t: t, conn: conn, gcm: gcm, buf: make([]byte, 70000)}
-	t.Cleanup(m.close)
-	return m
+	r := &raw{t: t, conn: conn}
+	t.Cleanup(func() { conn.Close() })
+	return r
 }
 
-// login completes the username step and waits for the welcome message.
-func (s *server) login(t *testing.T, name string) *member {
+// rawLogin opens a session and logs in.
+func rawLogin(t *testing.T, s *testserver.Server, name string) *raw {
 	t.Helper()
-	m := s.session(t)
-	m.expect("Enter your username")
-	m.sendText(name)
-	m.expect("Welcome to the chat, " + name)
-	m.name = name
-	return m
+	r := rawSession(t, s)
+	r.name = name
+	r.send(wire.Msg{T: wire.THello, V: wire.Version, User: name})
+	m := r.next(15 * time.Second)
+	if m.T != wire.TWelcome {
+		t.Fatalf("login %s: got %+v", name, m)
+	}
+	return r
 }
 
-func (m *member) close() { m.conn.Close() }
+func mustMsg(m wire.Msg) []byte {
+	f, err := wire.EncodeMsg(m)
+	if err != nil {
+		panic(err)
+	}
+	return f
+}
 
-// writePacket sends one obfuscated packet: type, length, data, padding.
-// Padding is never empty, so the server's padding drain cannot swallow the
-// start of the next packet.
-func (m *member) writePacket(typ byte, data []byte) error {
-	pad := make([]byte, 1+int(randByte())%64)
-	pkt := make([]byte, 3, 3+len(data)+len(pad))
-	pkt[0] = typ
-	binary.BigEndian.PutUint16(pkt[1:3], uint16(len(data)))
-	pkt = append(pkt, data...)
-	pkt = append(pkt, pad...)
-	_, err := m.conn.Write(pkt)
+func (r *raw) send(m wire.Msg) {
+	r.t.Helper()
+	if _, err := r.conn.Write(mustMsg(m)); err != nil {
+		r.t.Fatalf("send %s: %v", m.T, err)
+	}
+}
+
+func (r *raw) write(b []byte) error {
+	_, err := r.conn.Write(b)
 	return err
 }
 
-func randByte() byte {
-	var b [1]byte
-	rand.Read(b[:])
-	return b[0]
+// frame builds a frame by hand: length, type, flags, padding length, body.
+func frame(length uint32, typ, flags byte, pad uint16, body []byte) []byte {
+	b := make([]byte, 8, 8+len(body))
+	binary.BigEndian.PutUint32(b, length)
+	b[4], b[5] = typ, flags
+	binary.BigEndian.PutUint16(b[6:], pad)
+	return append(b, body...)
 }
 
-func (m *member) seal(plain []byte) []byte {
-	nonce := make([]byte, m.gcm.NonceSize())
-	rand.Read(nonce)
-	return m.gcm.Seal(nonce, nonce, plain, nil)
-}
-
-func (m *member) sendText(text string) {
-	m.t.Helper()
-	if err := m.writePacket(0x01, m.seal([]byte(text))); err != nil {
-		m.t.Fatalf("send %q: %v", text, err)
+// controlFrame wraps an arbitrary payload in a valid control frame.
+func controlFrame(payload []byte) []byte {
+	f, err := wire.Encode(wire.FrameControl, payload)
+	if err != nil {
+		panic(err)
 	}
+	return f
 }
 
-// next returns the next decrypted message (type 0x01 or 0x03). The server
-// writes each packet in a single TLS record, and a tls.Conn read never
-// crosses a record boundary, so one read is one packet.
-func (m *member) next(timeout time.Duration) (byte, string, error) {
-	deadline := time.Now().Add(timeout)
+// next returns the next control message, skipping decoys and data.
+func (r *raw) next(timeout time.Duration) wire.Msg {
+	r.t.Helper()
+	m, err := r.tryNext(timeout)
+	if err != nil {
+		r.t.Fatalf("%s: read: %v", r.name, err)
+	}
+	return m
+}
+
+func (r *raw) tryNext(timeout time.Duration) (wire.Msg, error) {
+	r.conn.SetReadDeadline(time.Now().Add(timeout))
 	for {
-		m.conn.SetReadDeadline(deadline)
-		n, err := m.conn.Read(m.buf)
+		f, err := wire.Read(r.conn)
 		if err != nil {
-			return 0, "", err
+			return wire.Msg{}, err
 		}
-		if n < 3 {
-			return 0, "", fmt.Errorf("short packet (%d bytes)", n)
-		}
-		typ := m.buf[0]
-		l := int(binary.BigEndian.Uint16(m.buf[1:3]))
-		if 3+l > n {
-			return 0, "", fmt.Errorf("packet spans records (%d > %d)", 3+l, n)
-		}
-		if typ == 0x02 { // decoy
+		if f.Type != wire.FrameControl {
 			continue
 		}
-		data := m.buf[3 : 3+l]
-		ns := m.gcm.NonceSize()
-		if len(data) < ns {
-			return 0, "", errors.New("ciphertext too short")
-		}
-		plain, err := m.gcm.Open(nil, data[:ns], data[ns:], nil)
-		if err != nil {
-			return 0, "", fmt.Errorf("decrypt: %w", err)
-		}
-		return typ, string(plain), nil
+		return wire.DecodeMsg(f.Payload)
 	}
 }
 
-// expect reads messages until one contains want.
-func (m *member) expect(want string) string {
-	m.t.Helper()
-	got, err := m.waitFor(want, 15*time.Second)
-	if err != nil {
-		m.t.Fatalf("%s: waiting for %q: %v (seen: %q)", m.name, want, err, got)
-	}
-	return got
-}
-
-func (m *member) waitFor(want string, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	var seen []string
+// waitFor reads until a message matches.
+func (r *raw) waitFor(what string, pred func(wire.Msg) bool) wire.Msg {
+	r.t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
 	for {
-		_, msg, err := m.next(time.Until(deadline))
+		m, err := r.tryNext(time.Until(deadline))
 		if err != nil {
-			return strings.Join(seen, " | "), err
+			r.t.Fatalf("%s: waiting for %s: %v", r.name, what, err)
 		}
-		if strings.Contains(msg, want) {
-			return msg, nil
+		if pred(m) {
+			return m
 		}
-		seen = append(seen, msg)
 	}
+}
+
+// silent sends payload on a fresh TCP connection and checks that the
+// server closes it without sending a single byte.
+func silent(t *testing.T, s *testserver.Server, payload []byte) {
+	t.Helper()
+	n, closed := serverReply(t, s, payload)
+	if n > 0 {
+		t.Fatalf("server sent %d bytes to a connection without a valid gate token", n)
+	}
+	if !closed {
+		t.Fatal("server kept the connection open")
+	}
+}
+
+// serverReply sends payload on a fresh TCP connection and returns how many
+// bytes the server sent back and whether it closed the connection (within
+// 25 seconds; a peer that sends nothing is dropped after the 15-second
+// handshake timeout).
+func serverReply(t *testing.T, s *testserver.Server, payload []byte) (n int, closed bool) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", s.Addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if len(payload) > 0 {
+		conn.Write(payload)
+	}
+	conn.SetReadDeadline(time.Now().Add(25 * time.Second))
+	buf := make([]byte, 4096)
+	for {
+		k, err := conn.Read(buf)
+		n += k
+		if err != nil {
+			return n, !isTimeout(err)
+		}
+		if n > 0 {
+			// Something came back; don't wait for the handshake to time out.
+			return n, false
+		}
+	}
+}
+
+// clientHello returns the first TLS record a Go client sends with this
+// server name, without connecting anywhere.
+func clientHello(t *testing.T, serverName string) []byte {
+	t.Helper()
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	go tls.Client(c1, &tls.Config{ServerName: serverName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}).Handshake()
+	rec, _, err := wire.ReadClientHello(c2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rec
 }
 
 // expectClosed checks that the server closes the connection.

@@ -1,6 +1,6 @@
 # QuietRoom GUI Client
 
-A native desktop client for the QuietRoom encrypted chat server, built with Go and Wails. Provides a full graphical interface while maintaining the same end-to-end encryption, perfect forward secrecy, and traffic obfuscation as the CLI client.
+A native desktop client for the QuietRoom encrypted chat server, built with Go and Wails. It uses the same client implementation as the CLI (the shared [`client`](../client/) package), so both behave identically on the wire.
 
 Available for macOS, Windows, and Linux.
 
@@ -9,12 +9,11 @@ Available for macOS, Windows, and Linux.
 ## Features
 
 ### Security
-- **End-to-end encryption** — AES-256-GCM with per-session keys derived via Diffie-Hellman key exchange
-- **Perfect forward secrecy** — each session generates a new DH keypair; past sessions cannot be decrypted if a key is later compromised
+- **TLS 1.3** — all traffic encrypted with ephemeral keys (forward secrecy)
 - **Access key** — the client presents the master access key from `quietroom_access.pem` during the TLS handshake; the server refuses connections without it
 - **Certificate pinning** — the server's TLS certificate is compared byte-for-byte against the one stored in `quietroom_access.pem`; connections are refused if they don't match, blocking man-in-the-middle attacks
-- **DH key validation** — small subgroup attack prevention on the key exchange
-- **Decoy traffic** — configurable random padding packets sent at intervals to obscure communication patterns from traffic analysis
+- **Padding and decoy traffic** — messages are padded to size classes, and random cover messages at random intervals obscure communication patterns
+- **Safe rendering** — everything from the server is shown as plain text under a content security policy; files can only be sent after picking them in the native file dialog
 
 ### Messaging
 - **Lobby** — the default channel, visible to all users not currently in a room
@@ -28,7 +27,7 @@ Available for macOS, Windows, and Linux.
 - **Members button** — shows members of the currently viewed channel (lobby or room); password-protected rooms are only visible to joined members
 
 ### File transfers
-- Encrypted file transfers to any online user
+- File transfers of any size to any online user, several at once, while chat stays responsive
 - SHA-256 hash verification on receipt — the client reports whether the received file matches the sender's hash
 - Progress bar shown inline during send and receive
 - Files saved to a configurable download directory
@@ -65,7 +64,7 @@ To manage profiles, click the **⚙ Settings** button on the login screen.
 
 ### 4. Connect
 
-Click **Connect**. The client performs the TLS handshake, verifies the server certificate against the pinned copy, completes the DH key exchange, and logs in with the provided username. If the username is already taken on the server the connection is refused and an error is shown.
+Click **Connect**. The client performs the TLS handshake, verifies the server certificate against the pinned copy, and logs in with the provided username. If the username is already taken on the server the connection is refused and an error is shown.
 
 ---
 

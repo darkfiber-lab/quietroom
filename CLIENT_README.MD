@@ -1,19 +1,18 @@
 # QuietRoom Client
 
-A command-line chat client with strong encryption, perfect forward secrecy, and customizable visual themes.
+A command-line chat client for QuietRoom: TLS 1.3 with the server's access key, flow-controlled file transfers, and customizable visual themes.
 
 ## Features
 
-- 🔐 **End-to-End Encryption** - RSA + Diffie-Hellman + AES-256-GCM
-- 🔑 **Perfect Forward Secrecy** - Ephemeral session keys
+- 🔐 **TLS 1.3** - Forward secrecy; the access key from `quietroom_access.pem` is presented to the server
 - 🔒 **Certificate Pinning** - Exact server verification prevents MITM attacks
 - 🎨 **Customizable Colors** - Full theme configuration
 - 🔔 **Sound Notifications** - Audio alerts for new messages (optional)
-- 🕵️ **Traffic Obfuscation** - Evades Deep Packet Inspection
+- 🕵️ **Traffic Padding** - Message lengths are hidden
 - 🎭 **Decoy Traffic** - Hides communication patterns
 - 💬 **Private Messaging** - Direct messages to other users
 - 🚪 **Chat Rooms** - Join password-protected group conversations
-- 📁 **File Transfers** - Secure file sharing with hash verification
+- 📁 **File Transfers** - Any size, several at once, with SHA-256 verification
 - 📋 **Multiple Servers** - Store and switch between server configurations
 
 ## Installation
@@ -64,38 +63,31 @@ go run client.go
 
 You'll see:
 ```
-✓ Loaded RSA authentication key
-✓ Initialized Diffie-Hellman parameters
+✓ Loaded server certificate and access key
 
 Available servers:
   1. Default Server (localhost:37842)
 
 Press Enter to connect, or enter custom address: 
+Enter your username: Alice
+Connecting to localhost:37842...
 ```
 
 After successful connection:
 ```
-Connecting to localhost:37842...
-✓ Secure TLS connection established
-✓ Server authenticated via RSA signature
-✓ Diffie-Hellman key exchange completed
-✓ Perfect forward secrecy enabled
-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    SECURE ENCRYPTED CHAT - localhost:37842 - E2E ENCRYPTED + PFS
+                         WELCOME TO QUIETROOM
+   localhost:37842 - TLS 1.3 + ACCESS KEY - logged in as Alice
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ✓ Decoy traffic active
-✓ Traffic obfuscation active
 ✓ Type /help for available commands
-✓ Press Ctrl+C to disconnect
-
-Enter your username: Alice
-Welcome to the chat, Alice!
-Type /help for available commands. Type /quit to exit.
+✓ Press Ctrl+C or type /quit to disconnect
 
 > 
 ```
+
+If the name is taken or invalid, the client asks again.
 
 ## Configuration
 
@@ -123,7 +115,9 @@ The client uses `client_config.json` for configuration. A default one is created
   "decoy_interval_seconds": 30,
   "decoy_min_bytes": 100,
   "decoy_max_bytes": 500,
-  "sound_notification": false
+  "sound_notification": false,
+  "download_dir": "downloads",
+  "max_receive_mb": 8192
 }
 ```
 
@@ -279,7 +273,7 @@ Customize the color scheme of the chat interface.
 - **Bandwidth**: ~100-500 bytes every 30 seconds (minimal)
 
 #### `decoy_interval_seconds` (integer)
-- **Description**: How often to send decoy packets
+- **Description**: Mean interval between decoy frames (each wait is random, 0.5–1.5 × this value)
 - **Default**: `30`
 - **Range**: `10` - `300` seconds recommended
 - **Example**: `30` (every 30s), `60` (every minute), `120` (every 2 minutes)
@@ -296,6 +290,16 @@ Customize the color scheme of the chat interface.
 - **Default**: `500`
 - **Range**: `100` - `2000` bytes
 - **Note**: Random size between min and max
+
+### File Configuration
+
+#### `download_dir` (string)
+- **Description**: Folder where accepted files are saved
+- **Default**: `"downloads"` (next to the client)
+
+#### `max_receive_mb` (integer)
+- **Description**: Largest file you accept, in MB; larger offers are declined automatically when you accept them
+- **Default**: `8192` (8 GB)
 
 ### Sound Configuration
 
@@ -357,59 +361,58 @@ While connected, you can use these commands:
   - Shows room names, member counts
   - 🔒 indicates password-protected rooms
   
-- `/users` - List users in current location
-  - Shows users in current room or lobby
+- `/users` - List all users online
+
+- `/members <#room|lobby>` - List the members of a room or of the lobby
+  - Password-protected rooms are only visible to their members
+
+When you join a room, your messages go to that room (the prompt shows it, e.g. `#general > `) until you `/leave` it.
 
 ### File Transfer Commands
-- `/file <user> <filename>` - Send file to a user
-  - Example: `/file Bob document.pdf`
-  - Only specify the filename, not full path
-  - Both users must be online
-  - Maximum file size: 10MB
+- `/file <user> <path>` - Offer a file to a user
+  - Example: `/file Bob ~/Documents/report.pdf` (quote paths with spaces: `/file Bob "my file.pdf"`)
+  - Both users must be online; any file size
+  - Up to 4 transfers at once in each direction
   
-- `/accept <transfer_id>` - Accept incoming file transfer
-  - Example: `/accept Alice_Bob_1234567890`
-  - Files are saved to `downloads/` folder
+- `/accept <transfer_id>` - Accept an incoming file
+  - Files are saved to the `download_dir` folder (`downloads/` by default)
   
-- `/decline <transfer_id>` - Decline incoming file transfer
-  - Example: `/decline Alice_Bob_1234567890`
+- `/decline <transfer_id>` - Decline an incoming file
+
+- `/cancel <transfer_id>` - Stop a transfer in progress (sending or receiving), or withdraw an offer
 
 ## Security Features
 
 ### Connection Flow
 
-1. **Load Public Certificate**: Verifies you have the server's certificate
-2. **TLS Handshake**: Establishes encrypted TLS 1.3 connection
-3. **Certificate Pinning**: Verifies exact certificate match (prevents MITM)
-4. **Server Authentication**: RSA signature verification
-5. **DH Key Exchange**: Generates ephemeral session keys
-6. **Encrypted Chat**: All messages encrypted with session key
+1. **Load Access File**: Reads the server certificate and the access key from `quietroom_access.pem`
+2. **TLS 1.3 Handshake**: Encrypted connection with ephemeral keys (forward secrecy); the client presents the access key
+3. **Certificate Pinning**: Verifies the exact server certificate (prevents MITM)
+4. **Login**: Sends the username; the server answers with a welcome or an error
 
-### Perfect Forward Secrecy
+### Forward Secrecy
 
-- Each connection generates new temporary keys
-- Old messages cannot be decrypted even if the certificate is compromised later
-- Keys are destroyed when you disconnect
+- Each connection uses new temporary TLS keys
+- Recorded traffic cannot be decrypted later, even if the access file is compromised
 
 ### Certificate Pinning
 
 - Client verifies the **exact** server certificate byte-for-byte
 - Prevents man-in-the-middle attacks even with compromised certificate authorities
-- Warning displayed if certificate doesn't match expected value
+- Connection refused if the certificate doesn't match
 
-### Traffic Obfuscation
+### Traffic Padding and Decoys
 
-Your traffic is protected by multiple layers:
 1. **TLS 1.3**: Full transport layer encryption
-2. **Application Layer Obfuscation**: TLS-like packet structure with random padding
-3. **Decoy Traffic**: Optional random encrypted data to mask patterns
+2. **Padding**: Every message is padded to a size class, so its length is hidden
+3. **Decoy Traffic**: Random cover messages at random intervals mask when you chat
 
 Network monitors see:
-- ✅ Encrypted TLS traffic (looks like HTTPS)
-- ✅ Variable packet sizes
-- ❌ Cannot determine what protocol it is
-- ❌ Cannot read message content or length
+- ✅ Encrypted TLS traffic
+- ❌ Cannot read message content or exact length
 - ❌ Cannot tell when real messages are sent (with decoy traffic)
+
+The server decrypts and relays messages (it is trusted by design) and never stores them.
 
 ## File Transfers
 
@@ -422,18 +425,18 @@ Network monitors see:
 
 2. Wait for recipient to accept:
    ```
-   *** File transfer request sent to Bob ***
-   Transfer ID: Alice_Bob_1702345678
-   Waiting for recipient to accept...
+   Computing file hash...
+   *** File offer sent to Bob: presentation.pdf (1.2 MB) ***
+   Transfer ID: 3f9c0a5e8b1d4c2a9e7f6b5d4c3a2b1e
+   SHA-256: a1b2c3d4...
+   Waiting for the recipient to accept... (/cancel 3f9c... to withdraw)
    ```
 
-3. When accepted, file is automatically sent:
+3. When accepted, the file is sent automatically, as fast as the recipient can receive it. You can keep chatting meanwhile:
    ```
-   Computing file hash...
-   Sending file: presentation.pdf (1.23 MB)
-   SHA-256: a1b2c3d4...
-   Progress: 100.0%
-   ✓ File sent successfully
+   Bob accepted — sending presentation.pdf (1.2 MB)
+   Sending presentation.pdf: 100.0% (1.2 MB of 1.2 MB)
+   ✓ File sent: presentation.pdf (1.2 MB)
    ✓ Recipient should verify hash: a1b2c3d4...
    ```
 
@@ -445,28 +448,28 @@ Network monitors see:
    Sender: Alice
    File: presentation.pdf
    SHA-256: a1b2c3d4...
-   Transfer ID: Alice_Bob_1702345678
+   Transfer ID: 3f9c0a5e8b1d4c2a9e7f6b5d4c3a2b1e
    
-   To accept, type: /accept Alice_Bob_1702345678
-   To decline, type: /decline Alice_Bob_1702345678
+   To accept, type: /accept 3f9c0a5e8b1d4c2a9e7f6b5d4c3a2b1e
+   To decline, type: /decline 3f9c0a5e8b1d4c2a9e7f6b5d4c3a2b1e
    ```
 
 2. Accept the transfer:
    ```
-   /accept Alice_Bob_1702345678
+   /accept 3f9c0a5e8b1d4c2a9e7f6b5d4c3a2b1e
    ```
 
 3. File is received automatically:
    ```
-   Receiving file: presentation.pdf (1.23 MB)
+   Receiving presentation.pdf (1.2 MB) from Alice
    Expected SHA-256: a1b2c3d4...
-   Progress: 100.0%
-   ✓ File received successfully (1.23 MB)
-   SHA-256: a1b2c3d4...
+   ✓ File received: presentation.pdf (1.2 MB)
+     Saved to: downloads/presentation.pdf
+     SHA-256: a1b2c3d4...
    ✓ Hash verification PASSED - file integrity verified!
    ```
 
-4. Find your file in the `downloads/` folder
+4. Find your file in the `downloads/` folder. While receiving, data goes to a hidden `.part` file that is removed if the transfer fails, so you never get a silently truncated file.
 
 ### File Transfer Security
 
@@ -474,6 +477,7 @@ Network monitors see:
 - **Hash Verification**: SHA-256 hash ensures file integrity
 - **No Tampering**: Any modification will be detected
 - **Recipient Approval**: Recipient must accept before transfer begins
+- **Safe Names**: Directory parts are stripped from file names; existing files are never overwritten (a number is appended)
 
 ## Troubleshooting
 
@@ -501,14 +505,20 @@ Network monitors see:
 
 **Solution**: The file must contain the server certificate *and* the access key. Get the complete `quietroom_access.pem` from your administrator.
 
-### Server authentication failed
+### Different protocol version
 
-**Problem**: `✗ Server authentication failed - possible MITM attack!`
+**Problem**: `✗ the server speaks a different protocol version`
+
+**Solution**: QuietRoom 3 clients need a QuietRoom 3 server (and vice versa). Update the server or the client so both run 3.x.
+
+### Server closed the connection without answering
+
+**Problem**: `✗ the server closed the connection without answering — your quietroom_access.pem is wrong or outdated ...`
 
 **Causes & Solutions**:
-1. **Wrong access file**: Get the correct `quietroom_access.pem` from administrator
-2. **Server restarted**: Every restart generates new keys, get the new access file
-3. **Actual MITM attack**: Someone is intercepting your connection - investigate before connecting
+1. **Server restarted**: Every restart generates new keys — get the new access file
+2. **Clock off**: The connection token is tied to the current time; set this computer's clock correctly (within 5 minutes)
+3. **Wrong file**: Make sure the access file came from this server
 
 ### Certificate does not match
 
@@ -532,7 +542,7 @@ Network monitors see:
 
 ### Username rejected
 
-**Problem**: Connection drops after entering username
+**Problem**: `✗ Invalid username` or `✗ Username already taken`
 
 **Causes**:
 - Username contains invalid characters (only letters, numbers, spaces, `_`, `-`, `.` allowed)
@@ -586,23 +596,22 @@ afplay /System/Library/Sounds/Ping.aiff
 
 ### File transfer fails
 
-**Problem**: File transfer interrupted or fails
+**Problem**: `✗ File transfer of ... ended: <reason>`
 
 **Solutions**:
-1. Check both users are still connected
-2. Ensure file is under 10MB
-3. Verify you have write permissions in current directory
-4. Check disk space available
-5. Try with a smaller file to test
+1. `... disconnected`: one side left; send the file again once both are online
+2. `offer expired`: the recipient did not accept within 5 minutes
+3. `transfer stalled`: no data moved for 2 minutes (network trouble)
+4. `cannot write file`: check write permissions and disk space in `download_dir`
+5. `file is too large`: raise `max_receive_mb` if you want to accept it
 
 ### Hash verification failed
 
 **Problem**: `✗ Hash verification FAILED - file may be corrupted!`
 
 **Causes**:
-- Network transmission error
-- File was modified during transfer
-- Possible attack attempt
+- The file was modified on the sender's side while it was being sent
+- Possible attack attempt (TLS already protects the data in transit)
 
 **Solution**:
 1. Ask sender to resend the file
