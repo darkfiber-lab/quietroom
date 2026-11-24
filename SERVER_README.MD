@@ -19,16 +19,29 @@ A self-hosted encrypted chat server: TLS 1.3 with forward secrecy, a shared acce
 - Go 1.26 or higher (only needed to build from source)
 - Linux/Unix, macOS, or Windows
 
-### Building
+### Getting the server
+
+Download `quietroom-cli-<platform>-v<version>.zip` from the [releases page](https://github.com/darkfiber-lab/quietroom/releases); it contains the server binary `quietroom_server-<platform>-v<version>`. Verify it before use:
 
 ```bash
-go build -o chat_server server.go
+sha256sum --check --ignore-missing SHA256SUMS.txt
+gh attestation verify quietroom-cli-<platform>-v<version>.zip -R darkfiber-lab/quietroom
+```
+
+Rename the binary to `quietroom_server` (the commands below use that name).
+
+### Building from source
+
+From the repository root:
+
+```bash
+go build -o quietroom_server quietroom_server.go
 ```
 
 Or run directly:
 
 ```bash
-go run server.go
+go run quietroom_server.go
 ```
 
 ## Usage
@@ -37,7 +50,7 @@ go run server.go
 
 1. **Start the server:**
    ```bash
-   ./chat_server
+   ./quietroom_server
    ```
 
 2. **Copy the access file to clients:**
@@ -50,7 +63,7 @@ go run server.go
 ### Starting the Server
 
 ```bash
-./chat_server
+./quietroom_server
 ```
 
 You should see:
@@ -175,7 +188,7 @@ Connections must complete the TLS handshake and log in within 15 seconds or they
 
 Built-in limits (not configurable): messages up to 8 KB; about 20 messages per second per member (bursts up to 60); at most 4 file transfers per member in each direction; offers expire after 5 minutes, stalled transfers after 2 minutes.
 
-Usernames are 1–32 letters, digits, spaces, `_`, `-` or `.`. Room names start with `#` followed by 1–32 letters, digits, `_`, `-` or `.`.
+Usernames are 1–32 letters, digits, `_`, `-` or `.` (no spaces), and unique regardless of case: while `Alice` is online, nobody can join as `alice`. Members can be addressed in any case (`/msg alice` reaches `Alice`). Room names start with `#` followed by 1–32 letters, digits, `_`, `-` or `.`.
 
 ## Security Features
 
@@ -259,18 +272,18 @@ sudo firewall-cmd --reload
 
 ## Systemd Service (Linux)
 
-Create `/etc/systemd/system/chat-server.service`:
+Create `/etc/systemd/system/quietroom.service`:
 
 ```ini
 [Unit]
-Description=Secure Chat Server
+Description=QuietRoom server
 After=network.target
 
 [Service]
 Type=simple
-User=chatserver
-WorkingDirectory=/opt/chat-server
-ExecStart=/opt/chat-server/chat_server
+User=quietroom
+WorkingDirectory=/opt/quietroom
+ExecStart=/opt/quietroom/quietroom_server
 Restart=always
 RestartSec=10
 
@@ -281,8 +294,8 @@ WantedBy=multi-user.target
 Enable and start:
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable chat-server
-sudo systemctl start chat-server
+sudo systemctl enable quietroom
+sudo systemctl start quietroom
 ```
 
 ## Troubleshooting

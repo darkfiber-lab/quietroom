@@ -28,7 +28,7 @@ Available for macOS, Windows, and Linux.
 
 ### File transfers
 - File transfers of any size to any online user, several at once, while chat stays responsive
-- SHA-256 hash verification on receipt — the client reports whether the received file matches the sender's hash
+- SHA-256 hash verification on receipt — a file that does not match the sender's hash is discarded, never saved
 - Progress bar shown inline during send and receive
 - Files saved to a configurable download directory
 

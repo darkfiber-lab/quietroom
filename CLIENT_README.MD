@@ -545,11 +545,12 @@ The server decrypts and relays messages (it is trusted by design) and never stor
 **Problem**: `✗ Invalid username` or `✗ Username already taken`
 
 **Causes**:
-- Username contains invalid characters (only letters, numbers, spaces, `_`, `-`, `.` allowed)
+- Username contains invalid characters (only letters, numbers, `_`, `-`, `.` allowed; no spaces)
 - Username is too long (max 32 characters)
-- Username is empty or only whitespace
+- Username is empty
+- Someone online already uses the name in any capitalisation (`alice` is taken while `Alice` is online)
 
-**Solution**: Use a valid username with allowed characters
+**Solution**: Use a valid username with allowed characters, for example `bob_smith` instead of `bob smith`
 
 ### No sound notifications
 
@@ -607,16 +608,17 @@ afplay /System/Library/Sounds/Ping.aiff
 
 ### Hash verification failed
 
-**Problem**: `✗ Hash verification FAILED - file may be corrupted!`
+**Problem**: `✗ File transfer of <name> ended: SHA-256 mismatch, file discarded (expected …, got …)`
+
+The received data did not match the hash the sender announced, so the client deleted it: nothing is saved to the download folder.
 
 **Causes**:
 - The file was modified on the sender's side while it was being sent
-- Possible attack attempt (TLS already protects the data in transit)
+- A sender deliberately announcing a hash that does not match the content (TLS already protects the data in transit, so the network is not the cause)
 
 **Solution**:
-1. Ask sender to resend the file
-2. Check network stability
-3. If problem persists, investigate security concerns
+1. Ask the sender to resend the file without changing it during the transfer
+2. If it happens again, treat the sender's file as suspicious
 
 ## Tips & Tricks
 

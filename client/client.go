@@ -76,7 +76,7 @@ const (
 	EvFileOffered              // Transfer: our offer reached the recipient
 	EvFileStarted              // Transfer: accepted, data is flowing
 	EvFileProgress             // Transfer.Done
-	EvFileComplete             // Transfer: Path, ActualSHA256, OK (hash matches)
+	EvFileComplete             // Transfer: Path, ActualSHA256, OK (always true for received files: a hash mismatch is EvFileFailed)
 	EvFileFailed               // Transfer, Text: declined, cancelled or failed
 	EvDisconnected             // Text: reason
 )
@@ -255,7 +255,7 @@ func Dial(cfg Config) (*Client, error) {
 	}
 	user := strings.TrimSpace(cfg.Username)
 	if !wire.ValidUsername(user) {
-		return nil, &LoginError{Code: wire.CodeInvalidUsername, Text: "Invalid username: use 1-32 letters, digits, spaces, '_', '-' or '.'"}
+		return nil, &LoginError{Code: wire.CodeInvalidUsername, Text: "Invalid username: " + wire.UsernameRules}
 	}
 
 	access, err := LoadAccess(cfg.AccessFile)
@@ -598,9 +598,11 @@ func (c *Client) reader() {
 func (c *Client) handleMsg(m wire.Msg) {
 	switch m.T {
 	case wire.TChat:
-		c.emit(Event{Kind: EvChat, From: m.From, Room: m.Room, Text: m.Text, Time: m.Time, Self: m.From == c.user})
+		// The server already cleans text; cleaning again protects against
+		// a server that does not.
+		c.emit(Event{Kind: EvChat, From: m.From, Room: m.Room, Text: wire.CleanText(m.Text), Time: m.Time, Self: m.From == c.user})
 	case wire.TDM:
-		c.emit(Event{Kind: EvDM, From: m.From, To: m.To, Text: m.Text, Time: m.Time, Self: m.From == c.user})
+		c.emit(Event{Kind: EvDM, From: m.From, To: m.To, Text: wire.CleanText(m.Text), Time: m.Time, Self: m.From == c.user})
 	case wire.TJoined:
 		c.emit(Event{Kind: EvJoined, User: m.User, Room: m.Room, Self: m.User == c.user, Created: m.Created})
 	case wire.TLeft:

@@ -554,11 +554,7 @@ func (a *App) handleEvent(e client.Event) {
 			"expectedHash": t.SHA256,
 			"hashMatch":    t.OK,
 		})
-		if t.OK {
-			a.notify("File received: " + t.Name)
-		} else {
-			a.notify("File received but hash FAILED: " + t.Name)
-		}
+		a.notify("File received: " + t.Name) // a hash mismatch arrives as EvFileFailed
 
 	case client.EvFileFailed:
 		name := ""

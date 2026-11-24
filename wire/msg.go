@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -172,20 +173,60 @@ func ParseID(s string) ([IDLen]byte, bool) {
 	return id, true
 }
 
-// ValidUsername: 1-32 ASCII letters, digits, space, '_', '-', '.', not only
+// ValidUsername: 1-32 ASCII letters, digits, '_', '-', '.' (no spaces, so
+// names work as command arguments). Names are unique regardless of case;
+// see UsernameKey. Not only
 // spaces, no leading or trailing space.
 func ValidUsername(name string) bool {
-	if name == "" || len(name) > MaxUsernameLen || strings.TrimSpace(name) != name {
+	if name == "" || len(name) > MaxUsernameLen {
 		return false
 	}
 	for _, ch := range name {
 		ok := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-			(ch >= '0' && ch <= '9') || ch == ' ' || ch == '_' || ch == '-' || ch == '.'
+			(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.'
 		if !ok {
 			return false
 		}
 	}
 	return true
+}
+
+// UsernameKey is the form under which a username is reserved: names that
+// differ only in case (alice, Alice) are the same name.
+func UsernameKey(name string) string { return strings.ToLower(name) }
+
+// UsernameRules describes valid usernames for error messages.
+const UsernameRules = "use 1-32 letters, digits, '_', '-' or '.' (no spaces)"
+
+// hidden reports characters that change how text is displayed without
+// being visible: bidirectional controls, which can reorder text (a file
+// "invoice\u202Egpj.exe" displays as "invoiceexe.jpg"), and zero-width
+// characters that make look-alike strings. Zero-width joiners (U+200C,
+// U+200D) are kept in text: emoji sequences and some scripts need them.
+func hidden(r rune) bool {
+	switch {
+	case r >= 0x202A && r <= 0x202E, // LRE, RLE, PDF, LRO, RLO
+		r >= 0x2066 && r <= 0x2069,            // LRI, RLI, FSI, PDI
+		r == 0x200E, r == 0x200F, r == 0x061C, // LRM, RLM, ALM
+		r == 0x200B, r == 0x2060, r == 0xFEFF, r == 0x180E, // zero-width space, word joiner, BOM, MVS
+		r >= 0x2061 && r <= 0x2064: // invisible math operators
+		return true
+	}
+	return false
+}
+
+// CleanText removes control characters (except newline and tab) and hidden
+// characters (see hidden) from chat text.
+func CleanText(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\t':
+			return r
+		case r < 32 || r == 127 || (r >= 0x80 && r < 0xa0) || r == utf8.RuneError || hidden(r):
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // ValidRoomName: "#" followed by 1-32 ASCII letters, digits, '_', '-', '.'.
@@ -217,14 +258,15 @@ func ValidSHA256(s string) bool {
 }
 
 // CleanFileName reduces a file name to a safe base name for display and
-// saving: no directories, no control characters, at most 255 bytes. It
+// saving: no directories, no control characters, no Unicode format
+// characters (bidi controls, zero-width characters), at most 255 bytes. It
 // returns "" if nothing usable remains.
 func CleanFileName(name string) string {
 	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
 		name = name[i+1:]
 	}
 	name = strings.Map(func(r rune) rune {
-		if r < 32 || r == 127 || r == utf8.RuneError {
+		if r < 32 || r == 127 || (r >= 0x80 && r < 0xa0) || r == utf8.RuneError || unicode.Is(unicode.Cf, r) || hidden(r) {
 			return -1
 		}
 		return r

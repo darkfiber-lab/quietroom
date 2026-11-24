@@ -145,12 +145,12 @@ func TestDecodeMsg(t *testing.T) {
 }
 
 func TestValidation(t *testing.T) {
-	for _, ok := range []string{"alice", "Bob Smith", "a.b-c_d", "x"} {
+	for _, ok := range []string{"alice", "Bob", "a.b-c_d", "x"} {
 		if !ValidUsername(ok) {
 			t.Errorf("ValidUsername(%q) = false", ok)
 		}
 	}
-	for _, bad := range []string{"", " a", "a ", "<b>", "ä", "a\nb", "\x1b[31m", string(make([]byte, 33))} {
+	for _, bad := range []string{"", " a", "a ", "Bob Smith", "<b>", "ä", "a\nb", "\x1b[31m", "a\u202eb", string(make([]byte, 33))} {
 		if ValidUsername(bad) {
 			t.Errorf("ValidUsername(%q) = true", bad)
 		}
@@ -176,6 +176,49 @@ func TestValidation(t *testing.T) {
 	for in, want := range cases {
 		if got := CleanFileName(in); got != want {
 			t.Errorf("CleanFileName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestUsernameKey(t *testing.T) {
+	if UsernameKey("Alice") != UsernameKey("alice") || UsernameKey("ALICE.x") != UsernameKey("alice.X") {
+		t.Fatal("names that differ only in case must share a key")
+	}
+	if UsernameKey("alice") == UsernameKey("alice.") {
+		t.Fatal("different names share a key")
+	}
+}
+
+// Bidi controls reorder what is displayed: "invoice<RLO>gpj.exe" shows as
+// "invoiceexe.jpg". They and zero-width characters must not survive.
+func TestHiddenCharacters(t *testing.T) {
+	names := map[string]string{
+		"invoice\u202Egpj.exe":       "invoicegpj.exe",
+		"a\u2066b\u2069c\u200Fd.txt": "abcd.txt",
+		"pay\u200Bpal.pdf":           "paypal.pdf",
+		"\uFEFFreport.doc":           "report.doc",
+		"x\u0085y.bin":               "xy.bin",  // C1 control
+		"zw\u200Dj.txt":              "zwj.txt", // no format characters at all in file names
+		"\u202E":                     "",
+	}
+	for in, want := range names {
+		if got := CleanFileName(in); got != want {
+			t.Errorf("CleanFileName(%q) = %q, want %q", in, got, want)
+		}
+	}
+	texts := map[string]string{
+		"hello\u202Edlrow":            "hellodlrow",
+		"line1\nline2\tend":           "line1\nline2\tend", // newline and tab kept
+		"bell\x07 esc\x1b[2J del\x7f": "bell esc[2J del",
+		"crlf\r\n":                    "crlf\n",
+		"family 👨\u200D👩\u200D👧":      "family 👨\u200D👩\u200D👧", // emoji joiners kept
+		"zero\u200Bwidth\u2060joiner": "zerowidthjoiner",
+		"c1\u009bcontrol":             "c1control",
+		"ünïcödé 日本語":                 "ünïcödé 日本語",
+	}
+	for in, want := range texts {
+		if got := CleanText(in); got != want {
+			t.Errorf("CleanText(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -242,6 +285,9 @@ func FuzzDecodeMsg(f *testing.F) {
 		ValidUsername(m.User)
 		ValidRoomName(m.Room)
 		CleanFileName(m.Name)
+		if c := CleanText(m.Text); len(c) > len(m.Text) {
+			t.Fatal("CleanText grew the text")
+		}
 		ParseID(m.ID)
 	})
 }
