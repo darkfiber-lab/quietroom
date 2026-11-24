@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **No generated files in the repository** — the built GUI frontend (`quietroom-gui/frontend/dist/`, a minified bundle produced by Vite) is no longer committed; `wails build` and `wails dev` generate it. Only an empty `dist/.gitkeep` remains, so the GUI's Go code compiles on a fresh clone; the Vite config puts it back after each build. Stray `.DS_Store` files and Wails' `package.json.md5` are gone and ignored.
+
+---
+
 ## [3.1.0] - 2026-11-24
 
 Compatible with 3.0 servers and clients (protocol 3). Update the server first: from 3.1 on, usernames with spaces are refused and names are unique regardless of case (see Changed).
