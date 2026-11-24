@@ -4,8 +4,10 @@
 
 ### Added
 - **OpenSSF Best Practices badge** — QuietRoom meets the "passing" level and Baseline level 1; the badge is shown in the README. The README's contribution guidelines now state the pull-request process and that new functionality comes with tests.
+- **Container deployment examples** in `deploy/`: a Podman Quadlet unit (systemd service, private user namespace, host network, read-only, no capabilities, resource limits) and an nftables egress guard that blocks every outbound connection from the server's user, including to cloud metadata services. Documented in SERVER_README.MD, "Running in a container"; the DOCKERFILE comments now cover Docker and Podman.
 
-### Changed
+### ⚠ Changed
+- **Container image runs as uid/gid 65532** instead of 1000. On most Linux hosts 1000 is the first login user, so a process escaping the container would have been that user; 65532 belongs to no account. Existing data volumes must be given to 65532 before upgrading (`chown -R 65532:65532` on the volume, or Podman's `:U` mount option); see SERVER_README.MD, "Running in a container".
 - **No generated files in the repository** — the built GUI frontend (`quietroom-gui/frontend/dist/`, a minified bundle produced by Vite) is no longer committed; `wails build` and `wails dev` generate it. Only an empty `dist/.gitkeep` remains, so the GUI's Go code compiles on a fresh clone; the Vite config puts it back after each build. Stray `.DS_Store` files and Wails' `package.json.md5` are gone and ignored.
 
 ### Security

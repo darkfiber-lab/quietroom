@@ -15,18 +15,31 @@
 # QuietRoom Server Dockerfile
 # Runtime-only container: expects a pre-compiled, statically linked
 # quietroom_server binary (CGO_ENABLED=0, matching the target architecture)
-# in the build context, e.g. from a release zip.
+# in the build context, e.g. from a release zip. Works with Docker and Podman;
+# nothing in it is specific to a distribution or cloud.
 #
 # Build:
-#   docker build -f DOCKERFILE -t quietroom-server .
+#   docker build -f DOCKERFILE -t quietroom-server .      (or: podman build)
 #
-# Run (hardened):
+# Run (hardened), Docker:
 #   docker run -d --name quietroom-server --restart unless-stopped \
 #     -p 37842:37842 -v quietroom-data:/app \
 #     --cap-drop ALL --security-opt no-new-privileges:true --read-only \
 #     --memory 512m --pids-limit 256 \
 #     --log-opt max-size=10m --log-opt max-file=3 \
 #     quietroom-server
+#
+# Podman: see deploy/quietroom-server.container (a systemd Quadlet unit with a
+# private user namespace), and deploy/quietroom-guard.nft, which blocks every
+# outbound connection the server could try to open. SERVER_README.MD,
+# "Running in a container", explains both.
+#
+# The server runs as uid/gid 65532, which belongs to no account on common
+# Linux systems. (Up to 3.1 it was 1000, usually the host's first login user:
+# after an escape from the container, an attacker would have been that user.)
+# Upgrading from an image that used 1000: give the data volume to 65532 first,
+# e.g. `chown -R 65532:65532 <volume directory>`, or mount it with Podman's
+# `:U` option.
 #
 # The server writes only to /app, so a read-only root filesystem works.
 # The final image contains no OS packages and no shell: only the binary.
@@ -39,7 +52,7 @@ FROM alpine@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c7
 
 COPY quietroom_server /out/usr/local/bin/quietroom_server
 RUN chmod 0755 /out/usr/local/bin/quietroom_server && \
-    mkdir -p /out/app && chown 1000:1000 /out/app && chmod 0700 /out/app
+    mkdir -p /out/app && chown 65532:65532 /out/app && chmod 0700 /out/app
 
 # ── Final image: static binary only, nothing else ─────────────────────────
 FROM scratch
@@ -48,17 +61,16 @@ FROM scratch
 # updates the server (a binary inside /app would be hidden by the volume).
 COPY --from=prep /out/usr/local/bin/quietroom_server /usr/local/bin/quietroom_server
 
-# Data directory (volume), owned by uid/gid 1000 (typical first user on the
-# host, so the files stay accessible to the host account):
+# Data directory (volume), owned by uid/gid 65532 (no account on the host):
 #   - server_config.json (created with defaults on first start)
 #   - quietroom_access.pem (SECRET, regenerated on every start)
 #   - chat_server.log, security.log
-COPY --from=prep --chown=1000:1000 /out/app /app
+COPY --from=prep --chown=65532:65532 /out/app /app
 WORKDIR /app
 VOLUME ["/app"]
 
 # Numeric user: there is no /etc/passwd in a scratch image.
-USER 1000:1000
+USER 65532:65532
 EXPOSE 37842
 
 # No HEALTHCHECK: a TCP probe would show up as a rejected connection in the
