@@ -66,6 +66,14 @@ jobs:
       - name: Unit tests
         run: go test -race -count=1 ./wire/ ./client/ ./lineedit/...
 
+      - name: Linux desktop notifications (GUI, against a private D-Bus)
+        working-directory: quietroom-gui
+        env:
+          QUIETROOM_REQUIRE_DBUS: '1'
+        run: |
+          command -v dbus-daemon || { sudo apt-get update && sudo apt-get install -y --no-install-recommends dbus-daemon; }
+          go test -race -count=1 ./internal/linuxnotify/
+
       - name: Fuzz the frame reader, message decoder, command parser and ClientHello parser
         run: |
           for target in FuzzRead FuzzDecodeMsg FuzzParseCommand FuzzReadClientHello; do

@@ -21,9 +21,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,7 +29,6 @@ import (
 
 	"github.com/darkfiber-lab/quietroom/client"
 	"github.com/darkfiber-lab/quietroom/wire"
-	"github.com/gen2brain/beeep"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -93,6 +90,8 @@ type App struct {
 	pickedSendPath string // last path chosen via PickFileToSend
 	pickMu         sync.Mutex
 
+	notes notifier // desktop notifications (notifications.go)
+
 	// emit sends an event to the frontend (replaced in tests).
 	emit func(ctx context.Context, name string, data ...interface{})
 }
@@ -105,6 +104,11 @@ func NewApp() *App {
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.config = a.loadConfig()
+}
+
+// domReady runs once the window and frontend exist.
+func (a *App) domReady(ctx context.Context) {
+	a.setupNotifications()
 }
 
 func (a *App) shutdown(ctx context.Context) {
@@ -161,7 +165,11 @@ func (a *App) GetConfig() AppConfig {
 
 // SaveConfig saves updated config from the frontend
 func (a *App) SaveConfig(cfg AppConfig) error {
+	enabling := cfg.SoundEnabled && !a.config.SoundEnabled
 	a.config = cfg
+	if enabling {
+		go a.authorizeNotifications() // asks for permission if needed
+	}
 	return a.saveConfig()
 }
 
@@ -442,7 +450,15 @@ func (a *App) handleEvent(e client.Event) {
 			"isOwn":     e.Self,
 		})
 		if !e.Self {
-			a.notify("New message from " + e.From)
+			channel := e.Room
+			if channel == "" {
+				channel = "__lobby__"
+			}
+			where := "the lobby"
+			if e.Room != "" {
+				where = e.Room
+			}
+			a.notify("New message from "+e.From+" in "+where, channel)
 		}
 
 	case client.EvDM:
@@ -458,7 +474,7 @@ func (a *App) handleEvent(e client.Event) {
 			"isOwn":     e.Self,
 		})
 		if !e.Self {
-			a.notify("DM from " + e.From)
+			a.notify("Direct message from "+e.From, "__dm__"+e.From)
 		}
 
 	case client.EvInfo, client.EvError:
@@ -502,7 +518,7 @@ func (a *App) handleEvent(e client.Event) {
 			"expectedHash": t.SHA256,
 			"senderName":   t.Peer,
 		})
-		a.notify("File transfer request from " + t.Peer)
+		a.notify("File offered by "+t.Peer, "")
 
 	case client.EvFileStarted:
 		t := e.Transfer
@@ -554,7 +570,7 @@ func (a *App) handleEvent(e client.Event) {
 			"expectedHash": t.SHA256,
 			"hashMatch":    t.OK,
 		})
-		a.notify("File received: " + t.Name) // a hash mismatch arrives as EvFileFailed
+		a.notify("File received from "+t.Peer, "") // a hash mismatch arrives as EvFileFailed
 
 	case client.EvFileFailed:
 		name := ""
@@ -571,18 +587,6 @@ func (a *App) handleEvent(e client.Event) {
 // ─────────────────────────────────────────────
 // Sound notifications
 // ─────────────────────────────────────────────
-
-func (a *App) notify(message string) {
-	if !a.config.SoundEnabled {
-		return
-	}
-	go func() {
-		beeep.Notify("QuietRoom", message, "")
-		if goruntime.GOOS == "darwin" {
-			exec.Command("afplay", "/System/Library/Sounds/Ping.aiff").Run()
-		}
-	}()
-}
 
 // ─────────────────────────────────────────────
 // Utility

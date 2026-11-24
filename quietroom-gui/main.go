@@ -44,6 +44,7 @@ func main() {
 		},
 		BackgroundColour: &options.RGBA{R: 18, G: 18, B: 24, A: 1},
 		OnStartup:        app.startup,
+		OnDomReady:       app.domReady,
 		OnShutdown:       app.shutdown,
 		Bind: []interface{}{
 			app,
@@ -60,10 +61,11 @@ func main() {
 		},
 		Linux: &linux.Options{
 			ProgramName: "QuietRoom",
+			Icon:        linuxWindowIcon(),
 		},
-		Frameless:        false,
-		CSSDragProperty:  "--wails-draggable",
-		CSSDragValue:     "drag",
+		Frameless:       false,
+		CSSDragProperty: "--wails-draggable",
+		CSSDragValue:    "drag",
 	})
 
 	if err != nil {
