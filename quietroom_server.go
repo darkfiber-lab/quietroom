@@ -21,7 +21,9 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/pbkdf2"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -45,7 +47,6 @@ import (
 	"time"
 
 	"github.com/darkfiber-lab/quietroom/wire"
-	"golang.org/x/crypto/bcrypt"
 )
 
 type ServerConfig struct {
@@ -307,9 +308,48 @@ func (c *Client) allow(cost float64) bool {
 }
 
 type Room struct {
-	name         string
-	members      map[*Client]bool
-	passwordHash string // bcrypt hash, empty if no password
+	name     string
+	members  map[*Client]bool
+	password *roomPassword // nil if the room has no password
+}
+
+// Room passwords are kept only as PBKDF2-HMAC-SHA256 keys with a random
+// salt (standard library only). The iteration count follows the OWASP
+// recommendation; at most passwordWorkers hashes run at once, so members
+// cannot tie up every CPU by joining password rooms.
+const (
+	passwordIterations = 600000
+	passwordWorkers    = 2
+)
+
+var passwordSlots = make(chan struct{}, passwordWorkers)
+
+type roomPassword struct {
+	salt []byte
+	key  []byte
+}
+
+func derivePassword(password string, salt []byte) ([]byte, error) {
+	passwordSlots <- struct{}{}
+	defer func() { <-passwordSlots }()
+	return pbkdf2.Key(sha256.New, password, salt, passwordIterations, 32)
+}
+
+func newRoomPassword(password string) (*roomPassword, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	key, err := derivePassword(password, salt)
+	if err != nil {
+		return nil, err
+	}
+	return &roomPassword{salt: salt, key: key}, nil
+}
+
+func (p *roomPassword) matches(password string) bool {
+	key, err := derivePassword(password, p.salt)
+	return err == nil && subtle.ConstantTimeCompare(key, p.key) == 1
 }
 
 type transfer struct {
@@ -826,7 +866,7 @@ func messageCost(t string) float64 {
 	case wire.TFileAccept, wire.TFileCredit, wire.TFileEnd, wire.TFileCancel, wire.TFileDecline:
 		return 0
 	case wire.TJoin:
-		return 5 // bcrypt is expensive
+		return 5 // password hashing is expensive
 	case wire.TFileOffer:
 		return 2
 	}
@@ -1016,9 +1056,9 @@ func (s *Server) handleJoin(c *Client, m wire.Msg) {
 	already := c.rooms[name]
 	count := len(c.rooms)
 	total := len(s.rooms)
-	var hash string
+	var pw *roomPassword
 	if r != nil {
-		hash = r.passwordHash
+		pw = r.password
 	}
 	s.mu.Unlock()
 
@@ -1034,24 +1074,23 @@ func (s *Server) handleJoin(c *Client, m wire.Msg) {
 		return
 	}
 
-	// bcrypt runs without holding the lock.
-	var newHash string
-	if r != nil && hash != "" {
+	// Password hashing runs without holding the lock.
+	var newPw *roomPassword
+	if r != nil && pw != nil {
 		if password == "" {
 			s.fail(c, "This room is password-protected. Usage: /join "+name+" <password>")
 			return
 		}
-		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+		if !pw.matches(password) {
 			s.fail(c, "Incorrect password for room "+name)
 			return
 		}
 	} else if r == nil && password != "" {
-		h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-		if err != nil {
+		var err error
+		if newPw, err = newRoomPassword(password); err != nil {
 			s.fail(c, "Error creating room password.")
 			return
 		}
-		newHash = string(h)
 	}
 
 	s.mu.Lock()
@@ -1067,7 +1106,7 @@ func (s *Server) handleJoin(c *Client, m wire.Msg) {
 			s.fail(c, "Too many rooms on this server")
 			return
 		}
-		current = &Room{name: name, members: make(map[*Client]bool), passwordHash: newHash}
+		current = &Room{name: name, members: make(map[*Client]bool), password: newPw}
 		s.rooms[name] = current
 		created = true
 	case current != r:
@@ -1113,7 +1152,7 @@ func (s *Server) handleRooms(c *Client) {
 		for _, name := range names {
 			r := s.rooms[name]
 			locked := ""
-			if r.passwordHash != "" {
+			if r.password != nil {
 				locked = " 🔒"
 			}
 			fmt.Fprintf(&b, "  %s%s (%d users)\n", name, locked, len(r.members))
@@ -1148,7 +1187,7 @@ func (s *Server) handleMembers(c *Client, m wire.Msg) {
 	} else {
 		r := s.rooms[target]
 		// Password rooms are only visible to their members.
-		if r == nil || (r.passwordHash != "" && !c.rooms[target]) {
+		if r == nil || (r.password != nil && !c.rooms[target]) {
 			s.mu.Unlock()
 			s.fail(c, "Room not found or access denied.")
 			return

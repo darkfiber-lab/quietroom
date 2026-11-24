@@ -57,6 +57,9 @@ The bot exits after writing the config. Edit before running again.
   "history_ttl_seconds": 3600,
   "system_prompt": "You are a helpful assistant on a private encrypted chat server. Keep responses concise.",
   "max_message_length": 400,
+  "max_concurrent_requests": 2,
+  "max_requests_per_minute": 6,
+  "log_metadata": false,
   "decoy_traffic": true,
   "decoy_interval": 30,
   "decoy_min_bytes": 100,
@@ -75,6 +78,10 @@ Key fields:
 | `max_history_per_user` | Maximum messages retained per sender (both sides count) |
 | `history_ttl_seconds` | History discarded after this many seconds of inactivity |
 | `max_message_length` | Replies longer than this are split into multiple DMs |
+| `max_concurrent_requests` | LLM requests running at once, all users together (default 2); further requests are refused with "busy" |
+| `max_requests_per_minute` | Messages accepted per user per minute, commands included (default 6); the user is told once, further messages are ignored |
+| `log_metadata` | `false` (default): the log contains no usernames. Message text is never logged |
+| `ollama.base_url` / `openai.base_url` | Where prompts are sent. ⚠️ **Keep this on the same machine or your own network**: every message members send to the bot, plus their conversation history, goes to this URL. A hosted API means chat content leaves your infrastructure |
 
 ### 4. Start your LLM server
 
@@ -192,7 +199,7 @@ QuietRoomConnector            LLMBot
 
 ## Logging
 
-Logs go to stdout and `llm_bot.log`. Entries include connection events, incoming DMs (truncated to 80 chars), LLM errors, reply chunk counts, and history reaper activity. Room messages and decoy packets appear only at debug level.
+Logs go to stdout and `llm_bot.log`. Entries include connection events, incoming DMs (length only, never the text), rate-limit hits, LLM errors, reply chunk counts, and history reaper activity. Members appear as `[member]` unless `log_metadata` is `true`. Room messages and decoy packets appear only at debug level.
 
 ---
 
@@ -203,3 +210,6 @@ Logs go to stdout and `llm_bot.log`. Entries include connection events, incoming
 - The bot never responds to room messages and cannot be triggered without a deliberate DM.
 - Conversation histories are held in memory only and never written to disk.
 - The system prompt is not visible to users.
+- Each user can have one request running at a time, and at most `max_concurrent_requests` run overall, so one member cannot monopolise the model or queue up work; `max_requests_per_minute` caps how often each user can ask.
+- Backend errors are logged; users only see a generic error, never the backend address or its error text.
+- Prompts go to the configured `base_url`. Use a local model to keep chat content on infrastructure you control.

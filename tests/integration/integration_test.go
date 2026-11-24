@@ -180,6 +180,15 @@ func TestPasswordRoom(t *testing.T) {
 	eve.Wait("hidden members", wait, testserver.Text(client.EvError, "access denied"))
 	eve.C.Join("#vault", "correct horse")
 	eve.Wait("joined", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#vault" })
+
+	// Long passwords (up to the 256-byte limit) work, and differ in every byte.
+	long := strings.Repeat("ü", wire.MaxPasswordBytes/2) // 256 bytes
+	alice.C.Join("#long", long)
+	alice.Wait("long created", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#long" })
+	eve.C.Join("#long", long[:len(long)-2]+"x!")
+	eve.Wait("long wrong", wait, testserver.Text(client.EvError, "Incorrect password"))
+	eve.C.Join("#long", long)
+	eve.Wait("long joined", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#long" })
 	s.CheckOutput(t)
 }
 

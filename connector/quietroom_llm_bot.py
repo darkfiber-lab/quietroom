@@ -115,6 +115,15 @@ class BotConfig:
     # Long responses are split into chunks of this length
     max_message_length: int = 400
 
+    # Abuse limits: LLM requests running at once (all users together), and
+    # messages per user per minute (commands included)
+    max_concurrent_requests: int = 2
+    max_requests_per_minute: int = 6
+
+    # Logs never contain message text. With log_metadata false (default)
+    # they contain no usernames either.
+    log_metadata: bool = False
+
     def to_connector_config(self) -> ConnectorConfig:
         return ConnectorConfig(
             server_host=self.server_host,
@@ -156,6 +165,9 @@ def load_config(path: str = "bot_config.json") -> BotConfig:
             "history_ttl_seconds": cfg.history_ttl_seconds,
             "system_prompt": cfg.system_prompt,
             "max_message_length": cfg.max_message_length,
+            "max_concurrent_requests": cfg.max_concurrent_requests,
+            "max_requests_per_minute": cfg.max_requests_per_minute,
+            "log_metadata": cfg.log_metadata,
         }
         with open(path, "w") as f:
             json.dump(d, f, indent=2)
@@ -179,6 +191,9 @@ def load_config(path: str = "bot_config.json") -> BotConfig:
         history_ttl_seconds=d.get("history_ttl_seconds", 3600),
         system_prompt=d.get("system_prompt", BotConfig.system_prompt),
         max_message_length=d.get("max_message_length", 400),
+        max_concurrent_requests=max(1, int(d.get("max_concurrent_requests", 2))),
+        max_requests_per_minute=max(1, int(d.get("max_requests_per_minute", 6))),
+        log_metadata=bool(d.get("log_metadata", False)),
     )
 
     if "ollama" in d:
@@ -359,7 +374,6 @@ class HistoryManager:
         with self._lock:
             if sender in self._histories:
                 del self._histories[sender]
-                log.info("Cleared history for '%s'", sender)
                 return True
             return False
 
@@ -368,7 +382,8 @@ class HistoryManager:
             expired = [s for s, h in self._histories.items() if h.is_expired(self._ttl)]
             for s in expired:
                 del self._histories[s]
-                log.info("Purged expired history for '%s'", s)
+            if expired:
+                log.info("Purged %d expired conversation(s)", len(expired))
 
 
 # ---------------------------------------------------------------------------
@@ -412,10 +427,52 @@ class LLMBot:
         self._history = HistoryManager(cfg.max_history_per_user, cfg.history_ttl_seconds)
         self._shutdown = threading.Event()
 
+        # Abuse limits
+        self._slots = threading.BoundedSemaphore(cfg.max_concurrent_requests)
+        self._limits_lock = threading.Lock()
+        self._busy: set[str] = set()                   # users with a request running
+        self._recent: dict[str, deque] = {}            # user -> message times (last minute)
+        self._warned: dict[str, float] = {}            # user -> when told to slow down
+
         # Register callbacks on the connector
         self._conn.on_dm(self._handle_dm)
         self._conn.on_disconnect(self._handle_disconnect)
         self._conn.on_presence(self._handle_presence)
+
+    def _who(self, user: str) -> str:
+        """A username for the log, or a placeholder unless log_metadata is on."""
+        return f"'{user}'" if self._cfg.log_metadata else "[member]"
+
+    def _within_rate(self, sender: str) -> bool:
+        """Count a message against the sender's per-minute budget."""
+        now = time.monotonic()
+        with self._limits_lock:
+            q = self._recent.setdefault(sender, deque())
+            while q and now - q[0] > 60:
+                q.popleft()
+            if len(q) < self._cfg.max_requests_per_minute:
+                q.append(now)
+                return True
+            # Tell the sender once per minute, otherwise stay quiet.
+            warn = now - self._warned.get(sender, -1e9) > 60
+            if warn:
+                self._warned[sender] = now
+        if warn:
+            log.info("Rate limit reached by %s", self._who(sender))
+            self._conn.send_dm(
+                sender,
+                f"Slow down: at most {self._cfg.max_requests_per_minute} messages per minute. "
+                "Messages over the limit are ignored.",
+            )
+        return False
+
+    def _purge_limits(self):
+        now = time.monotonic()
+        with self._limits_lock:
+            for user in [u for u, q in self._recent.items() if not q or now - q[-1] > 60]:
+                del self._recent[user]
+            for user in [u for u, t in self._warned.items() if now - t > 60]:
+                del self._warned[user]
 
     def _handle_disconnect(self, reason: Optional[Exception]):
         log.info("Connector disconnected: %s", reason or "clean shutdown")
@@ -425,13 +482,15 @@ class LLMBot:
         if event == "left" and room is None:
             if self._history.clear(username):
                 log.info(
-                    "User '%s' left — conversation history purged to prevent context leak",
-                    username,
+                    "%s left — conversation history purged to prevent context leak",
+                    self._who(username),
                 )
 
     def _handle_dm(self, sender: str, message: str):
         """Callback fired by the connector for every incoming DM."""
-        log.info("DM from '%s': %s", sender, message[:80])
+        log.info("DM from %s (%d characters)", self._who(sender), len(message))
+        if not self._within_rate(sender):
+            return
 
         if message.strip().lower() == "!reset":
             self._history.clear(sender)
@@ -452,24 +511,47 @@ class LLMBot:
         messages.extend(history)
         messages.append({"role": "user", "content": message})
 
+        # One request per user at a time, and at most max_concurrent_requests
+        # overall: nobody can queue up work or starve the other users.
+        refusal = None
+        with self._limits_lock:
+            if sender in self._busy:
+                refusal = "Still working on your previous message — please wait for the answer."
+            elif not self._slots.acquire(blocking=False):
+                refusal = "I'm busy answering others — please try again in a moment."
+            else:
+                self._busy.add(sender)
+        if refusal:
+            self._conn.send_dm(sender, refusal)
+            return
+
         # Run LLM in a thread — the connector's receive loop must not block
         threading.Thread(
             target=self._generate_and_reply,
             args=(sender, message, messages),
             daemon=True,
-            name=f"llm-{sender}",
+            name="llm-request",
         ).start()
 
     def _generate_and_reply(self, sender: str, original: str, messages: list[dict]):
         try:
+            self._answer(sender, original, messages)
+        finally:
+            with self._limits_lock:
+                self._busy.discard(sender)
+            self._slots.release()
+
+    def _answer(self, sender: str, original: str, messages: list[dict]):
+        try:
             reply = self._llm.generate(messages)
-        except RuntimeError as e:
-            log.error("LLM error for '%s': %s", sender, e)
-            self._conn.send_dm(sender, f"[Error: {e}]")
+        except Exception as e:  # any backend failure, including HTTP errors
+            # Details stay in the log; the user gets no backend internals.
+            log.error("LLM error for %s: %s", self._who(sender), e)
+            self._conn.send_dm(sender, "[Error: the language model did not answer — please try again later]")
             return
 
         if not reply:
-            log.warning("LLM returned empty response for '%s'", sender)
+            log.warning("LLM returned empty response for %s", self._who(sender))
             return
 
         # Commit exchange to history only after a successful round trip
@@ -477,7 +559,7 @@ class LLMBot:
         self._history.add(sender, "assistant", reply)
 
         chunks = chunk_response(reply, self._cfg.max_message_length)
-        log.info("Replying to '%s' in %d chunk(s)", sender, len(chunks))
+        log.info("Replying to %s in %d chunk(s)", self._who(sender), len(chunks))
         for i, chunk in enumerate(chunks):
             self._conn.send_dm(sender, chunk)
             if i < len(chunks) - 1:
@@ -488,6 +570,7 @@ class LLMBot:
             self._shutdown.wait(timeout=300)
             if not self._shutdown.is_set():
                 self._history.purge_expired()
+                self._purge_limits()
 
     def run_until_disconnected(self):
         """Block the calling thread until the connector disconnects."""

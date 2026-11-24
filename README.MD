@@ -197,4 +197,5 @@ commercial license. Contact the author for details.
 
 Built with:
 - Go standard library (crypto/tls, TLS 1.3)
-- golang.org/x/crypto (bcrypt for room passwords)
+- Go standard library (crypto/pbkdf2 for room passwords)
+- golang.org/x/term (CLI terminal input)

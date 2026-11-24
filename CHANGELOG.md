@@ -14,6 +14,7 @@
 - **Tests** — protocol unit tests and fuzzing (`wire/`); integration tests with a real server, the client library, the CLI in a pseudo-terminal and the Python connector (`tests/integration/`); GUI backend tests (`quietroom-gui/app_test.go`); attack tests with hostile clients (`tests/attack/`): missing, forged and stale access keys, malformed frames, spoofed fields, hostile names, flow-control abuse, floods, reconnect races, slow readers, and a check that logs contain no member metadata. All run in CI with the race detector.
 - **Silent to strangers** — the server no longer shows its certificate (or anything else) to connections without the access file. Clients send a one-time gate token, derived from the access key and the current time, in the TLS server name; without a valid token the server closes the connection without a reply. Scanners and `openssl s_client` see a closed connection. Client clocks must be within 5 minutes of the server's.
 - **Python connector** — `on_presence` callback for members joining and leaving
+- **LLM bot limits** — one request per user at a time, at most `max_concurrent_requests` (default 2) overall, and `max_requests_per_minute` (default 6) per user; backend errors no longer reveal the backend address to users; the README warns that `base_url` receives all prompts
 - **Security policy** — `SECURITY.md`; vulnerabilities can be reported privately via GitHub's "Report a vulnerability"
 
 ### Changed
@@ -26,10 +27,13 @@
 - **CLI** — asks for the username before connecting (and again if it is taken); the prompt shows the current room; no more local echo (your messages are shown as the server delivered them); UTF-8 input
 - **Python connector** — no longer needs the `cryptography` package; file offers are declined automatically
 - **Docker image** — the final image is built `FROM scratch` and contains only the static server binary (no OS packages, no shell); the preparation stage's base image is pinned by digest
-- **Dependencies** — `golang.org/x/crypto` v0.58.0, `golang.org/x/term` v0.47.0; minimum Go version 1.26
+- **Dependencies** — `golang.org/x/crypto` removed from the server and CLI: room passwords are hashed with PBKDF2-HMAC-SHA256 (600,000 iterations, random salt) from the Go standard library instead of bcrypt, and at most two hashes run at once. Remaining dependency: `golang.org/x/term` v0.47.0 (CLI input). Minimum Go version 1.26
+- **LLM bot logging** — the log never contains message text, and contains no usernames unless `log_metadata` is enabled
+- **GUI wording** — the connect screen says "Encrypted in transit · Access key only · Messages never stored" instead of "End-to-end encrypted": the server relays messages (by design), so end-to-end was not accurate
 - **CI** — all GitHub Actions pinned to commit SHAs; workflow inputs passed via environment variables; checkouts no longer persist credentials; releases are published with the GitHub CLI instead of a third-party action; Wails CLI pinned to v2.13.0; `npm ci` instead of `npm install`; `go mod download` + `go mod verify` instead of `go mod tidy` during builds
 
 ### Fixed
+- **Room passwords longer than 72 bytes** — bcrypt rejected them ("Error creating room password"); the full 256 bytes now work
 - **File transfers** — `/decline` by a member who is not the recipient no longer cancels the transfer
 - **Stream desynchronisation** — padding without a length field could swallow or leave behind bytes (for example when a decoy arrived within 10 ms, or TLS split a packet), corrupting every following message
 
