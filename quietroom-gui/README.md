@@ -36,9 +36,9 @@ Available for macOS, Windows, and Linux.
 - Dark theme with cyan accent
 - Sidebar channel navigation — lobby, joined rooms, and DM threads
 - Autocomplete suggestions in the Join Room and New DM dialogs, populated from the live server data when the dialog opens
-- Sound notifications for new messages and file transfer requests
+- Desktop notifications with sound for new messages, DMs and file transfers, sent as QuietRoom itself; clicking one brings QuietRoom forward and opens that conversation. They say who wrote, never what (the operating system keeps a notification history). On macOS, QuietRoom asks for permission the first time
 - Server profiles — save multiple server configurations and switch between them from the login screen
-- Settings panel — configure decoy traffic, sound notifications, download directory, and server profiles
+- Settings panel — configure decoy traffic, desktop notifications, download directory, and server profiles
 
 ---
 
@@ -108,7 +108,7 @@ Open settings via the **⚙** button on the login screen or the settings button 
 | Decoy traffic | Sends random encrypted padding packets to the server at regular intervals to obscure traffic patterns. Enabled by default. |
 | Decoy interval | How often (in seconds) decoy packets are sent. |
 | Decoy min/max bytes | Size range for decoy payloads. |
-| Sound notifications | Plays a system notification sound when a message or file transfer request arrives. |
+| Desktop notifications (with sound) | Shows a notification with sound when a message, DM or file transfer arrives. If the operating system does not allow notifications, the chat says why; on macOS, allow them under System Settings → Notifications → QuietRoom. |
 | Download directory | Where received files are saved. Defaults to `~/Downloads/QuietRoom`. |
 
 ---

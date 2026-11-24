@@ -380,6 +380,17 @@ export const App = {
       Chat.appendDM(data)
     })
 
+    // A desktop notification was clicked: open its conversation.
+    runtime.EventsOn('notification_clicked', data => {
+      const channel = (data && data.channel) || ''
+      if (!this.connected || !channel) return
+      if (channel.startsWith('__dm__')) {
+        Chat.openDM(channel.slice('__dm__'.length))
+      } else if (channel === '__lobby__' || Chat.channels[channel]) {
+        Chat.switchTo(channel)
+      }
+    })
+
     runtime.EventsOn('system_message', data => {
       const text = data.text || ''
 

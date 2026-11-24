@@ -13,6 +13,7 @@
 - **Hidden characters removed** — bidi controls (which can disguise `invoice‮gpj.exe` as `invoiceexe.jpg`) and zero-width characters are removed from chat text, DMs and file names by the server, and again by the clients. File names also lose all other Unicode format characters and C1 controls; emoji joiners are kept in text.
 
 ### Fixed
+- **GUI notifications on macOS** — notifications came from Script Editor (its icon, and a click opened Script Editor), because they were sent through AppleScript. They now use the system's notification service through Wails, as QuietRoom itself: QuietRoom's icon, and a click brings QuietRoom forward and opens the conversation. macOS asks for permission once. The app's bundle identifier is now `com.darkfiber-lab.quietroom` (was `com.wails.QuietRoom`). Notifications name the sender (and room), never message text or file names.
 - **Server documentation** — `SERVER_README.MD` showed outdated build commands (`chat_server` from `server.go`); it now explains downloading and verifying a release or building `quietroom_server.go`, and the systemd example uses the right names
 - **GUI sources** — `frontend/wailsjs/go/models.ts` has its license header again; a Wails post-build hook restores it after every build, and a test fails if it is missing. The Wails runtime bindings in the repository match Wails v2.13.0 again (the 3.0.0 release commit had reverted them; release binaries were not affected, as builds regenerate them)
 
