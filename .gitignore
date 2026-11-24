@@ -20,3 +20,8 @@ quietroom_access.pem
 .quietroom_access.pem.tmp-*
 # Frontend dependencies
 quietroom-gui/frontend/node_modules/
+# Generated frontend build (vite) and Wails bookkeeping - never commit.
+# dist/.gitkeep stays so the GUI's //go:embed compiles on a fresh clone.
+quietroom-gui/frontend/dist/*
+!quietroom-gui/frontend/dist/.gitkeep
+quietroom-gui/frontend/package.json.md5
