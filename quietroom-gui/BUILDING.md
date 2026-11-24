@@ -131,6 +131,8 @@ Or using the build script:
 
 The application window opens automatically. The Wails dev server also serves the frontend at `http://localhost:34115` which you can open in a browser for debugging, though some Go bindings won't be available outside the native window.
 
+> **License header:** Wails regenerates `frontend/wailsjs/go/models.ts` without its license header. `wails build` restores it through a post-build hook (`wails.json` → `scripts/licenseheader.mjs`); `wails dev` runs no hooks, so afterwards run `node scripts/licenseheader.mjs` before committing. `go test` in `quietroom-gui` fails if the header is missing.
+
 ### Opening dev tools
 
 Right-click anywhere in the app window and select **Inspect** to open the browser dev tools, or add this to `main.go` in the `options.App` struct to open them automatically on launch:

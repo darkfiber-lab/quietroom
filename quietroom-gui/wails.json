@@ -8,5 +8,8 @@
   "frontend:dev:serverUrl": "auto",
   "author": {
     "name": "darkfiber-lab"
+  },
+  "postBuildHooks": {
+    "*/*": "node ../../scripts/licenseheader.mjs"
   }
 }

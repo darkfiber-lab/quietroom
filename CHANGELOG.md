@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **LLM bot** — `ollama.think` setting for reasoning models: `false` (default, as before) answers directly, `true` lets the model reason first, `null` uses the model's default
+
+### Fixed
+- **GUI sources** — `frontend/wailsjs/go/models.ts` has its license header again; a Wails post-build hook restores it after every build, and a test fails if it is missing. The Wails runtime bindings in the repository match Wails v2.13.0 again (the 3.0.0 release commit had reverted them; release binaries were not affected, as builds regenerate them)
+
+---
+
 ## [3.0.0] - 2026-11-24
 
 ### ⚠ Breaking
