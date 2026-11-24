@@ -61,6 +61,7 @@ func main() {
 		},
 		Linux: &linux.Options{
 			ProgramName: "QuietRoom",
+			Icon:        linuxWindowIcon(),
 		},
 		Frameless:       false,
 		CSSDragProperty: "--wails-draggable",

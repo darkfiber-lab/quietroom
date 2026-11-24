@@ -18,44 +18,57 @@ import (
 	"fmt"
 	"os/exec"
 	goruntime "runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 
-	"github.com/gen2brain/beeep"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // Desktop notifications use the operating system's own notification
-// service through Wails, so they come from QuietRoom itself: its name and
-// icon, and clicking one brings QuietRoom to the front and opens the
-// conversation. On macOS this needs the bundle identifier from
-// build/darwin/Info.plist and the user's permission, which is requested
-// once. The text never includes message content or file names, only who
-// sent something (and the room), because operating systems keep
-// notifications in their own history.
+// service, so they come from QuietRoom itself (its name and icon), and
+// clicking one brings QuietRoom to the front and opens the conversation:
 //
-// Elsewhere, if the native route fails, the beeep library is the fallback.
-// On macOS it is never used: it goes through AppleScript, so notifications
-// would come from Script Editor (wrong icon, and a click opens Script
-// Editor).
+//   - macOS and Windows: Wails (UNUserNotificationCenter; Windows toast
+//     notifications), see notifications_wails.go. macOS needs the bundle
+//     identifier from build/darwin/Info.plist and asks the user once.
+//   - Linux: the freedesktop notification service on D-Bus, see
+//     notifications_linux.go and internal/linuxnotify.
+//
+// There is deliberately no fallback to scripting tools (AppleScript,
+// PowerShell, notify-send): those make the notification come from Script
+// Editor or PowerShell. If notifications cannot be shown, the chat says why
+// once; on macOS the sound still plays.
+//
+// The text never includes message content or file names, only who sent
+// something (and the room), because operating systems keep notifications in
+// their own history.
+
+// notificationBackend is the platform's notification service.
+type notificationBackend interface {
+	// authorize asks for permission if the platform needs it.
+	authorize() (bool, error)
+	// send shows a notification; channel is reported back when clicked.
+	send(id, message, channel string) error
+}
 
 type notifier struct {
-	mu          sync.Mutex
-	initialized bool // Wails notifications set up
-	allowed     bool // the user permits notifications
-	reported    bool // the user was told why notifications do not work
-	nextID      atomic.Uint64
+	mu       sync.Mutex
+	backend  notificationBackend // nil until set up (or if unavailable)
+	allowed  bool                // the user permits notifications
+	reported bool                // the user was told why notifications fail
+	nextID   atomic.Uint64
 }
 
 // setupNotifications runs once the window exists.
 func (a *App) setupNotifications() {
-	if err := runtime.InitializeNotifications(a.ctx); err != nil {
+	b, err := newNotificationBackend(a)
+	if err != nil {
 		a.notificationProblem(err)
 		return
 	}
-	runtime.OnNotificationResponse(a.ctx, a.notificationClicked)
 	a.notes.mu.Lock()
-	a.notes.initialized = true
+	a.notes.backend = b
 	a.notes.mu.Unlock()
 	if a.config.SoundEnabled {
 		go a.authorizeNotifications()
@@ -66,15 +79,12 @@ func (a *App) setupNotifications() {
 // On macOS the first call shows the system's permission prompt.
 func (a *App) authorizeNotifications() bool {
 	a.notes.mu.Lock()
-	initialized := a.notes.initialized
+	b := a.notes.backend
 	a.notes.mu.Unlock()
-	if !initialized {
+	if b == nil {
 		return false
 	}
-	ok, err := runtime.CheckNotificationAuthorization(a.ctx)
-	if err == nil && !ok {
-		ok, err = runtime.RequestNotificationAuthorization(a.ctx)
-	}
+	ok, err := b.authorize()
 	a.notes.mu.Lock()
 	a.notes.allowed = ok && err == nil
 	a.notes.mu.Unlock()
@@ -109,36 +119,34 @@ func (a *App) notify(message, channel string) {
 	}
 	go func() {
 		a.notes.mu.Lock()
-		native := a.notes.initialized && a.notes.allowed
+		b, allowed := a.notes.backend, a.notes.allowed
 		a.notes.mu.Unlock()
-		if native {
-			err := runtime.SendNotification(a.ctx, runtime.NotificationOptions{
-				ID:    fmt.Sprintf("quietroom-%d", a.notes.nextID.Add(1)),
-				Title: "QuietRoom",
-				Body:  message,
-				Data:  map[string]interface{}{"channel": channel},
-			})
+		if b != nil && allowed {
+			err := b.send(fmt.Sprintf("quietroom-%d", a.notes.nextID.Add(1)), message, channel)
 			if err == nil {
-				return // the system plays its notification sound
+				return
 			}
 			a.notificationProblem(err)
 		}
 		if goruntime.GOOS == "darwin" {
-			// No AppleScript fallback (see above): just the sound.
 			exec.Command("afplay", "/System/Library/Sounds/Ping.aiff").Run()
-			return
 		}
-		beeep.Notify("QuietRoom", message, "")
 	}()
 }
 
-// notificationClicked brings the window forward and opens the conversation.
-func (a *App) notificationClicked(result runtime.NotificationResult) {
-	if result.Error != nil {
-		return
-	}
+// openConversation brings the window forward and opens the conversation of
+// a clicked notification.
+func (a *App) openConversation(channel string) {
 	runtime.WindowUnminimise(a.ctx)
 	runtime.WindowShow(a.ctx)
-	channel, _ := result.Response.UserInfo["channel"].(string)
 	a.emit(a.ctx, "notification_clicked", map[string]interface{}{"channel": channel})
+}
+
+// isQuietRoomExe reports whether a Windows notification registration
+// belongs to a QuietRoom GUI executable: release builds
+// (quietroom_client_gui-…exe) and local builds (QuietRoom.exe,
+// quietroom_client_gui.exe). Used to clean up after older versions.
+func isQuietRoomExe(name string) bool {
+	l := strings.ToLower(name)
+	return strings.HasSuffix(l, ".exe") && (strings.HasPrefix(l, "quietroom_client_gui") || l == "quietroom.exe")
 }

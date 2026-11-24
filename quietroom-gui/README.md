@@ -108,7 +108,7 @@ Open settings via the **⚙** button on the login screen or the settings button 
 | Decoy traffic | Sends random encrypted padding packets to the server at regular intervals to obscure traffic patterns. Enabled by default. |
 | Decoy interval | How often (in seconds) decoy packets are sent. |
 | Decoy min/max bytes | Size range for decoy payloads. |
-| Desktop notifications (with sound) | Shows a notification with sound when a message, DM or file transfer arrives. If the operating system does not allow notifications, the chat says why; on macOS, allow them under System Settings → Notifications → QuietRoom. |
+| Desktop notifications (with sound) | Shows a notification when a message, DM or file transfer arrives, through the system's own notification service (macOS Notification Center, Windows notifications, the Linux desktop's notification service over D-Bus). If notifications cannot be shown, the chat says why; on macOS, allow them under System Settings → Notifications → QuietRoom. |
 | Download directory | Where received files are saved. Defaults to `~/Downloads/QuietRoom`. |
 
 ---
