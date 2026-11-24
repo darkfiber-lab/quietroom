@@ -13,6 +13,12 @@
 - **Hidden characters removed** — bidi controls (which can disguise `invoice‮gpj.exe` as `invoiceexe.jpg`) and zero-width characters are removed from chat text, DMs and file names by the server, and again by the clients. File names also lose all other Unicode format characters and C1 controls; emoji joiners are kept in text.
 
 ### Fixed
+- **GUI notifications** — they were sent through scripting tools and came from the wrong application: Script Editor on macOS (a click opened Script Editor), Windows PowerShell on Windows (a PowerShell script was written to the temporary folder and run for every notification), and an unnamed sender without icon on Linux. They now use each system's notification service and come from QuietRoom, with its icon; a click brings QuietRoom forward and opens the conversation.
+  - macOS: Wails (`UNUserNotificationCenter`); permission is asked once; bundle identifier `com.darkfiber-lab.quietroom` (was `com.wails.QuietRoom`)
+  - Windows: Wails toast notifications, shown as "QuietRoom" rather than the executable's file name; registry entries left by older QuietRoom versions are removed
+  - Linux: the freedesktop notification service on D-Bus directly (`internal/linuxnotify`), with app name, icon and the instant-message category; the window now has QuietRoom's icon too
+  - The `beeep` library and its PowerShell, AppleScript and system-tray code are gone. If notifications cannot be shown, the chat says why once.
+  - Notifications name the sender (and room), never message text or file names.
 - **Server documentation** — `SERVER_README.MD` showed outdated build commands (`chat_server` from `server.go`); it now explains downloading and verifying a release or building `quietroom_server.go`, and the systemd example uses the right names
 - **GUI sources** — `frontend/wailsjs/go/models.ts` has its license header again; a Wails post-build hook restores it after every build, and a test fails if it is missing. The Wails runtime bindings in the repository match Wails v2.13.0 again (the 3.0.0 release commit had reverted them; release binaries were not affected, as builds regenerate them)
 
