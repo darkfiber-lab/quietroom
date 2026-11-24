@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [3.1.0] - 2026-11-24
+
+Compatible with 3.0 servers and clients (protocol 3). Update the server first: from 3.1 on, usernames with spaces are refused and names are unique regardless of case (see Changed).
 
 ### Added
 - **CLI line mode** — without an interactive terminal (Plan 9, which has no raw mode, or with input or output redirected) the CLI reads plain lines and prints messages as they arrive instead of failing with "Failed to set raw terminal mode"; colours are off there and whenever `NO_COLOR` is set
