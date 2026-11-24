@@ -29,9 +29,9 @@
 #     --log-opt max-size=10m --log-opt max-file=3 \
 #     quietroom-server
 #
-# Podman: see deploy/quietroom-server.container (a systemd Quadlet unit with a
-# private user namespace), and deploy/quietroom-guard.nft, which blocks every
-# outbound connection the server could try to open. SERVER_README.MD,
+# Podman: see deploy/quietroom-server.container (a rootless systemd Quadlet
+# unit; deploy/rootful/ for cgroup v1 hosts), and deploy/quietroom-guard.nft,
+# which blocks every outbound connection the server could try to open. SERVER_README.MD,
 # "Running in a container", explains both.
 #
 # The server runs as uid/gid 65532, which belongs to no account on common

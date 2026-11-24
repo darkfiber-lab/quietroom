@@ -1,36 +1,47 @@
 # Copyright (C) 2026 darkfiber-lab
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# QuietRoom server as a systemd service with rootful Podman (Quadlet).
-# Install:
-#   podman build -f DOCKERFILE -t quietroom-server .   (in a folder with the
-#                                                       release's quietroom_server)
-#   cp deploy/quietroom-server.container /etc/containers/systemd/
-#   systemctl daemon-reload && systemctl start quietroom-server
-# The service starts at boot. Logs: journalctl -u quietroom-server
-# (podman logs -f also works if Podman logs its events to journald, e.g. in
-# /etc/containers/containers.conf.d/50-events-journald.conf:
-#   [engine]
-#   events_logger = "journald"
-# Some distributions default to "file", and podman logs -f then refuses.)
-# Access file: the volume's directory (podman volume inspect quietroom-data).
+# QuietRoom server as a systemd service with ROOTLESS Podman (Quadlet), run by
+# an unprivileged system user. Needs cgroup v2 (Enterprise Linux 9, current
+# Debian/Ubuntu/Fedora); on cgroup v1 hosts use deploy/rootful/.
+#
+# Install (as root):
+#   useradd --system --create-home --home-dir /var/lib/quietroom \
+#           --shell /sbin/nologin quietroom
+#   echo "quietroom:200001:65536" >> /etc/subuid
+#   echo "quietroom:200001:65536" >> /etc/subgid
+#   loginctl enable-linger quietroom          # start its services at boot
+#   # build the image as that user (folder with DOCKERFILE + quietroom_server,
+#   # readable by quietroom), then install this unit:
+#   cd /tmp && sudo -u quietroom XDG_RUNTIME_DIR=/run/user/$(id -u quietroom) \
+#       podman build -f /var/lib/quietroom/build/DOCKERFILE \
+#       -t localhost/quietroom-server /var/lib/quietroom/build
+#   install -d -o quietroom -g quietroom /var/lib/quietroom/.config/containers/systemd
+#   install -o quietroom -g quietroom -m 0640 deploy/quietroom-server.container \
+#       /var/lib/quietroom/.config/containers/systemd/
+#   systemctl --user -M quietroom@ daemon-reload
+#   systemctl --user -M quietroom@ start quietroom-server
+# Manage: systemctl --user -M quietroom@ status quietroom-server
+# Logs:   journalctl _SYSTEMD_USER_UNIT=quietroom-server.service -f
+# Access file: /var/lib/quietroom/.local/share/containers/storage/volumes/quietroom-data/_data/
 #
 # Isolation:
-# - Private user namespace with a fixed mapping: the server's uid/gid 65532
-#   is host uid/gid 265532, which belongs to no account and has no rights
-#   outside its own data volume.
+# - Nothing runs as root: Podman and conmon run as "quietroom" (no shell, no
+#   sudo); the server runs as container uid/gid 65532, which with the
+#   subordinate ids above is host uid/gid 265532, an id with no account.
 # - Read-only image, no capabilities, no privilege escalation, memory and
-#   process limits.
+#   process limits (cgroup v2 delegates memory and pids to user services).
 # - Host network: the server only answers on port 37842 (open it in the host
 #   firewall); there is no NAT that a firewall reload could remove. Pair it
 #   with deploy/quietroom-guard.nft, which blocks every outbound connection
-#   from uid 265532. If you prefer a bridge network, replace Network=host with
-#   PublishPort=37842:37842.
-# Needs a cgroup v2 host for rootless use; as written (rootful) it also works
-# on cgroup v1 hosts such as Enterprise Linux 8.
+#   from uid 265532 and keeps "quietroom" away from cloud metadata services.
+# podman logs -f needs Podman events in journald, e.g. in
+# /etc/containers/containers.conf.d/50-events-journald.conf:
+#   [engine]
+#   events_logger = "journald"
 
 [Unit]
-Description=QuietRoom server
+Description=QuietRoom server (rootless)
 After=network-online.target
 Wants=network-online.target
 
@@ -39,8 +50,6 @@ Image=localhost/quietroom-server
 ContainerName=quietroom-server
 User=65532
 Group=65532
-UIDMap=0:200000:65536
-GIDMap=0:200000:65536
 Network=host
 # :U gives the volume to the container user, also after an upgrade from an
 # image that ran as uid 1000.
@@ -56,4 +65,4 @@ Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target default.target
+WantedBy=default.target

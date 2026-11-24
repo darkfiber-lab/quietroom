@@ -1,0 +1,63 @@
+# Copyright (C) 2026 darkfiber-lab
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# QuietRoom server as a systemd service with ROOTFUL Podman (Quadlet).
+# Prefer the rootless unit in deploy/quietroom-server.container. Use this one
+# only on hosts where rootless Podman cannot apply resource limits (cgroup v1,
+# e.g. Enterprise Linux 8).
+# Install:
+#   podman build -f DOCKERFILE -t quietroom-server .   (in a folder with the
+#                                                       release's quietroom_server)
+#   cp deploy/quietroom-server.container /etc/containers/systemd/
+#   systemctl daemon-reload && systemctl start quietroom-server
+# The service starts at boot. Logs: journalctl -u quietroom-server
+# (podman logs -f also works if Podman logs its events to journald, e.g. in
+# /etc/containers/containers.conf.d/50-events-journald.conf:
+#   [engine]
+#   events_logger = "journald"
+# Some distributions default to "file", and podman logs -f then refuses.)
+# Access file: the volume's directory (podman volume inspect quietroom-data).
+#
+# Isolation:
+# - Private user namespace with a fixed mapping: the server's uid/gid 65532
+#   is host uid/gid 265532, which belongs to no account and has no rights
+#   outside its own data volume.
+# - Read-only image, no capabilities, no privilege escalation, memory and
+#   process limits.
+# - Host network: the server only answers on port 37842 (open it in the host
+#   firewall); there is no NAT that a firewall reload could remove. Pair it
+#   with deploy/quietroom-guard.nft, which blocks every outbound connection
+#   from uid 265532. If you prefer a bridge network, replace Network=host with
+#   PublishPort=37842:37842.
+# The uid of the server on the host is 265532 here too, so
+# deploy/quietroom-guard.nft works unchanged (its rules for the "quietroom"
+# service user then simply match nothing).
+
+[Unit]
+Description=QuietRoom server
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/quietroom-server
+ContainerName=quietroom-server
+User=65532
+Group=65532
+UIDMap=0:200000:65536
+GIDMap=0:200000:65536
+Network=host
+# :U gives the volume to the container user, also after an upgrade from an
+# image that ran as uid 1000.
+Volume=quietroom-data:/app:U
+DropCapability=all
+NoNewPrivileges=true
+ReadOnly=true
+LogDriver=journald
+PodmanArgs=--memory=512m --memory-swap=1g --pids-limit=256
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target default.target
