@@ -74,6 +74,10 @@ class OllamaConfig:
     base_url: str = "http://localhost:11434"
     model: str = "llama3"
     timeout: int = 600
+    # Reasoning ("thinking") models: false answers directly (faster, no
+    # reasoning text), true lets the model think first, null leaves the
+    # model's default. Ignored by models without a thinking mode.
+    think: Optional[bool] = False
 
 
 @dataclass
@@ -137,6 +141,12 @@ class BotConfig:
         )
 
 
+def _think_setting(value) -> Optional[bool]:
+    if value is None or isinstance(value, bool):
+        return value
+    raise ValueError(f'ollama.think must be true, false or null, not {value!r}')
+
+
 def load_config(path: str = "bot_config.json") -> BotConfig:
     if not os.path.exists(path):
         cfg = BotConfig()
@@ -154,6 +164,7 @@ def load_config(path: str = "bot_config.json") -> BotConfig:
                 "base_url": cfg.ollama.base_url,
                 "model": cfg.ollama.model,
                 "timeout": cfg.ollama.timeout,
+                "think": cfg.ollama.think,
             },
             "openai": {
                 "base_url": cfg.openai.base_url,
@@ -202,6 +213,7 @@ def load_config(path: str = "bot_config.json") -> BotConfig:
             base_url=o.get("base_url", "http://localhost:11434"),
             model=o.get("model", "llama3"),
             timeout=o.get("timeout", 600),
+            think=_think_setting(o.get("think", False)),
         )
     if "openai" in d:
         o = d["openai"]
@@ -268,10 +280,13 @@ class OllamaBackend(LLMBackend):
 
     def generate(self, messages: list[dict]) -> str:
         url = f"{self._cfg.base_url.rstrip('/')}/api/chat"
+        body = {"model": self._cfg.model, "messages": messages, "stream": False}
+        if self._cfg.think is not None:
+            body["think"] = self._cfg.think
         try:
             resp = self._requests.post(
                 url,
-                json={"model": self._cfg.model, "messages": messages, "stream": False, "think": False},
+                json=body,
                 timeout=self._cfg.timeout,
             )
             resp.raise_for_status()

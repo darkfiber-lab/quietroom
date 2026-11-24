@@ -45,7 +45,8 @@ The bot exits after writing the config. Edit before running again.
   "ollama": {
     "base_url": "http://localhost:11434",
     "model": "llama3",
-    "timeout": 120
+    "timeout": 120,
+    "think": false
   },
   "openai": {
     "base_url": "http://localhost:8080/v1",
@@ -81,6 +82,7 @@ Key fields:
 | `max_concurrent_requests` | LLM requests running at once, all users together (default 2); further requests are refused with "busy" |
 | `max_requests_per_minute` | Messages accepted per user per minute, commands included (default 6); the user is told once, further messages are ignored |
 | `log_metadata` | `false` (default): the log contains no usernames. Message text is never logged |
+| `ollama.think` | For reasoning ("thinking") models: `false` (default) answers directly, which is faster and keeps reasoning text out of replies; `true` lets the model reason first; `null` uses the model's default. Models without a thinking mode ignore it |
 | `ollama.base_url` / `openai.base_url` | Where prompts are sent. ⚠️ **Keep this on the same machine or your own network**: every message members send to the bot, plus their conversation history, goes to this URL. A hosted API means chat content leaves your infrastructure |
 
 ### 4. Start your LLM server
