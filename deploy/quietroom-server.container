@@ -8,6 +8,11 @@
 #   cp deploy/quietroom-server.container /etc/containers/systemd/
 #   systemctl daemon-reload && systemctl start quietroom-server
 # The service starts at boot. Logs: journalctl -u quietroom-server
+# (podman logs -f also works if Podman logs its events to journald, e.g. in
+# /etc/containers/containers.conf.d/50-events-journald.conf:
+#   [engine]
+#   events_logger = "journald"
+# Some distributions default to "file", and podman logs -f then refuses.)
 # Access file: the volume's directory (podman volume inspect quietroom-data).
 #
 # Isolation:
