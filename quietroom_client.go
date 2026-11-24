@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/darkfiber-lab/quietroom/client"
+	"github.com/darkfiber-lab/quietroom/lineedit"
 	"github.com/darkfiber-lab/quietroom/wire"
 	"golang.org/x/term"
 )
@@ -82,23 +83,33 @@ var colors = map[string]string{
 
 const legacyAccessFile = "chat_public.pem"
 
-// UI is the terminal front end. All output goes through print, which keeps
-// the input line intact.
+// UI is the terminal front end. All output after login goes through the
+// line editor, which keeps what the user is typing intact below it.
+//
+// Without an interactive terminal (Plan 9, where raw mode is unavailable, or
+// when input or output is redirected) the CLI runs in line mode instead:
+// lines are read as typed and output is printed as it arrives, without
+// line editing or colours.
 type UI struct {
 	config ClientConfig
 	c      *client.Client
 
-	outMu       sync.Mutex
-	input       string
-	prompt      string
-	rawMode     bool
-	progressing bool // a progress line is on screen
+	lineMode bool // no line editor: read whole lines, print plainly
+	noColor  bool
+
+	outMu  sync.Mutex
+	ed     *lineedit.Editor
+	ready  bool     // the input line is on screen (or line mode started)
+	queued []string // output that arrived before the input line was drawn
 
 	roomMu      sync.Mutex
 	currentRoom string
 }
 
 func (u *UI) colorize(color, text string) string {
+	if u.noColor {
+		return text
+	}
 	if code, ok := colors[color]; ok {
 		return code + text + colors["reset"]
 	}
@@ -117,51 +128,87 @@ func sanitizeText(s string) string {
 	}, wire.CleanText(s))
 }
 
-func (u *UI) eol() string {
-	if u.rawMode {
-		return "\r\n"
+// terminalWidth reports the width of the terminal (80 if unknown).
+func terminalWidth() int {
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		return w
 	}
-	return "\n"
+	return 80
 }
 
-// print writes lines above the input line and redraws it.
-func (u *UI) print(color string, text string) {
+// output shows lines above the input line.
+func (u *UI) output(lines []string) {
 	u.outMu.Lock()
 	defer u.outMu.Unlock()
-	fmt.Print("\r\033[K")
-	u.progressing = false
-	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
-		fmt.Print(u.colorize(color, sanitizeText(line)) + u.eol())
+	if !u.ready {
+		u.queued = append(u.queued, lines...)
+		return
 	}
-	u.redraw()
+	if u.lineMode {
+		for _, l := range lines {
+			fmt.Println(l)
+		}
+		return
+	}
+	u.ed.Print(strings.Join(lines, "\n"))
+}
+
+// print shows text (one or more lines) in one colour.
+func (u *UI) print(color string, text string) {
+	var lines []string
+	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		lines = append(lines, u.colorize(color, sanitizeText(line)))
+	}
+	u.output(lines)
 }
 
 // printChat renders one chat line with timestamp and name colors.
 func (u *UI) printChat(ts, prefix, name, text string) {
-	u.outMu.Lock()
-	defer u.outMu.Unlock()
-	fmt.Print("\r\033[K")
-	u.progressing = false
 	t := u.config.Theme
 	line := u.colorize(t.TimestampColor, "["+sanitizeText(ts)+"]") + " "
 	if prefix != "" {
 		line += u.colorize(t.SystemColor, sanitizeText(prefix)) + " "
 	}
-	line += u.colorize(t.UsernameColor, sanitizeText(name)) + ": " + u.colorize(t.MessageColor, sanitizeText(text))
-	fmt.Print(line + u.eol())
-	u.redraw()
+	// Multi-line messages keep their line breaks, indented under the name.
+	parts := strings.Split(text, "\n")
+	line += u.colorize(t.UsernameColor, sanitizeText(name)) + ": " + u.colorize(t.MessageColor, sanitizeText(parts[0]))
+	lines := []string{line}
+	for _, p := range parts[1:] {
+		lines = append(lines, "    "+u.colorize(t.MessageColor, sanitizeText(p)))
+	}
+	u.output(lines)
 }
 
-// progress shows a single updating progress line.
+// progress shows a transfer's progress on the status line above the input;
+// an empty text removes it.
 func (u *UI) progress(text string) {
 	u.outMu.Lock()
 	defer u.outMu.Unlock()
-	fmt.Print("\r\033[K" + u.colorize(u.config.Theme.SystemColor, sanitizeText(text)))
-	u.progressing = true
+	if u.ready && !u.lineMode { // line mode: only the final result is shown
+		if text != "" {
+			text = u.colorize(u.config.Theme.SystemColor, sanitizeText(text))
+		}
+		u.ed.SetStatus(text)
+	}
 }
 
-func (u *UI) redraw() {
-	fmt.Print("\r\033[K" + u.colorize(u.config.Theme.SystemColor, u.prompt) + u.input)
+// start draws the input line and shows output that arrived before it.
+func (u *UI) start() {
+	u.outMu.Lock()
+	defer u.outMu.Unlock()
+	u.ready = true
+	if u.lineMode {
+		for _, l := range u.queued {
+			fmt.Println(l)
+		}
+		u.queued = nil
+		return
+	}
+	u.ed.Start()
+	if len(u.queued) > 0 {
+		u.ed.Print(strings.Join(u.queued, "\n"))
+		u.queued = nil
+	}
 }
 
 func (u *UI) notify() {
@@ -196,12 +243,12 @@ func (u *UI) setRoom(r string) {
 	u.roomMu.Lock()
 	u.currentRoom = r
 	u.roomMu.Unlock()
-	u.outMu.Lock()
-	if r == "" {
-		u.prompt = "> "
-	} else {
-		u.prompt = r + " > "
+	prompt := "> "
+	if r != "" {
+		prompt = r + " > "
 	}
+	u.outMu.Lock()
+	u.ed.SetPrompt(u.colorize(u.config.Theme.SystemColor, prompt))
 	u.outMu.Unlock()
 }
 
@@ -297,6 +344,7 @@ func (u *UI) onEvent(e client.Event) {
 		u.progress(fmt.Sprintf("%s %s: %.1f%% (%s of %s)", verb, t.Name, pct, formatBytes(t.Done), formatBytes(t.Size)))
 	case client.EvFileComplete:
 		t := e.Transfer
+		u.progress("")
 		if t.Outgoing {
 			u.print(th.SystemColor, fmt.Sprintf("✓ File sent: %s (%s)\n✓ Recipient should verify hash: %s", t.Name, formatBytes(t.Size), t.SHA256))
 			return
@@ -305,6 +353,7 @@ func (u *UI) onEvent(e client.Event) {
 		u.notify()
 		u.print(th.SystemColor, fmt.Sprintf("✓ File received: %s (%s)\n  Saved to: %s\n  SHA-256: %s\n✓ Hash verification PASSED - file integrity verified!", t.Name, formatBytes(t.Size), t.Path, t.ActualSHA256))
 	case client.EvFileFailed:
+		u.progress("")
 		name := "file"
 		if e.Transfer != nil {
 			name = e.Transfer.Name
@@ -350,7 +399,10 @@ func loadConfig() ClientConfig {
 	return config
 }
 
-func clearScreen() {
+func (u *UI) clearScreen() {
+	if u.lineMode || runtime.GOOS == "plan9" {
+		return
+	}
 	cmd := exec.Command("clear")
 	if runtime.GOOS == "windows" {
 		cmd = exec.Command("cmd", "/c", "cls")
@@ -361,14 +413,20 @@ func clearScreen() {
 
 func main() {
 	config := loadConfig()
-	u := &UI{config: config, prompt: "> "}
+	u := &UI{config: config}
+	u.lineMode = !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd()))
+	// Colours only on terminals that understand ANSI sequences
+	// (NO_COLOR: https://no-color.org).
+	u.noColor = os.Getenv("NO_COLOR") != "" || runtime.GOOS == "plan9" || !term.IsTerminal(int(os.Stdout.Fd()))
+	u.ed = lineedit.New(os.Stdout, terminalWidth)
+	u.ed.SetPrompt(u.colorize(config.Theme.SystemColor, "> "))
 	th := config.Theme
 	fail := func(msg string) {
 		fmt.Println(u.colorize(th.ErrorColor, "✗ "+msg))
 		os.Exit(1)
 	}
 
-	clearScreen()
+	u.clearScreen()
 
 	if _, err := os.Stat(client.AccessFileName); os.IsNotExist(err) {
 		if _, err := os.Stat(legacyAccessFile); err == nil {
@@ -442,7 +500,7 @@ func main() {
 	}
 	u.c = c
 
-	clearScreen()
+	u.clearScreen()
 	sep := u.colorize("gray", strings.Repeat("━", 78))
 	fmt.Println(sep)
 	fmt.Println(u.colorize(th.SystemColor, "                         WELCOME TO QUIETROOM"))
@@ -456,21 +514,34 @@ func main() {
 	fmt.Println(u.colorize(th.SystemColor, "✓ Press Ctrl+C or type /quit to disconnect"))
 	fmt.Println()
 
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		fail("Failed to set raw terminal mode: " + err.Error())
+	restore := func() {}
+	if !u.lineMode {
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			// For example on Plan 9: fall back to plain line input.
+			u.lineMode = true
+			fmt.Println(u.colorize(th.SystemColor, "✓ Line editing unavailable here ("+err.Error()+"): using plain line input"))
+		} else {
+			lineedit.EnableTerminalOutput(os.Stdout) // escape sequences on Windows consoles
+			restore = func() { term.Restore(int(os.Stdin.Fd()), oldState) }
+		}
 	}
-	restore := func() { term.Restore(int(os.Stdin.Fd()), oldState) }
-	u.outMu.Lock()
-	u.rawMode = true
-	u.redraw()
-	u.outMu.Unlock()
+	u.start()
 
+	// finish removes the input line before leaving raw mode.
+	finish := func() {
+		u.outMu.Lock()
+		if u.ready && !u.lineMode {
+			u.ed.Clear()
+			u.ready = false
+		}
+		u.outMu.Unlock()
+		restore()
+	}
 	var quitting sync.Once
 	quit := func(code int) {
 		quitting.Do(func() {})
-		restore()
-		fmt.Println()
+		finish()
 		c.Close()
 		fmt.Println(u.colorize("gray", strings.Repeat("━", 78)))
 		fmt.Println(u.colorize(th.SystemColor, "Disconnected from server"))
@@ -490,53 +561,23 @@ func main() {
 		if stopped {
 			return // the user quit: quit() exits
 		}
-		restore()
-		fmt.Println()
+		finish()
 		os.Exit(1)
 	}()
 
 	lines := make(chan string)
-	go func() {
-		buf := make([]byte, 64)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if err != nil || n == 0 {
-				close(lines)
-				return
+	if u.lineMode {
+		// The same scanner as for the login prompts: it may already hold
+		// input that was read ahead.
+		go func() {
+			for scanner.Scan() {
+				lines <- scanner.Text()
 			}
-			for _, b := range buf[:n] {
-				u.outMu.Lock()
-				switch {
-				case b == 13 || b == 10: // Enter
-					text := u.input
-					u.input = ""
-					fmt.Print("\r\033[K")
-					u.redraw()
-					u.outMu.Unlock()
-					if strings.TrimSpace(text) != "" {
-						lines <- text
-					}
-					continue
-				case b == 127 || b == 8: // Backspace (UTF-8 aware)
-					r := []rune(u.input)
-					if len(r) > 0 {
-						u.input = string(r[:len(r)-1])
-					}
-					u.redraw()
-				case b == 3: // Ctrl+C
-					u.outMu.Unlock()
-					quit(0)
-				case b == 21: // Ctrl+U: clear line
-					u.input = ""
-					u.redraw()
-				case b >= 32 && b != 127: // printable, including UTF-8 bytes
-					u.input += string([]byte{b})
-					fmt.Print(string([]byte{b}))
-				}
-				u.outMu.Unlock()
-			}
-		}
-	}()
+			close(lines)
+		}()
+	} else {
+		go u.readKeys(lines, quit)
+	}
 
 	for text := range lines {
 		text = strings.TrimSpace(text)
@@ -557,4 +598,29 @@ func main() {
 		}
 	}
 	quit(0)
+}
+
+// readKeys feeds keystrokes to the line editor and passes on entered lines.
+func (u *UI) readKeys(lines chan<- string, quit func(int)) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil || n == 0 {
+			close(lines)
+			return
+		}
+		u.outMu.Lock()
+		events := u.ed.Feed(buf[:n])
+		u.outMu.Unlock()
+		for _, ev := range events {
+			switch ev.Kind {
+			case lineedit.Interrupt:
+				quit(0)
+			case lineedit.Line:
+				if strings.TrimSpace(ev.Text) != "" {
+					lines <- ev.Text
+				}
+			}
+		}
+	}
 }

@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- **CLI line mode** — without an interactive terminal (Plan 9, which has no raw mode, or with input or output redirected) the CLI reads plain lines and prints messages as they arrive instead of failing with "Failed to set raw terminal mode"; colours are off there and whenever `NO_COLOR` is set
+- **CLI line editing** — cursor movement by character and word, Home/End, Delete, Ctrl+W/U/K, history of sent lines with ↑/↓, Ctrl+L to redraw; on Windows the classic console gets escape-sequence support enabled
 - **LLM bot** — `ollama.think` setting for reasoning models: `false` (default, as before) answers directly, `true` lets the model reason first, `null` uses the model's default
 
 ### ⚠ Changed
@@ -13,6 +15,7 @@
 - **Hidden characters removed** — bidi controls (which can disguise `invoice‮gpj.exe` as `invoiceexe.jpg`) and zero-width characters are removed from chat text, DMs and file names by the server, and again by the clients. File names also lose all other Unicode format characters and C1 controls; emoji joiners are kept in text.
 
 ### Fixed
+- **CLI input line** — editing a line long enough to wrap (for example with Backspace) printed the whole message again, and messages arriving while such a line was being typed left copies of it behind. The CLI now has a proper line editor (`lineedit/`) that tracks how many rows the input occupies, including wide characters and the terminal's deferred wrap at the last column. Arrow keys no longer insert `[A`, `[D` and similar text; transfer progress has its own line above the prompt instead of overwriting the input; multi-line messages keep their line breaks.
 - **GUI notifications** — they were sent through scripting tools and came from the wrong application: Script Editor on macOS (a click opened Script Editor), Windows PowerShell on Windows (a PowerShell script was written to the temporary folder and run for every notification), and an unnamed sender without icon on Linux. They now use each system's notification service and come from QuietRoom, with its icon; a click brings QuietRoom forward and opens the conversation.
   - macOS: Wails (`UNUserNotificationCenter`); permission is asked once; bundle identifier `com.darkfiber-lab.quietroom` (was `com.wails.QuietRoom`)
   - Windows: Wails toast notifications, shown as "QuietRoom" rather than the executable's file name; registry entries left by older QuietRoom versions are removed

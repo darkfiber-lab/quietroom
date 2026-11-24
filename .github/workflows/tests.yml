@@ -59,12 +59,12 @@ jobs:
 
       - name: Vet
         run: |
-          go vet ./wire/ ./client/ ./tests/...
+          go vet ./wire/ ./client/ ./lineedit/... ./tests/...
           go vet quietroom_server.go
           go vet quietroom_client.go
 
       - name: Unit tests
-        run: go test -race -count=1 ./wire/ ./client/
+        run: go test -race -count=1 ./wire/ ./client/ ./lineedit/...
 
       - name: Linux desktop notifications (GUI, against a private D-Bus)
         working-directory: quietroom-gui
