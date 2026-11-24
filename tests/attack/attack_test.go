@@ -289,6 +289,8 @@ func TestHostileUsernames(t *testing.T) {
 		"non-ascii":        "ädmin",
 		"ansi escape":      "\x1b[31mred",
 		"zero-width space": "ad​min",
+		"inner space":      "bob smith",
+		"bidi override":    "ad\u202enim",
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := rawSession(t, s)
@@ -303,10 +305,12 @@ func TestHostileUsernames(t *testing.T) {
 	t.Run("duplicate", func(t *testing.T) {
 		name := uniqueName("taken")
 		rawLogin(t, s, name)
-		r := rawSession(t, s)
-		r.send(wire.Msg{T: wire.THello, V: wire.Version, User: name})
-		if m := r.next(10 * time.Second); m.T != wire.TError || m.Code != wire.CodeUsernameTaken {
-			t.Fatalf("got %+v", m)
+		for _, variant := range []string{name, strings.ToUpper(name)} {
+			r := rawSession(t, s)
+			r.send(wire.Msg{T: wire.THello, V: wire.Version, User: variant})
+			if m := r.next(10 * time.Second); m.T != wire.TError || m.Code != wire.CodeUsernameTaken {
+				t.Fatalf("%s: got %+v", variant, m)
+			}
 		}
 	})
 	healthy(t, s)
@@ -401,6 +405,35 @@ func dataFrame(id [wire.IDLen]byte, n int) []byte {
 
 func cancelled(reason string) func(wire.Msg) bool {
 	return func(m wire.Msg) bool { return m.T == wire.TFileCancel && strings.Contains(m.Text, reason) }
+}
+
+// TestHashMismatchDiscarded: a sender whose data does not match the hash it
+// announced gets nothing into the recipient's download folder, not even
+// under a temporary name.
+func TestHashMismatchDiscarded(t *testing.T) {
+	s := start(t, testserver.Config{})
+	mallory := rawLogin(t, s, uniqueName("mallory"))
+	bob := s.Join(t, uniqueName("bob"))
+
+	mallory.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: bob.Name, Name: "setup.exe", Size: 1000, SHA256: sha})
+	o := bob.Wait("offer", 15*time.Second, func(e client.Event) bool { return e.Kind == client.EvFileOffer })
+	bob.C.AcceptFile(o.Transfer.ID)
+	accept := mallory.waitFor("accept", func(m wire.Msg) bool { return m.T == wire.TFileAccept })
+	id, _ := wire.ParseID(accept.ID)
+	mallory.write(dataFrame(id, 1000)) // zeros: not the announced hash
+	mallory.send(wire.Msg{T: wire.TFileEnd, ID: accept.ID})
+
+	e := bob.Wait("result", 15*time.Second, func(e client.Event) bool {
+		return e.Kind == client.EvFileComplete || e.Kind == client.EvFileFailed
+	})
+	if e.Kind != client.EvFileFailed || !strings.Contains(e.Text, "SHA-256 mismatch, file discarded") {
+		t.Fatalf("got %v %q", e.Kind, e.Text)
+	}
+	entries, _ := os.ReadDir(bob.Dir)
+	if len(entries) != 0 {
+		t.Fatalf("download folder not empty after a hash mismatch: %v", entries)
+	}
+	healthy(t, s)
 }
 
 // TestTransferAbuse: a malicious sender or recipient can only break its own

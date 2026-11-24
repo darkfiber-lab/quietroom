@@ -370,7 +370,7 @@ type transfer struct {
 type Server struct {
 	mu        sync.Mutex // members, usernames, rooms
 	clients   map[*Client]bool
-	usernames map[string]*Client
+	usernames map[string]*Client // by wire.UsernameKey
 	rooms     map[string]*Room
 
 	tmu       sync.Mutex // transfers
@@ -797,7 +797,7 @@ func (s *Server) handleClient(conn net.Conn) {
 	username := hello.User
 	if !wire.ValidUsername(username) {
 		s.logSecurity("Invalid username from %s", s.peer(ipAddr))
-		reject(wire.CodeInvalidUsername, "Invalid username: use 1-32 letters, digits, spaces, '_', '-' or '.'")
+		reject(wire.CodeInvalidUsername, "Invalid username: "+wire.UsernameRules)
 		return
 	}
 
@@ -813,12 +813,12 @@ func (s *Server) handleClient(conn net.Conn) {
 		lastRefill: time.Now(),
 	}
 	s.mu.Lock()
-	if _, taken := s.usernames[username]; taken {
+	if _, taken := s.usernames[wire.UsernameKey(username)]; taken {
 		s.mu.Unlock()
 		reject(wire.CodeUsernameTaken, "Username already taken. Please reconnect with a different name.")
 		return
 	}
-	s.usernames[username] = c
+	s.usernames[wire.UsernameKey(username)] = c
 	s.clients[c] = true
 	joined = c
 	s.to(c, wire.Msg{T: wire.TWelcome, User: username, V: wire.Version})
@@ -929,7 +929,7 @@ func (s *Server) removeClient(c *Client) {
 		return
 	}
 	delete(s.clients, c)
-	delete(s.usernames, c.username)
+	delete(s.usernames, wire.UsernameKey(c.username))
 	for name := range c.rooms {
 		if r := s.rooms[name]; r != nil {
 			delete(r.members, c)
@@ -987,8 +987,9 @@ func (s *Server) sendDecoys(c *Client) {
 
 // ── Chat ───────────────────────────────────────────────────────────
 
+// cleanText removes control and hidden characters (see wire.CleanText).
 func cleanText(t string) (string, bool) {
-	t = strings.TrimSpace(t)
+	t = strings.TrimSpace(wire.CleanText(t))
 	return t, t != "" && len(t) <= wire.MaxTextBytes
 }
 
@@ -1025,18 +1026,18 @@ func (s *Server) handleDM(c *Client, m wire.Msg) {
 		return
 	}
 	s.mu.Lock()
-	target := s.usernames[m.To]
+	target := s.usernames[wire.UsernameKey(m.To)]
 	s.mu.Unlock()
 	if target == nil {
 		s.fail(c, fmt.Sprintf("User '%s' is not online.", m.To))
 		return
 	}
-	out := encode(wire.Msg{T: wire.TDM, From: c.username, To: m.To, Text: text, Time: now()})
+	out := encode(wire.Msg{T: wire.TDM, From: c.username, To: target.username, Text: text, Time: now()})
 	target.send(out)
 	if target != c {
 		c.send(out)
 	}
-	s.logMeta("DM: %s -> %s", c.username, m.To)
+	s.logMeta("DM: %s -> %s", c.username, target.username)
 }
 
 func (s *Server) handleJoin(c *Client, m wire.Msg) {
@@ -1165,8 +1166,8 @@ func (s *Server) handleRooms(c *Client) {
 func (s *Server) handleUsers(c *Client) {
 	s.mu.Lock()
 	names := make([]string, 0, len(s.usernames))
-	for name := range s.usernames {
-		names = append(names, name)
+	for _, u := range s.usernames {
+		names = append(names, u.username)
 	}
 	s.mu.Unlock()
 	sort.Strings(names)
@@ -1231,7 +1232,7 @@ func (s *Server) handleOffer(c *Client, m wire.Msg) {
 		return
 	}
 	s.mu.Lock()
-	target := s.usernames[m.To]
+	target := s.usernames[wire.UsernameKey(m.To)]
 	s.mu.Unlock()
 	if target == nil {
 		failRef(fmt.Sprintf("User '%s' is not online.", m.To))
@@ -1276,8 +1277,8 @@ func (s *Server) handleOffer(c *Client, m wire.Msg) {
 	s.tmu.Unlock()
 
 	s.to(target, wire.Msg{T: wire.TFileOffer, ID: t.idStr, From: c.username, Name: name, Size: t.size, SHA256: t.sha})
-	s.to(c, wire.Msg{T: wire.TFileOffered, Ref: m.Ref, ID: t.idStr, To: m.To, Name: name, Size: t.size, SHA256: t.sha})
-	s.logMeta("File transfer offered: %s -> %s (%s, %d bytes)", c.username, m.To, name, t.size)
+	s.to(c, wire.Msg{T: wire.TFileOffered, Ref: m.Ref, ID: t.idStr, To: target.username, Name: name, Size: t.size, SHA256: t.sha})
+	s.logMeta("File transfer offered: %s -> %s (%s, %d bytes)", c.username, target.username, name, t.size)
 }
 
 // lookup returns a transfer by ID. Caller holds s.tmu.

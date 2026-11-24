@@ -106,14 +106,15 @@ func (u *UI) colorize(color, text string) string {
 }
 
 // sanitizeText removes control characters (including terminal escape
-// sequences) from text received from the server.
+// sequences) and hidden characters such as bidi overrides from text
+// received from the server.
 func sanitizeText(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r < 32 || r == 127 || (r >= 0x80 && r < 0xa0) {
 			return -1
 		}
 		return r
-	}, s)
+	}, wire.CleanText(s))
 }
 
 func (u *UI) eol() string {
@@ -300,12 +301,9 @@ func (u *UI) onEvent(e client.Event) {
 			u.print(th.SystemColor, fmt.Sprintf("✓ File sent: %s (%s)\n✓ Recipient should verify hash: %s", t.Name, formatBytes(t.Size), t.SHA256))
 			return
 		}
+		// Files whose hash does not match arrive as EvFileFailed instead.
 		u.notify()
-		if t.OK {
-			u.print(th.SystemColor, fmt.Sprintf("✓ File received: %s (%s)\n  Saved to: %s\n  SHA-256: %s\n✓ Hash verification PASSED - file integrity verified!", t.Name, formatBytes(t.Size), t.Path, t.ActualSHA256))
-		} else {
-			u.print(th.ErrorColor, fmt.Sprintf("✗ Hash verification FAILED - file may be corrupted!\n  Saved to: %s\n  Expected: %s\n  Got:      %s", t.Path, t.SHA256, t.ActualSHA256))
-		}
+		u.print(th.SystemColor, fmt.Sprintf("✓ File received: %s (%s)\n  Saved to: %s\n  SHA-256: %s\n✓ Hash verification PASSED - file integrity verified!", t.Name, formatBytes(t.Size), t.Path, t.ActualSHA256))
 	case client.EvFileFailed:
 		name := "file"
 		if e.Transfer != nil {

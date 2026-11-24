@@ -165,6 +165,9 @@ func (c *Client) handleOffered(m wire.Msg) {
 		delete(c.offers, m.Ref)
 		o.mu.Lock()
 		o.id, o.idb = m.ID, idb
+		if wire.ValidUsername(m.To) {
+			o.to = m.To // the recipient's own spelling of the name
+		}
 		o.mu.Unlock()
 		c.out[m.ID] = o
 	}
@@ -464,6 +467,14 @@ func (c *Client) completeIn(id string) {
 		c.emit(Event{Kind: EvFileFailed, Transfer: t, Text: fmt.Sprintf("incomplete file (%d of %d bytes)", recv, size)})
 		return
 	}
+	if sum != want {
+		// The content differs from what the sender announced (changed while
+		// sending, or deliberately): never put it in the download folder.
+		os.Remove(part)
+		t.ActualSHA256 = sum
+		c.emit(Event{Kind: EvFileFailed, Transfer: t, Text: fmt.Sprintf("SHA-256 mismatch, file discarded (expected %s, got %s)", want, sum)})
+		return
+	}
 	final, err := uniquePath(dir, name)
 	if err == nil {
 		err = closeErr
@@ -478,7 +489,7 @@ func (c *Client) completeIn(id string) {
 	}
 	t.Path = final
 	t.ActualSHA256 = sum
-	t.OK = sum == want
+	t.OK = true
 	c.emit(Event{Kind: EvFileComplete, Transfer: t})
 }
 
