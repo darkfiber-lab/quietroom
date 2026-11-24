@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [3.0.0] - 2026-11-24
 
 ### ⚠ Breaking
 - **Protocol 3** — the wire protocol was rebuilt. 3.x servers and clients do not talk to 2.x: update the server, the CLI and GUI clients and the Python connector together. The access file format is unchanged (the server certificate now uses ECDSA P-256 instead of RSA-4096); as always, the restart issues a new `quietroom_access.pem`.
