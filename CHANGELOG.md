@@ -2,11 +2,14 @@
 
 ## [Unreleased]
 
-### Security
-- **Dependency minimums raised** past versions with known vulnerabilities reported by OpenSSF Scorecard: the LLM bot now requires `requests` 2.33.0 or newer (netrc credential leak, TLS verification bypass in sessions, path handling in zipped files); the GUI uses `golang.org/x/net` 0.63.0, `golang.org/x/crypto` 0.59.0 and a fixed `gorilla/websocket` (weak random WebSocket mask key). The Go modules come in through Wails; the `govulncheck` scan in CI reports none of the affected code as reachable from QuietRoom.
+### Added
+- **OpenSSF Best Practices badge** — QuietRoom meets the "passing" level and Baseline level 1; the badge is shown in the README. The README's contribution guidelines now state the pull-request process and that new functionality comes with tests.
 
 ### Changed
 - **No generated files in the repository** — the built GUI frontend (`quietroom-gui/frontend/dist/`, a minified bundle produced by Vite) is no longer committed; `wails build` and `wails dev` generate it. Only an empty `dist/.gitkeep` remains, so the GUI's Go code compiles on a fresh clone; the Vite config puts it back after each build. Stray `.DS_Store` files and Wails' `package.json.md5` are gone and ignored.
+
+### Security
+- **Dependency minimums raised** past versions with known vulnerabilities reported by OpenSSF Scorecard: the LLM bot now requires `requests` 2.33.0 or newer (netrc credential leak, TLS verification bypass in sessions, path handling in zipped files); the GUI uses `golang.org/x/net` 0.63.0, `golang.org/x/crypto` 0.59.0 and a fixed `gorilla/websocket` (weak random WebSocket mask key). The Go modules come in through Wails; the `govulncheck` scan in CI reports none of the affected code as reachable from QuietRoom.
 
 ---
 
