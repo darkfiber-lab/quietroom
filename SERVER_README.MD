@@ -277,16 +277,22 @@ docker run -d --name quietroom-server --restart unless-stopped \
   quietroom-server
 ```
 
-**Podman with systemd** (recommended): [`deploy/quietroom-server.container`](deploy/quietroom-server.container) is a Quadlet unit that starts the server at boot in a private user namespace (the server's uid 65532 is host uid 265532), with a read-only image, no capabilities and resource limits. It uses the host network, so no NAT rule can be lost when the firewall reloads; open port 37842 in the host firewall.
+**Rootless Podman with systemd** (recommended): [`deploy/quietroom-server.container`](deploy/quietroom-server.container) is a Quadlet unit run by an unprivileged system user, `quietroom` (no shell, no sudo), so nothing in the chain runs as root. The server's uid 65532 maps to host uid 265532, which has no account. The image is read-only, with no capabilities and with memory and process limits. It uses the host network, so no NAT rule can be lost when the firewall reloads; open port 37842 in the host firewall. It needs cgroup v2 (Enterprise Linux 9, current Debian, Ubuntu, Fedora). The file's header lists the install steps:
 
 ```bash
-cp deploy/quietroom-server.container /etc/containers/systemd/
-systemctl daemon-reload && systemctl start quietroom-server
-journalctl -u quietroom-server        # server output
-podman volume inspect quietroom-data  # where quietroom_access.pem is written
+useradd --system --create-home --home-dir /var/lib/quietroom --shell /sbin/nologin quietroom
+echo "quietroom:200001:65536" >> /etc/subuid; echo "quietroom:200001:65536" >> /etc/subgid
+loginctl enable-linger quietroom     # its services start at boot
+# build the image as quietroom, install the unit under
+# /var/lib/quietroom/.config/containers/systemd/, then:
+systemctl --user -M quietroom@ daemon-reload
+systemctl --user -M quietroom@ start quietroom-server
+journalctl _SYSTEMD_USER_UNIT=quietroom-server.service -f   # server output
 ```
 
-**Egress guard** (recommended with either): the server never opens connections, it only answers them. [`deploy/quietroom-guard.nft`](deploy/quietroom-guard.nft) blocks every outbound connection from the server's user, so a compromised server could not reach the internet, local services or a cloud metadata service. Set `quietroom_uid` in the file (265532 with the Podman unit, 65532 with Docker), then load it at boot with [`deploy/quietroom-guard.service`](deploy/quietroom-guard.service):
+On cgroup v1 hosts (for example Enterprise Linux 8), rootless Podman cannot apply the resource limits; use the rootful unit in [`deploy/rootful/`](deploy/rootful/quietroom-server.container), which keeps the same user-namespace mapping.
+
+**Egress guard** (recommended with either): the server never opens connections, it only answers them. [`deploy/quietroom-guard.nft`](deploy/quietroom-guard.nft) blocks every outbound connection from the server's user, so a compromised server could not reach the internet, local services or a cloud metadata service. With rootless Podman it also keeps the `quietroom` service user away from the metadata service while still allowing image pulls. Set `quietroom_uid` (265532 with the Podman units, 65532 with Docker) and `service_uid` (`id -u quietroom`) in the file, then load it at boot with [`deploy/quietroom-guard.service`](deploy/quietroom-guard.service):
 
 ```bash
 cp deploy/quietroom-guard.nft /etc/nftables/quietroom-guard.nft

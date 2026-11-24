@@ -4,7 +4,7 @@
 
 ### Added
 - **OpenSSF Best Practices badge** — QuietRoom meets the "passing" level and Baseline level 1; the badge is shown in the README. The README's contribution guidelines now state the pull-request process and that new functionality comes with tests.
-- **Container deployment examples** in `deploy/`: a Podman Quadlet unit (systemd service, private user namespace, host network, read-only, no capabilities, resource limits) and an nftables egress guard that blocks every outbound connection from the server's user, including to cloud metadata services. Documented in SERVER_README.MD, "Running in a container"; the DOCKERFILE comments now cover Docker and Podman.
+- **Container deployment examples** in `deploy/`: a rootless Podman Quadlet unit run by an unprivileged `quietroom` system user (nothing runs as root; private user namespace, host network, read-only, no capabilities, resource limits, started at boot), a rootful variant for cgroup v1 hosts in `deploy/rootful/`, and an nftables egress guard that blocks every outbound connection from the server's user and keeps the service user away from cloud metadata services. Documented in SERVER_README.MD, "Running in a container"; the DOCKERFILE comments now cover Docker and Podman.
 
 ### ⚠ Changed
 - **Container image runs as uid/gid 65532** instead of 1000. On most Linux hosts 1000 is the first login user, so a process escaping the container would have been that user; 65532 belongs to no account. Existing data volumes must be given to 65532 before upgrading (`chown -R 65532:65532` on the volume, or Podman's `:U` mount option); see SERVER_README.MD, "Running in a container".
