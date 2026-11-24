@@ -66,9 +66,9 @@ jobs:
       - name: Unit tests
         run: go test -race -count=1 ./wire/ ./client/
 
-      - name: Fuzz the frame reader and message decoder
+      - name: Fuzz the frame reader, message decoder, command parser and ClientHello parser
         run: |
-          for target in FuzzRead FuzzDecodeMsg FuzzParseCommand; do
+          for target in FuzzRead FuzzDecodeMsg FuzzParseCommand FuzzReadClientHello; do
             go test ./wire/ -run=NONE -fuzz="^${target}\$" -fuzztime=60s
           done
 

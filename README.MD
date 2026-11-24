@@ -73,7 +73,8 @@ For detailed setup instructions, configuration options, and troubleshooting:
 1. **TLS 1.3** - Encrypts all traffic between client and server with ephemeral keys (forward secrecy)
 2. **Certificate Pinning** - Clients accept only the exact server certificate from `quietroom_access.pem`, which prevents man-in-the-middle attacks
 3. **Access Key (mutual TLS)** - Clients must present the master access key from `quietroom_access.pem`; connections without it are refused during the TLS handshake, before any QuietRoom code runs
-4. **Fresh keys per run** - The server generates new keys on every start and keeps its private key in memory only; a restart revokes every access file
+4. **Silent to strangers** - Without a valid gate token (derived from the access key) in the first TLS message, the server closes the connection without sending anything: scanners never see its certificate
+5. **Fresh keys per run** - The server generates new keys on every start and keeps its private key in memory only; a restart revokes every access file
 
 The server decrypts and relays messages: the operator's server is trusted by design. Messages are never stored.
 

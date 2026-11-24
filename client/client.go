@@ -25,6 +25,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -135,13 +136,38 @@ type Client struct {
 	in     map[string]*incoming // transfers to us, by ID
 }
 
+// Access is a parsed access file.
+type Access struct {
+	ServerCert *x509.Certificate // pinned server certificate
+	Cert       tls.Certificate   // access certificate and private key
+	GateKey    []byte            // key for the pre-TLS gate token
+}
+
+// TLSConfig returns a client configuration that presents the access key,
+// pins the server certificate and carries a fresh gate token. Call it for
+// every connection: a token is valid once.
+func (a *Access) TLSConfig() *tls.Config {
+	pinned := a.ServerCert.Raw
+	return &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		Certificates:       []tls.Certificate{a.Cert},
+		ServerName:         wire.GateToken(a.GateKey, time.Now()),
+		InsecureSkipVerify: true, // replaced by the exact pin below
+		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
+			if len(raw) == 0 || !bytes.Equal(raw[0], pinned) {
+				return errPin
+			}
+			return nil
+		},
+	}
+}
+
 // LoadAccess parses an access file: the pinned server certificate, the
 // access certificate and its private key.
-func LoadAccess(path string) (*x509.Certificate, tls.Certificate, error) {
-	var none tls.Certificate
+func LoadAccess(path string) (*Access, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, none, fmt.Errorf("cannot read access file: %w", err)
+		return nil, fmt.Errorf("cannot read access file: %w", err)
 	}
 	var certs []*pem.Block
 	var key *pem.Block
@@ -161,17 +187,17 @@ func LoadAccess(path string) (*x509.Certificate, tls.Certificate, error) {
 		}
 	}
 	if len(certs) != 2 || key == nil {
-		return nil, none, fmt.Errorf("%s is not a valid access file (it must contain the server certificate and the access key) — get the current %s from your server administrator", path, AccessFileName)
+		return nil, fmt.Errorf("%s is not a valid access file (it must contain the server certificate and the access key) — get the current %s from your server administrator", path, AccessFileName)
 	}
 	serverCert, err := x509.ParseCertificate(certs[0].Bytes)
 	if err != nil {
-		return nil, none, fmt.Errorf("invalid server certificate in access file: %w", err)
+		return nil, fmt.Errorf("invalid server certificate in access file: %w", err)
 	}
 	pair, err := tls.X509KeyPair(pem.EncodeToMemory(certs[1]), pem.EncodeToMemory(key))
 	if err != nil {
-		return nil, none, fmt.Errorf("invalid access key: %w", err)
+		return nil, fmt.Errorf("invalid access key: %w", err)
 	}
-	return serverCert, pair, nil
+	return &Access{ServerCert: serverCert, Cert: pair, GateKey: wire.GateKey(key.Bytes)}, nil
 }
 
 var errPin = errors.New("server certificate does not match the pinned certificate")
@@ -191,6 +217,18 @@ func describe(err error) error {
 		return fmt.Errorf("the server speaks a different protocol version (QuietRoom 3 clients need a QuietRoom 3 server)")
 	}
 	return err
+}
+
+// silentClose reports whether the handshake failed because the server
+// closed the connection without a reply, which is how its gate answers an
+// unknown or outdated access file.
+func silentClose(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	msg := err.Error()
+	return errors.Is(err, io.EOF) || strings.Contains(msg, "connection reset by peer") || strings.Contains(msg, "broken pipe")
 }
 
 // LoginError is returned by Dial when the server refuses the login.
@@ -220,24 +258,17 @@ func Dial(cfg Config) (*Client, error) {
 		return nil, &LoginError{Code: wire.CodeInvalidUsername, Text: "Invalid username: use 1-32 letters, digits, spaces, '_', '-' or '.'"}
 	}
 
-	pinned, pair, err := LoadAccess(cfg.AccessFile)
+	access, err := LoadAccess(cfg.AccessFile)
 	if err != nil {
 		return nil, err
 	}
-	tlsCfg := &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		Certificates:       []tls.Certificate{pair},
-		InsecureSkipVerify: true, // replaced by the exact pin below
-		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
-			if len(raw) == 0 || !bytes.Equal(raw[0], pinned.Raw) {
-				return errPin
-			}
-			return nil
-		},
-	}
+	tlsCfg := access.TLSConfig()
 	dialer := &net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}
 	conn, err := tls.DialWithDialer(dialer, "tcp", cfg.Addr, tlsCfg)
 	if err != nil {
+		if silentClose(err) {
+			return nil, fmt.Errorf("the server closed the connection without answering — your %s is wrong or outdated (the server may have been restarted), or this computer's clock is off by more than %d minutes", AccessFileName, wire.GateSkew)
+		}
 		return nil, fmt.Errorf("TLS connection failed: %w", describe(err))
 	}
 

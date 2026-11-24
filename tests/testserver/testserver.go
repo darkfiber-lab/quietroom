@@ -75,6 +75,7 @@ type Server struct {
 	AccessFile string
 	ServerCert *x509.Certificate
 	Access     tls.Certificate
+	GateKey    []byte
 
 	cmd    *exec.Cmd
 	output *syncBuffer
@@ -150,11 +151,11 @@ func Start(t testing.TB, bin string, cfg Config) *Server {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		if _, err := os.Stat(s.AccessFile); err == nil {
-			cert, pair, err := client.LoadAccess(s.AccessFile)
+			a, err := client.LoadAccess(s.AccessFile)
 			if err != nil {
 				t.Fatalf("access file: %v", err)
 			}
-			s.ServerCert, s.Access = cert, pair
+			s.ServerCert, s.Access, s.GateKey = a.ServerCert, a.Cert, a.GateKey
 			return s
 		}
 		select {

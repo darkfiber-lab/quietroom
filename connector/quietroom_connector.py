@@ -51,6 +51,9 @@ Usage
     # connection stays alive until conn.disconnect() or process exit
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -192,12 +195,34 @@ ACCESS_FILE_NAME = "quietroom_access.pem"
 _PEM_BLOCK_RE = re.compile(r"-----BEGIN ([A-Z ]+)-----.*?-----END \1-----", re.S)
 
 
-def _load_access_bundle(path: str) -> tuple[bytes, str]:
+# Gate: the server stays silent unless the ClientHello carries a fresh gate
+# token as its server name (see wire/gate.go in the QuietRoom repository).
+GATE_NONCE_LEN = 12
+GATE_MAC_LEN = 16
+
+
+def _gate_key(access_key_der: bytes) -> bytes:
+    return hmac.new(access_key_der, b"quietroom gate v1", hashlib.sha256).digest()
+
+
+def _gate_token(gate_key: bytes, now: Optional[float] = None) -> str:
+    minute = int(time.time() if now is None else now) // 60
+    nonce = secrets.token_bytes(GATE_NONCE_LEN)
+    mac = hmac.new(gate_key, minute.to_bytes(8, "big", signed=True) + nonce, hashlib.sha256).digest()
+    return (nonce + mac[:GATE_MAC_LEN]).hex()
+
+
+def _pem_body(block: str) -> bytes:
+    lines = [l for l in block.strip().splitlines() if not l.startswith("-----")]
+    return base64.b64decode("".join(lines))
+
+
+def _load_access_bundle(path: str) -> tuple[bytes, str, bytes]:
     """
     Parse an access file: the pinned server certificate followed by the master
     access certificate and its private key.
 
-    Returns (server_cert_der, access_cert_and_key_pem).
+    Returns (server_cert_der, access_cert_and_key_pem, gate_key).
     """
     with open(path, "r", encoding="ascii") as f:
         text = f.read()
@@ -217,7 +242,7 @@ def _load_access_bundle(path: str) -> tuple[bytes, str]:
             f"certificate and the access key). Get the current {ACCESS_FILE_NAME} "
             "from your server administrator."
         )
-    return ssl.PEM_cert_to_DER_cert(certs[0]), certs[1] + key
+    return ssl.PEM_cert_to_DER_cert(certs[0]), certs[1] + key, _gate_key(_pem_body(key))
 
 
 def _load_client_cert(ctx: ssl.SSLContext, cert_and_key_pem: str):
@@ -276,6 +301,7 @@ class QuietRoomConnector:
         self._sock: Optional[ssl.SSLSocket] = None
         self._server_cert_der: Optional[bytes] = None
         self._access_pem: Optional[str] = None
+        self._gate_key: bytes = b""
         self._send_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._shutdown_once = threading.Lock()
@@ -531,7 +557,7 @@ class QuietRoomConnector:
                 f"Access file '{self._cfg.cert_file}' not found. "
                 f"Copy {ACCESS_FILE_NAME} from the server."
             )
-        self._server_cert_der, self._access_pem = _load_access_bundle(self._cfg.cert_file)
+        self._server_cert_der, self._access_pem, self._gate_key = _load_access_bundle(self._cfg.cert_file)
 
     def _tls_connect(self) -> ssl.SSLSocket:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -544,7 +570,16 @@ class QuietRoomConnector:
             (self._cfg.server_host, self._cfg.server_port),
             timeout=self._cfg.connect_timeout,
         )
-        tls_sock = ctx.wrap_socket(raw, server_hostname=self._cfg.server_host)
+        try:
+            # The server name carries the gate token, not the host name.
+            tls_sock = ctx.wrap_socket(raw, server_hostname=_gate_token(self._gate_key))
+        except (ConnectionResetError, BrokenPipeError, ssl.SSLEOFError) as e:
+            raw.close()
+            raise SecurityError(
+                "The server closed the connection without answering: the access file is wrong "
+                "or outdated (the server may have been restarted), or this computer's clock is "
+                "off by more than 5 minutes"
+            ) from e
 
         # Certificate pinning — compare raw DER bytes
         if tls_sock.getpeercert(binary_form=True) != self._server_cert_der:

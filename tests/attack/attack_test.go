@@ -80,9 +80,10 @@ func TestAccessKeyRequired(t *testing.T) {
 		if !rejected(dialTLS(s, s.ServerCert, []tls.Certificate{other.Access})) {
 			t.Fatal("server accepted the access key of a different run")
 		}
-		// The client side notices too: the stale file's pin does not match.
+		// A client with the stale file is stopped at the gate and gets a
+		// clear message.
 		if _, err := client.Dial(client.Config{Addr: s.Addr, AccessFile: other.AccessFile, Username: "stale"}); err == nil ||
-			!strings.Contains(err.Error(), "does not match") {
+			!strings.Contains(err.Error(), "wrong or outdated") {
 			t.Fatalf("client with a stale access file: %v", err)
 		}
 	})
@@ -99,6 +100,80 @@ func TestAccessKeyRequired(t *testing.T) {
 		m := s.Join(t, uniqueName("member"))
 		m.C.Request(wire.THelp, "")
 		m.Wait("help", 15*time.Second, testserver.Text(client.EvInfo, "Available Commands"))
+	})
+	healthy(t, s)
+}
+
+// TestGateSilentToStrangers: without a valid gate token the server closes
+// the connection without sending anything, so scanners never see its
+// certificate or any TLS alert.
+func TestGateSilentToStrangers(t *testing.T) {
+	s := start(t, testserver.Config{})
+	other := start(t, testserver.Config{})
+	now := time.Now()
+
+	t.Run("valid token gets a TLS reply", func(t *testing.T) {
+		if n, _ := serverReply(t, s, clientHello(t, wire.GateToken(s.GateKey, now))); n == 0 {
+			t.Fatal("server did not answer a valid ClientHello")
+		}
+	})
+	cases := map[string][]byte{
+		"nothing at all":                  nil,
+		"http request":                    []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+		"ClientHello without server name": clientHello(t, ""),
+		"ClientHello with a host name":    clientHello(t, "example.com"),
+		"random token":                    clientHello(t, strings.Repeat("ab", wire.GateTokenLen/2)),
+		"token of another server":         clientHello(t, wire.GateToken(other.GateKey, now)),
+		"expired token":                   clientHello(t, wire.GateToken(s.GateKey, now.Add(-20*time.Minute))),
+		"token from the future":           clientHello(t, wire.GateToken(s.GateKey, now.Add(20*time.Minute))),
+		"oversize record header":          {22, 3, 1, 0xff, 0xff},
+		"TLS alert record":                {21, 3, 3, 0, 2, 2, 40},
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) { silent(t, s, payload) })
+	}
+	t.Run("replayed token", func(t *testing.T) {
+		hello := clientHello(t, wire.GateToken(s.GateKey, now))
+		if n, _ := serverReply(t, s, hello); n == 0 {
+			t.Fatal("first use refused")
+		}
+		silent(t, s, hello)
+		silent(t, s, hello)
+	})
+	t.Run("standard TLS client", func(t *testing.T) {
+		// What a scanner or openssl s_client does: the handshake fails
+		// without the server's certificate ever arriving.
+		var seen bool
+		_, err := dialTLSName(s, s.ServerCert, nil, "")
+		cfg := &tls.Config{InsecureSkipVerify: true, VerifyConnection: func(tls.ConnectionState) error { seen = true; return nil }}
+		conn, err2 := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", s.Addr, cfg)
+		if err == nil || err2 == nil || seen {
+			if conn != nil {
+				conn.Close()
+			}
+			t.Fatalf("handshake without a token: %v / %v (certificate seen: %v)", err, err2, seen)
+		}
+	})
+	t.Run("clock skew within limits", func(t *testing.T) {
+		conn, err := dialTLSName(s, s.ServerCert, []tls.Certificate{s.Access}, wire.GateToken(s.GateKey, now.Add(-4*time.Minute)))
+		if rejected(conn, err) {
+			t.Fatal("token from 4 minutes ago refused")
+		}
+	})
+	t.Run("slow ClientHello", func(t *testing.T) {
+		// Dribbling the ClientHello byte by byte is cut off by the
+		// handshake timeout, not held open forever.
+		conn, err := net.DialTimeout("tcp", s.Addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conn.Write([]byte{22, 3, 1, 0x40, 0x00})
+		start := time.Now()
+		expectClosed(t, conn, 30*time.Second)
+		if d := time.Since(start); d < 5*time.Second {
+			t.Fatalf("closed after only %s", d)
+		}
 	})
 	healthy(t, s)
 }

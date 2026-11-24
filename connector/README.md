@@ -327,6 +327,7 @@ while conn.is_connected:
 
 ## Security notes
 
+- **Gate token** — the TLS server name carries a one-time token derived from the access key, without which the server stays silent; the computer's clock must be within 5 minutes of the server's
 - **Certificate pinning** — the connector compares the server's TLS certificate byte-for-byte against the certificate in `quietroom_access.pem` and refuses to connect if they do not match, blocking man-in-the-middle attacks.
 - **TLS 1.3 only** — ephemeral keys per connection (forward secrecy); the connector presents the access key from `quietroom_access.pem`.
 - **Strict framing** — every frame states its exact length; malformed frames end the connection instead of being guessed around.

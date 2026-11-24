@@ -378,7 +378,7 @@ func main() {
 		}
 		fail(client.AccessFileName + " not found! Copy it from your server administrator to this directory.")
 	}
-	if _, _, err := client.LoadAccess(client.AccessFileName); err != nil {
+	if _, err := client.LoadAccess(client.AccessFileName); err != nil {
 		fail("Error loading access file: " + err.Error())
 	}
 	fmt.Println(u.colorize(th.SystemColor, "✓ Loaded server certificate and access key"))

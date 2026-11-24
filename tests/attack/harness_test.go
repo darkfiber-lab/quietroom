@@ -71,12 +71,18 @@ func healthy(t *testing.T, s *testserver.Server) {
 
 // ── Raw connections ─────────────────────────────────────────────────
 
-// dialTLS connects with the given client certificates and pins the server
-// certificate like the real clients do.
+// dialTLS connects with the given client certificates, passes the gate
+// with a valid token and pins the server certificate like the real clients do.
 func dialTLS(s *testserver.Server, pin *x509.Certificate, certs []tls.Certificate) (*tls.Conn, error) {
+	return dialTLSName(s, pin, certs, wire.GateToken(s.GateKey, time.Now()))
+}
+
+// dialTLSName is dialTLS with a chosen server name (gate token).
+func dialTLSName(s *testserver.Server, pin *x509.Certificate, certs []tls.Certificate, serverName string) (*tls.Conn, error) {
 	cfg := &tls.Config{
 		MinVersion:         tls.VersionTLS13,
 		InsecureSkipVerify: true, // replaced by the exact pin below
+		ServerName:         serverName,
 		Certificates:       certs,
 		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
 			if len(raw) == 0 || !bytes.Equal(raw[0], pin.Raw) {
@@ -214,6 +220,63 @@ func (r *raw) waitFor(what string, pred func(wire.Msg) bool) wire.Msg {
 			return m
 		}
 	}
+}
+
+// silent sends payload on a fresh TCP connection and checks that the
+// server closes it without sending a single byte.
+func silent(t *testing.T, s *testserver.Server, payload []byte) {
+	t.Helper()
+	n, closed := serverReply(t, s, payload)
+	if n > 0 {
+		t.Fatalf("server sent %d bytes to a connection without a valid gate token", n)
+	}
+	if !closed {
+		t.Fatal("server kept the connection open")
+	}
+}
+
+// serverReply sends payload on a fresh TCP connection and returns how many
+// bytes the server sent back and whether it closed the connection (within
+// 25 seconds; a peer that sends nothing is dropped after the 15-second
+// handshake timeout).
+func serverReply(t *testing.T, s *testserver.Server, payload []byte) (n int, closed bool) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", s.Addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if len(payload) > 0 {
+		conn.Write(payload)
+	}
+	conn.SetReadDeadline(time.Now().Add(25 * time.Second))
+	buf := make([]byte, 4096)
+	for {
+		k, err := conn.Read(buf)
+		n += k
+		if err != nil {
+			return n, !isTimeout(err)
+		}
+		if n > 0 {
+			// Something came back; don't wait for the handshake to time out.
+			return n, false
+		}
+	}
+}
+
+// clientHello returns the first TLS record a Go client sends with this
+// server name, without connecting anywhere.
+func clientHello(t *testing.T, serverName string) []byte {
+	t.Helper()
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	go tls.Client(c1, &tls.Config{ServerName: serverName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}).Handshake()
+	rec, _, err := wire.ReadClientHello(c2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rec
 }
 
 // expectClosed checks that the server closes the connection.

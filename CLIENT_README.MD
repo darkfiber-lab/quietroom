@@ -511,6 +511,15 @@ The server decrypts and relays messages (it is trusted by design) and never stor
 
 **Solution**: QuietRoom 3 clients need a QuietRoom 3 server (and vice versa). Update the server or the client so both run 3.x.
 
+### Server closed the connection without answering
+
+**Problem**: `✗ the server closed the connection without answering — your quietroom_access.pem is wrong or outdated ...`
+
+**Causes & Solutions**:
+1. **Server restarted**: Every restart generates new keys — get the new access file
+2. **Clock off**: The connection token is tied to the current time; set this computer's clock correctly (within 5 minutes)
+3. **Wrong file**: Make sure the access file came from this server
+
 ### Certificate does not match
 
 **Problem**: `✗ Server certificate does not match your quietroom_access.pem`

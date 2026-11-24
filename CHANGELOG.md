@@ -12,6 +12,7 @@
 - **Message rate limit** — about 20 messages per second per member (bursts up to 60); flooding members are told and their excess messages dropped
 - **Shared client library** — `client/` implements the protocol once for the CLI and the GUI
 - **Tests** — protocol unit tests and fuzzing (`wire/`); integration tests with a real server, the client library, the CLI in a pseudo-terminal and the Python connector (`tests/integration/`); GUI backend tests (`quietroom-gui/app_test.go`); attack tests with hostile clients (`tests/attack/`): missing, forged and stale access keys, malformed frames, spoofed fields, hostile names, flow-control abuse, floods, reconnect races, slow readers, and a check that logs contain no member metadata. All run in CI with the race detector.
+- **Silent to strangers** — the server no longer shows its certificate (or anything else) to connections without the access file. Clients send a one-time gate token, derived from the access key and the current time, in the TLS server name; without a valid token the server closes the connection without a reply. Scanners and `openssl s_client` see a closed connection. Client clocks must be within 5 minutes of the server's.
 - **Python connector** — `on_presence` callback for members joining and leaving
 - **Security policy** — `SECURITY.md`; vulnerabilities can be reported privately via GitHub's "Report a vulnerability"
 

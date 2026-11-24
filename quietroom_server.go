@@ -31,6 +31,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -338,6 +339,10 @@ type Server struct {
 	tlsCert       tls.Certificate
 	accessCertRaw []byte // DER of the access certificate clients must present
 	accessBundle  []byte // contents of quietroom_access.pem for this run
+	tlsConfig     *tls.Config
+	gateKey       []byte // checks the gate token before TLS (see wire/gate.go)
+	gateMu        sync.Mutex
+	gateSeen      map[string]time.Time // nonce -> expiry, against replays
 	limiter       *connLimiter
 	config        ServerConfig
 
@@ -355,6 +360,7 @@ type sessionKeys struct {
 	tlsCert       tls.Certificate
 	accessCertRaw []byte
 	accessBundle  []byte // PEM contents of quietroom_access.pem
+	gateKey       []byte
 }
 
 func randomSerial() (*big.Int, error) {
@@ -446,6 +452,7 @@ func generateSessionKeys() (*sessionKeys, error) {
 			Leaf:        serverCert,
 		},
 		accessCertRaw: accessDER,
+		gateKey:       wire.GateKey(accessKeyDER),
 	}, nil
 }
 
@@ -550,15 +557,70 @@ func NewServer() (*Server, error) {
 		tlsCert:        keys.tlsCert,
 		accessCertRaw:  keys.accessCertRaw,
 		accessBundle:   keys.accessBundle,
+		gateKey:        keys.gateKey,
+		gateSeen:       make(map[string]time.Time),
 		limiter:        newConnLimiter(config),
 		config:         config,
 		logger:         log.New(logFile, "", log.LstdFlags),
 		securityLogger: log.New(secLogFile, "[SECURITY] ", log.LstdFlags),
 		shutdown:       make(chan struct{}),
 	}
+	s.tlsConfig = &tls.Config{
+		Certificates:          []tls.Certificate{s.tlsCert},
+		MinVersion:            tls.VersionTLS13,
+		ClientAuth:            tls.RequireAnyClientCert,
+		VerifyPeerCertificate: s.verifyAccessCert,
+	}
 	s.logSecurity("Server started (protocol %d)", wire.Version)
 	return s, nil
 }
+
+// maxGateNonces bounds the replay cache. Only valid tokens are stored, so
+// only access-file holders can fill it.
+const maxGateNonces = 100000
+
+// gate reads the ClientHello and checks its gate token before anything is
+// sent. On failure the caller closes the connection without a reply, so
+// the server never shows its certificate (or anything else) to strangers.
+func (s *Server) gate(conn net.Conn) (net.Conn, error) {
+	record, name, err := wire.ReadClientHello(conn)
+	if err != nil {
+		return nil, fmt.Errorf("no TLS ClientHello: %v", err)
+	}
+	if name == "" {
+		return nil, errors.New("no gate token")
+	}
+	now := time.Now()
+	nonce, ok := wire.CheckGate(s.gateKey, name, now)
+	if !ok {
+		return nil, errors.New("invalid or expired gate token")
+	}
+	s.gateMu.Lock()
+	defer s.gateMu.Unlock()
+	if exp, seen := s.gateSeen[nonce]; seen && now.Before(exp) {
+		return nil, errors.New("replayed gate token")
+	}
+	if len(s.gateSeen) >= maxGateNonces/2 {
+		for n, exp := range s.gateSeen {
+			if now.After(exp) {
+				delete(s.gateSeen, n)
+			}
+		}
+	}
+	if len(s.gateSeen) >= maxGateNonces {
+		return nil, errors.New("gate replay cache full")
+	}
+	s.gateSeen[nonce] = now.Add(wire.GateLifetime)
+	return &prefixConn{Conn: conn, r: io.MultiReader(bytes.NewReader(record), conn)}, nil
+}
+
+// prefixConn replays the bytes read by the gate before the rest of the stream.
+type prefixConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (p *prefixConn) Read(b []byte) (int, error) { return p.r.Read(b) }
 
 func (s *Server) logSecurity(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
@@ -648,15 +710,18 @@ func (s *Server) handleClient(conn net.Conn) {
 		}
 	}()
 
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
+	conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	gated, err := s.gate(conn)
+	if err != nil {
+		s.logSecurity("Rejected connection from %s: %v", ipAddr, err)
 		return
 	}
-	conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	tlsConn := tls.Server(gated, s.tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {
 		s.logSecurity("Rejected connection from %s: %v", ipAddr, err)
 		return
 	}
+	conn = tlsConn
 
 	// Login: the first frame must be hello.
 	reject := func(code, text string) {
@@ -1395,15 +1460,9 @@ func main() {
 	}()
 	go server.housekeeping()
 
-	tlsConfig := &tls.Config{
-		Certificates:          []tls.Certificate{server.tlsCert},
-		MinVersion:            tls.VersionTLS13,
-		ClientAuth:            tls.RequireAnyClientCert,
-		VerifyPeerCertificate: server.verifyAccessCert,
-	}
-	listener, err := tls.Listen("tcp", fmt.Sprintf(":%d", server.config.Port), tlsConfig)
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", server.config.Port))
 	if err != nil {
-		fmt.Println("Error starting TLS server:", err)
+		fmt.Println("Error starting server:", err)
 		return
 	}
 	server.listener = listener
@@ -1416,7 +1475,7 @@ func main() {
 	fmt.Printf("✓ Access file saved to: %s\n", accessFile)
 	fmt.Printf("⚠ COPY %s to client machines before connecting — it is SECRET, anyone holding it can join!\n", accessFile)
 	fmt.Println("⚠ Restarting the server invalidates the previous access file.")
-	fmt.Printf("✓ QuietRoom server (protocol %d) listening on port %d (TLS 1.3, access key required)\n", wire.Version, server.config.Port)
+	fmt.Printf("✓ QuietRoom server (protocol %d) listening on port %d (TLS 1.3, access key required, silent to strangers)\n", wire.Version, server.config.Port)
 	fmt.Printf("✓ Logging to: %s\n", server.config.LogFile)
 	fmt.Printf("✓ Security logging to: %s\n", server.config.SecurityLogFile)
 	if server.config.LogMetadata {
@@ -1442,11 +1501,9 @@ func main() {
 				continue
 			}
 		}
-		if tlsConn, ok := conn.(*tls.Conn); ok {
-			if tcpConn, ok := tlsConn.NetConn().(*net.TCPConn); ok {
-				tcpConn.SetKeepAlive(true)
-				tcpConn.SetKeepAlivePeriod(30 * time.Second)
-			}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(30 * time.Second)
 		}
 		host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 		if err != nil {

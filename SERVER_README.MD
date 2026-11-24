@@ -59,7 +59,7 @@ You should see:
 ✓ Access file saved to: quietroom_access.pem
 ⚠ COPY quietroom_access.pem to client machines before connecting — it is SECRET, anyone holding it can join!
 ⚠ Restarting the server invalidates the previous access file.
-✓ QuietRoom server (protocol 3) listening on port 37842 (TLS 1.3, access key required)
+✓ QuietRoom server (protocol 3) listening on port 37842 (TLS 1.3, access key required, silent to strangers)
 ✓ Logging to: chat_server.log
 ✓ Security logging to: security.log
 ✓ Metadata logging off: logs contain no participant information
@@ -192,7 +192,13 @@ Usernames are 1–32 letters, digits, spaces, `_`, `-` or `.`. Room names start 
    - Rejected connections are recorded in the security log
    - A server restart rotates the key and revokes all previously distributed access files
 
-3. **Trusted server**
+3. **Silent to strangers (gate)**
+   - In TLS 1.3 a server normally shows its certificate to anyone who starts a handshake. QuietRoom does not: the client puts a gate token in the server name of its first TLS message, derived from the access key, the current minute and a random nonce
+   - The server reads that message before starting TLS; without a valid token it closes the connection without sending a single byte (no certificate, no TLS alert), so scanners and `openssl s_client` learn nothing
+   - Tokens are valid for ±5 minutes (clock skew) and only once (replays are refused)
+   - The port still accepts TCP connections; use a firewall if it must not appear open at all
+
+4. **Trusted server**
    - The server decrypts and relays messages and files (by design); it never stores them
 
 ### Protocol (version 3)
@@ -216,7 +222,8 @@ By default (`log_metadata: false`) the logs contain no information about partici
 
 ```
 [SECURITY] 2026/11/22 15:30:45 Server started (protocol 3)
-[SECURITY] 2026/11/22 15:31:02 Rejected connection from 203.0.113.7:51544: tls: client didn't provide a certificate
+[SECURITY] 2026/11/22 15:31:02 Rejected connection from 203.0.113.7:51544: no gate token
+[SECURITY] 2026/11/22 15:31:40 Rejected connection from 198.51.100.4:40212: no TLS ClientHello: not a TLS ClientHello
 [SECURITY] 2026/11/22 15:32:00 Refused 12 connection(s) over connection limits in the last minute
 [SECURITY] 2026/11/22 15:33:10 Malformed frame from [member]: malformed frame: unknown type 0x7f
 ```
@@ -306,8 +313,10 @@ netstat -tulpn | grep 37842
 **Problem**: `Rejected connection from ...` in the security log
 
 **Solution**: 
-1. `access key not recognised` / `client didn't provide a certificate` means a client without a valid access file tried to connect: ensure clients have the current `quietroom_access.pem` (a server restart replaces it)
-2. `No valid hello` usually means an outdated client: QuietRoom 3 servers need QuietRoom 3 clients
+1. `no gate token` / `no TLS ClientHello` is almost always an internet scanner; nothing was revealed to it
+2. `invalid or expired gate token` means a client with an old access file (a server restart replaces it) or a clock more than 5 minutes off; `replayed gate token` means someone re-sent a captured connection attempt
+3. `access key not recognised` / `client didn't provide a certificate` means a client passed the gate but presented a wrong access key
+4. `No valid hello` usually means an outdated client: QuietRoom 3 servers need QuietRoom 3 clients
 
 ## Security Best Practices
 
