@@ -1,0 +1,20 @@
+# Copyright (C) 2026 darkfiber-lab
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Loads deploy/quietroom-guard.nft at boot.
+#   cp deploy/quietroom-guard.nft /etc/nftables/quietroom-guard.nft
+#   cp deploy/quietroom-guard.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now quietroom-guard
+[Unit]
+Description=QuietRoom egress guard (nftables)
+After=network-pre.target
+Before=network.target quietroom-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables/quietroom-guard.nft
+ExecStop=/usr/sbin/nft delete table inet quietroom_guard
+
+[Install]
+WantedBy=multi-user.target

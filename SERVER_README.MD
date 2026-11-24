@@ -257,6 +257,45 @@ By default (`log_metadata: false`) the logs contain no information about partici
 - `chat_server.log` - General activity log
 - `security.log` - Security events log
 
+## Running in a container
+
+The repository's `DOCKERFILE` builds a minimal image (the static server binary and nothing else) from a release's `quietroom_server`. It works with Docker and Podman and runs the server as uid/gid **65532**, which belongs to no account on the host.
+
+```bash
+# In a folder with DOCKERFILE and the release's quietroom_server binary
+docker build -f DOCKERFILE -t quietroom-server .     # or: podman build ...
+```
+
+**Docker**, hardened (see the comments at the top of `DOCKERFILE`):
+
+```bash
+docker run -d --name quietroom-server --restart unless-stopped \
+  -p 37842:37842 -v quietroom-data:/app \
+  --cap-drop ALL --security-opt no-new-privileges:true --read-only \
+  --memory 512m --pids-limit 256 \
+  --log-opt max-size=10m --log-opt max-file=3 \
+  quietroom-server
+```
+
+**Podman with systemd** (recommended): [`deploy/quietroom-server.container`](deploy/quietroom-server.container) is a Quadlet unit that starts the server at boot in a private user namespace (the server's uid 65532 is host uid 265532), with a read-only image, no capabilities and resource limits. It uses the host network, so no NAT rule can be lost when the firewall reloads; open port 37842 in the host firewall.
+
+```bash
+cp deploy/quietroom-server.container /etc/containers/systemd/
+systemctl daemon-reload && systemctl start quietroom-server
+journalctl -u quietroom-server        # server output
+podman volume inspect quietroom-data  # where quietroom_access.pem is written
+```
+
+**Egress guard** (recommended with either): the server never opens connections, it only answers them. [`deploy/quietroom-guard.nft`](deploy/quietroom-guard.nft) blocks every outbound connection from the server's user, so a compromised server could not reach the internet, local services or a cloud metadata service. Set `quietroom_uid` in the file (265532 with the Podman unit, 65532 with Docker), then load it at boot with [`deploy/quietroom-guard.service`](deploy/quietroom-guard.service):
+
+```bash
+cp deploy/quietroom-guard.nft /etc/nftables/quietroom-guard.nft
+cp deploy/quietroom-guard.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now quietroom-guard
+```
+
+**Upgrading from 3.1 or earlier:** older images ran as uid 1000. Give the data volume to the new user before starting the new image (`chown -R 65532:65532` on the volume's directory; with Podman, the `:U` volume option in the unit does it). Restarting issues a new `quietroom_access.pem`, as always.
+
 ## Port Forwarding
 
 If running behind a firewall/router, forward the configured port:

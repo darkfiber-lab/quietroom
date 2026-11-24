@@ -1,0 +1,29 @@
+#!/usr/sbin/nft -f
+# Copyright (C) 2026 darkfiber-lab
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# QuietRoom egress guard. The server only answers incoming connections and
+# never opens one, so every new outbound connection from its user is
+# blocked: if the server were ever compromised, it could not reach the
+# internet, other hosts, local services or a cloud metadata service
+# (169.254.169.254), which can hand out instance credentials.
+#
+# The uid is the server's uid as seen on the host:
+#   265532  Podman with deploy/quietroom-server.container (UIDMap 0:200000)
+#    65532  Docker or Podman without a user namespace
+# Check with: ps -o uid,cmd -C quietroom_server
+#
+# This is a separate nftables table, so firewalld or other firewall tools
+# leave it alone. Load it at boot, for example with deploy/quietroom-guard.service
+# (copy this file to /etc/nftables/quietroom-guard.nft).
+
+define quietroom_uid = 265532
+
+table inet quietroom_guard
+delete table inet quietroom_guard
+table inet quietroom_guard {
+  chain output {
+    type filter hook output priority -10; policy accept;
+    meta skuid $quietroom_uid ct state new counter reject
+  }
+}
