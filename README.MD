@@ -1,5 +1,7 @@
 # QuietRoom
 
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/17081/badge)](https://www.bestpractices.dev/projects/17081)
+
 A privacy-focused, self-hosted encrypted chat system: TLS 1.3 with forward secrecy, a shared access key that keeps outsiders out, padded traffic and decoys against traffic analysis.
 
 ## Rationale and Design Principles
@@ -173,10 +175,11 @@ All of these run in CI on every change.
 
 ## Contributing
 
-Contributions are welcome! Please ensure:
-- Code follows Go best practices
+Contributions are welcome. Open an issue to discuss larger changes first, then send a pull request against `master`; every pull request is reviewed, and all CI checks (tests, fuzzing, static analysis) must pass before it is merged. Please ensure:
+- Code follows Go best practices and `go vet` is clean
 - Security features are not weakened
-- Changes are well-documented
+- New functionality comes with automated tests, and bug fixes with a test that reproduces the bug where practical
+- Changes are documented (README files and `CHANGELOG.md`)
 - Tests pass (see Building from Source)
 
 ## Security Disclosure
