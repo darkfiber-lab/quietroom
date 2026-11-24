@@ -670,6 +670,16 @@ The input line can be edited like a shell prompt. Long input wraps over several 
 
 Wide characters (Chinese, Japanese, Korean, most emoji) take two columns. Emoji built from several characters (such as 👨‍👩‍👧) are drawn differently by different terminals; if the cursor looks misplaced after one, `Ctrl+L` redraws the line.
 
+### Line mode (no interactive terminal)
+
+Line editing needs a terminal that supports raw input. Where there is none, the CLI switches to **line mode** by itself: you type a whole line and press Enter, and messages are printed as they arrive, without colours or a prompt. This happens:
+
+- on **Plan 9**, which has no raw terminal mode;
+- when input or output is **redirected** (pipes, files, scripts, `ssh` without a terminal);
+- if switching the terminal to raw mode fails for any other reason (the CLI says so).
+
+Everything else works the same, including commands and file transfers (only the progress line is left out). Colours are also switched off on Plan 9, when output is not a terminal, or when the `NO_COLOR` environment variable is set.
+
 ## Performance
 
 ### Resource Usage

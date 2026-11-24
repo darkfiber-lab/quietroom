@@ -176,3 +176,82 @@ func TestCLI(t *testing.T) {
 
 	s.CheckOutput(t)
 }
+
+// TestCLILineMode runs the CLI without a terminal (stdin and stdout are
+// pipes). It must fall back to plain line input and uncoloured output, as
+// on Plan 9 where raw terminal mode does not exist.
+func TestCLILineMode(t *testing.T) {
+	work := t.TempDir()
+	cli := filepath.Join(work, "quietroom_client")
+	build := exec.Command("go", "build", "-o", cli, "quietroom_client.go")
+	build.Dir = filepath.Join("..", "..")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building CLI: %v\n%s", err, out)
+	}
+	s := start(t)
+	data, _ := os.ReadFile(s.AccessFile)
+	os.WriteFile(filepath.Join(work, client.AccessFileName), data, 0600)
+	os.WriteFile(filepath.Join(work, "client_config.json"), []byte(`{"servers":[{"name":"test","address":"127.0.0.1","port":1}],"decoy_traffic":false}`), 0600)
+	alice := s.Join(t, "alice")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, cli)
+	cmd.Dir = work
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color") // colours must stay off anyway
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	var all strings.Builder
+	lines := make(chan string, 100)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+	expect := func(sub string) {
+		t.Helper()
+		for {
+			select {
+			case l, ok := <-lines:
+				if !ok {
+					t.Fatalf("CLI exited before %q; output:\n%s", sub, all.String())
+				}
+				all.WriteString(l + "\n")
+				if strings.Contains(l, sub) {
+					return
+				}
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for %q; output:\n%s", sub, all.String())
+			}
+		}
+	}
+
+	io := func(s string) { stdin.Write([]byte(s + "\n")) }
+	io(s.Addr)
+	io("piper")
+	expect("WELCOME TO QUIETROOM")
+	alice.Wait("piper joined", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.User == "piper" })
+	alice.C.Chat("", "hello pipe")
+	expect("alice: hello pipe")
+	io("hello from a pipe")
+	alice.Wait("message", wait, chatFrom("piper", "hello from a pipe"))
+	expect("You: hello from a pipe")
+	io("/msg alice private")
+	alice.Wait("dm", wait, func(e client.Event) bool { return e.Kind == client.EvDM && e.From == "piper" && e.Text == "private" })
+	io("/quit")
+	expect("Disconnected from server")
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("CLI: %v\n%s", err, all.String())
+	}
+	if strings.Contains(all.String(), "\x1b") {
+		t.Fatalf("escape sequences in line mode output:\n%q", all.String())
+	}
+	alice.Wait("piper left", wait, func(e client.Event) bool { return e.Kind == client.EvLeft && e.User == "piper" && e.Room == "" })
+}

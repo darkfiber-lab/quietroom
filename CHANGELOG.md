@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- **CLI line mode** — without an interactive terminal (Plan 9, which has no raw mode, or with input or output redirected) the CLI reads plain lines and prints messages as they arrive instead of failing with "Failed to set raw terminal mode"; colours are off there and whenever `NO_COLOR` is set
 - **CLI line editing** — cursor movement by character and word, Home/End, Delete, Ctrl+W/U/K, history of sent lines with ↑/↓, Ctrl+L to redraw; on Windows the classic console gets escape-sequence support enabled
 - **LLM bot** — `ollama.think` setting for reasoning models: `false` (default, as before) answers directly, `true` lets the model reason first, `null` uses the model's default
 

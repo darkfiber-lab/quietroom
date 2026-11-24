@@ -85,13 +85,21 @@ const legacyAccessFile = "chat_public.pem"
 
 // UI is the terminal front end. All output after login goes through the
 // line editor, which keeps what the user is typing intact below it.
+//
+// Without an interactive terminal (Plan 9, where raw mode is unavailable, or
+// when input or output is redirected) the CLI runs in line mode instead:
+// lines are read as typed and output is printed as it arrives, without
+// line editing or colours.
 type UI struct {
 	config ClientConfig
 	c      *client.Client
 
+	lineMode bool // no line editor: read whole lines, print plainly
+	noColor  bool
+
 	outMu  sync.Mutex
 	ed     *lineedit.Editor
-	ready  bool     // the input line is on screen
+	ready  bool     // the input line is on screen (or line mode started)
 	queued []string // output that arrived before the input line was drawn
 
 	roomMu      sync.Mutex
@@ -99,6 +107,9 @@ type UI struct {
 }
 
 func (u *UI) colorize(color, text string) string {
+	if u.noColor {
+		return text
+	}
 	if code, ok := colors[color]; ok {
 		return code + text + colors["reset"]
 	}
@@ -131,6 +142,12 @@ func (u *UI) output(lines []string) {
 	defer u.outMu.Unlock()
 	if !u.ready {
 		u.queued = append(u.queued, lines...)
+		return
+	}
+	if u.lineMode {
+		for _, l := range lines {
+			fmt.Println(l)
+		}
 		return
 	}
 	u.ed.Print(strings.Join(lines, "\n"))
@@ -167,7 +184,7 @@ func (u *UI) printChat(ts, prefix, name, text string) {
 func (u *UI) progress(text string) {
 	u.outMu.Lock()
 	defer u.outMu.Unlock()
-	if u.ready {
+	if u.ready && !u.lineMode { // line mode: only the final result is shown
 		if text != "" {
 			text = u.colorize(u.config.Theme.SystemColor, sanitizeText(text))
 		}
@@ -180,6 +197,13 @@ func (u *UI) start() {
 	u.outMu.Lock()
 	defer u.outMu.Unlock()
 	u.ready = true
+	if u.lineMode {
+		for _, l := range u.queued {
+			fmt.Println(l)
+		}
+		u.queued = nil
+		return
+	}
 	u.ed.Start()
 	if len(u.queued) > 0 {
 		u.ed.Print(strings.Join(u.queued, "\n"))
@@ -375,7 +399,10 @@ func loadConfig() ClientConfig {
 	return config
 }
 
-func clearScreen() {
+func (u *UI) clearScreen() {
+	if u.lineMode || runtime.GOOS == "plan9" {
+		return
+	}
 	cmd := exec.Command("clear")
 	if runtime.GOOS == "windows" {
 		cmd = exec.Command("cmd", "/c", "cls")
@@ -387,6 +414,10 @@ func clearScreen() {
 func main() {
 	config := loadConfig()
 	u := &UI{config: config}
+	u.lineMode = !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd()))
+	// Colours only on terminals that understand ANSI sequences
+	// (NO_COLOR: https://no-color.org).
+	u.noColor = os.Getenv("NO_COLOR") != "" || runtime.GOOS == "plan9" || !term.IsTerminal(int(os.Stdout.Fd()))
 	u.ed = lineedit.New(os.Stdout, terminalWidth)
 	u.ed.SetPrompt(u.colorize(config.Theme.SystemColor, "> "))
 	th := config.Theme
@@ -395,7 +426,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	clearScreen()
+	u.clearScreen()
 
 	if _, err := os.Stat(client.AccessFileName); os.IsNotExist(err) {
 		if _, err := os.Stat(legacyAccessFile); err == nil {
@@ -469,7 +500,7 @@ func main() {
 	}
 	u.c = c
 
-	clearScreen()
+	u.clearScreen()
 	sep := u.colorize("gray", strings.Repeat("━", 78))
 	fmt.Println(sep)
 	fmt.Println(u.colorize(th.SystemColor, "                         WELCOME TO QUIETROOM"))
@@ -483,18 +514,24 @@ func main() {
 	fmt.Println(u.colorize(th.SystemColor, "✓ Press Ctrl+C or type /quit to disconnect"))
 	fmt.Println()
 
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		fail("Failed to set raw terminal mode: " + err.Error())
+	restore := func() {}
+	if !u.lineMode {
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			// For example on Plan 9: fall back to plain line input.
+			u.lineMode = true
+			fmt.Println(u.colorize(th.SystemColor, "✓ Line editing unavailable here ("+err.Error()+"): using plain line input"))
+		} else {
+			lineedit.EnableTerminalOutput(os.Stdout) // escape sequences on Windows consoles
+			restore = func() { term.Restore(int(os.Stdin.Fd()), oldState) }
+		}
 	}
-	lineedit.EnableTerminalOutput(os.Stdout) // escape sequences on Windows consoles
-	restore := func() { term.Restore(int(os.Stdin.Fd()), oldState) }
 	u.start()
 
 	// finish removes the input line before leaving raw mode.
 	finish := func() {
 		u.outMu.Lock()
-		if u.ready {
+		if u.ready && !u.lineMode {
 			u.ed.Clear()
 			u.ready = false
 		}
@@ -529,29 +566,18 @@ func main() {
 	}()
 
 	lines := make(chan string)
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if err != nil || n == 0 {
-				close(lines)
-				return
+	if u.lineMode {
+		// The same scanner as for the login prompts: it may already hold
+		// input that was read ahead.
+		go func() {
+			for scanner.Scan() {
+				lines <- scanner.Text()
 			}
-			u.outMu.Lock()
-			events := u.ed.Feed(buf[:n])
-			u.outMu.Unlock()
-			for _, ev := range events {
-				switch ev.Kind {
-				case lineedit.Interrupt:
-					quit(0)
-				case lineedit.Line:
-					if strings.TrimSpace(ev.Text) != "" {
-						lines <- ev.Text
-					}
-				}
-			}
-		}
-	}()
+			close(lines)
+		}()
+	} else {
+		go u.readKeys(lines, quit)
+	}
 
 	for text := range lines {
 		text = strings.TrimSpace(text)
@@ -572,4 +598,29 @@ func main() {
 		}
 	}
 	quit(0)
+}
+
+// readKeys feeds keystrokes to the line editor and passes on entered lines.
+func (u *UI) readKeys(lines chan<- string, quit func(int)) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil || n == 0 {
+			close(lines)
+			return
+		}
+		u.outMu.Lock()
+		events := u.ed.Feed(buf[:n])
+		u.outMu.Unlock()
+		for _, ev := range events {
+			switch ev.Kind {
+			case lineedit.Interrupt:
+				quit(0)
+			case lineedit.Line:
+				if strings.TrimSpace(ev.Text) != "" {
+					lines <- ev.Text
+				}
+			}
+		}
+	}
 }
