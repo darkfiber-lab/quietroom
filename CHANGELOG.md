@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- **CLI line editing** — cursor movement by character and word, Home/End, Delete, Ctrl+W/U/K, history of sent lines with ↑/↓, Ctrl+L to redraw; on Windows the classic console gets escape-sequence support enabled
 - **LLM bot** — `ollama.think` setting for reasoning models: `false` (default, as before) answers directly, `true` lets the model reason first, `null` uses the model's default
 
 ### ⚠ Changed
@@ -13,6 +14,7 @@
 - **Hidden characters removed** — bidi controls (which can disguise `invoice‮gpj.exe` as `invoiceexe.jpg`) and zero-width characters are removed from chat text, DMs and file names by the server, and again by the clients. File names also lose all other Unicode format characters and C1 controls; emoji joiners are kept in text.
 
 ### Fixed
+- **CLI input line** — editing a line long enough to wrap (for example with Backspace) printed the whole message again, and messages arriving while such a line was being typed left copies of it behind. The CLI now has a proper line editor (`lineedit/`) that tracks how many rows the input occupies, including wide characters and the terminal's deferred wrap at the last column. Arrow keys no longer insert `[A`, `[D` and similar text; transfer progress has its own line above the prompt instead of overwriting the input; multi-line messages keep their line breaks.
 - **Server documentation** — `SERVER_README.MD` showed outdated build commands (`chat_server` from `server.go`); it now explains downloading and verifying a release or building `quietroom_server.go`, and the systemd example uses the right names
 - **GUI sources** — `frontend/wailsjs/go/models.ts` has its license header again; a Wails post-build hook restores it after every build, and a test fails if it is missing. The Wails runtime bindings in the repository match Wails v2.13.0 again (the 3.0.0 release commit had reverted them; release binaries were not affected, as builds regenerate them)
 

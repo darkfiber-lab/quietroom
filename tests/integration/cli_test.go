@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/darkfiber-lab/quietroom/client"
+	"github.com/darkfiber-lab/quietroom/lineedit/vt"
 )
 
 // TestCLI runs the real CLI client in a pseudo-terminal against the server;
@@ -133,10 +134,45 @@ func TestCLI(t *testing.T) {
 	alice.C.Chat("", "\x1b[2J\x1b]0;pwned\x07 evil-marker")
 	expect("SANITIZED OK")
 
+	expect("TYPED")
+	alice.C.Chat("#cli", "while you type")
+	const typed = "this is a long message that wraps across the rows of a narrow END"
+	alice.Wait("edited message", wait, func(e client.Event) bool {
+		return e.Kind == client.EvChat && e.From == "clio" && e.Text == typed
+	})
+	expect("TYPING OK")
+
 	expect("EXIT 0")
 	alice.Wait("clio left", wait, func(e client.Event) bool { return e.Kind == client.EvLeft && e.User == "clio" && e.Room == "" })
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("driver: %v\n%s", err, stderr.String())
 	}
+
+	// Replay everything the CLI wrote through a terminal emulator of the
+	// same size and check what was on screen.
+	raw, err := os.ReadFile(filepath.Join(work, "screen.raw"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scr := vt.New(40, 24)
+	scr.Write(raw)
+	transcript := scr.LogicalLines()
+	count := func(sub string) int {
+		n := 0
+		for _, l := range transcript {
+			n += strings.Count(l, sub)
+		}
+		return n
+	}
+	if n := count("#cli > this is"); n != 0 {
+		t.Errorf("%d stale copies of the typed line left on screen:\n%s", n, strings.Join(transcript, "\n"))
+	}
+	if n := count("You: this is a long message"); n != 1 {
+		t.Errorf("sent message shown %d times:\n%s", n, strings.Join(transcript, "\n"))
+	}
+	if n := count("alice: while you type"); n != 1 {
+		t.Errorf("incoming message shown %d times:\n%s", n, strings.Join(transcript, "\n"))
+	}
+
 	s.CheckOutput(t)
 }

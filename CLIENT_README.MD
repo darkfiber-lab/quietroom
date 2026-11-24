@@ -654,11 +654,21 @@ Select server (1-1) or enter custom address: chat.example.com:37842
 
 ### Keyboard Shortcuts
 
-Most terminals support:
-- `Ctrl+C` - Disconnect and exit
-- `Ctrl+L` - Clear screen (terminal feature)
-- `Up Arrow` - Recall previous message (terminal feature)
-- `Ctrl+U` - Clear current line (terminal feature)
+The input line can be edited like a shell prompt. Long input wraps over several rows; messages that arrive while you type appear above it, and transfer progress is shown on its own line above the prompt.
+
+| Key | Action |
+|-----|--------|
+| `←` `→` (`Ctrl+B` `Ctrl+F`) | Move one character |
+| `Ctrl+←` `Ctrl+→` / `Alt+B` `Alt+F` | Move one word |
+| `Home` `End` (`Ctrl+A` `Ctrl+E`) | Start / end of the line |
+| `Backspace` / `Delete` (`Ctrl+D`) | Delete before / under the cursor |
+| `Ctrl+W` / `Alt+Backspace` | Delete the word before the cursor |
+| `Ctrl+U` / `Ctrl+K` | Delete to the start / end of the line |
+| `↑` `↓` | Previous / next line you sent (last 100) |
+| `Ctrl+L` | Clear the screen |
+| `Ctrl+C` | Disconnect and exit |
+
+Wide characters (Chinese, Japanese, Korean, most emoji) take two columns. Emoji built from several characters (such as 👨‍👩‍👧) are drawn differently by different terminals; if the cursor looks misplaced after one, `Ctrl+L` redraws the line.
 
 ## Performance
 
