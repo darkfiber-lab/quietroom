@@ -472,10 +472,12 @@ export const App = {
     runtime.EventsOn('room_joined', data => {
       if (data.username === this.username) {
         // Server confirmed our own join: now show and switch to the room
-        const hasPassword = this._pendingJoins[data.room] === true
         delete this._pendingJoins[data.room]
-        Chat.addRoom(data.room, hasPassword)
+        Chat.addRoom(data.room, data.locked === true)
         Chat.switchTo(data.room)
+        if (data.locked === true) {
+          Chat.appendSystem(`🔒 ${data.room} is end-to-end encrypted: only members who know the password can read it, not the server.`, data.room)
+        }
         return
       }
       Chat.appendSystem(`${data.username} joined ${data.room}`, data.room)

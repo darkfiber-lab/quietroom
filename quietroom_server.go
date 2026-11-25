@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -46,6 +45,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/darkfiber-lab/quietroom/e2e"
 	"github.com/darkfiber-lab/quietroom/wire"
 )
 
@@ -193,6 +193,7 @@ type Client struct {
 	conn     net.Conn
 	username string
 	ipAddr   string
+	kx, sk   string // session public keys (base64), relayed to other members
 
 	ctrl     chan []byte   // control frames, written first
 	bulk     chan []byte   // file data and file_end frames
@@ -310,46 +311,17 @@ func (c *Client) allow(cost float64) bool {
 type Room struct {
 	name     string
 	members  map[*Client]bool
-	password *roomPassword // nil if the room has no password
+	verifier []byte // SHA-256 of the room verifier; nil for an open room
 }
 
-// Room passwords are kept only as PBKDF2-HMAC-SHA256 keys with a random
-// salt (standard library only). The iteration count follows the OWASP
-// recommendation; at most passwordWorkers hashes run at once, so members
-// cannot tie up every CPU by joining password rooms.
-const (
-	passwordIterations = 600000
-	passwordWorkers    = 2
-)
+// locked reports an end-to-end encrypted (password) room. The server never
+// sees the password: clients derive a verifier from it (see e2e.DeriveRoom)
+// and the server only compares verifiers, keeping a hash of the first.
+func (r *Room) locked() bool { return r.verifier != nil }
 
-var passwordSlots = make(chan struct{}, passwordWorkers)
-
-type roomPassword struct {
-	salt []byte
-	key  []byte
-}
-
-func derivePassword(password string, salt []byte) ([]byte, error) {
-	passwordSlots <- struct{}{}
-	defer func() { <-passwordSlots }()
-	return pbkdf2.Key(sha256.New, password, salt, passwordIterations, 32)
-}
-
-func newRoomPassword(password string) (*roomPassword, error) {
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		return nil, err
-	}
-	key, err := derivePassword(password, salt)
-	if err != nil {
-		return nil, err
-	}
-	return &roomPassword{salt: salt, key: key}, nil
-}
-
-func (p *roomPassword) matches(password string) bool {
-	key, err := derivePassword(password, p.salt)
-	return err == nil && subtle.ConstantTimeCompare(key, p.key) == 1
+func hashVerifier(vf []byte) []byte {
+	h := sha256.Sum256(vf)
+	return h[:]
 }
 
 type transfer struct {
@@ -357,9 +329,7 @@ type transfer struct {
 	idStr     string
 	sender    *Client
 	recipient *Client
-	name      string
-	size      int64
-	sha       string
+	size      int64 // encrypted bytes to be sent
 	accepted  bool
 	credit    int64 // bytes the sender may still send
 	sent      int64
@@ -800,11 +770,18 @@ func (s *Server) handleClient(conn net.Conn) {
 		reject(wire.CodeInvalidUsername, "Invalid username: "+wire.UsernameRules)
 		return
 	}
+	if _, err := e2e.ParsePublicKeys(hello.KX, hello.SK); err != nil {
+		s.logSecurity("Invalid session keys from %s", s.peer(ipAddr))
+		reject(wire.CodeProtocol, "Invalid session keys")
+		return
+	}
 
 	c := &Client{
 		conn:       conn,
 		username:   username,
 		ipAddr:     ipAddr,
+		kx:         hello.KX,
+		sk:         hello.SK,
 		ctrl:       make(chan []byte, ctrlQueueLen),
 		bulk:       make(chan []byte, bulkQueueLen),
 		done:       make(chan struct{}),
@@ -822,7 +799,14 @@ func (s *Server) handleClient(conn net.Conn) {
 	s.clients[c] = true
 	joined = c
 	s.to(c, wire.Msg{T: wire.TWelcome, User: username, V: wire.Version})
-	s.broadcastAll(wire.Msg{T: wire.TJoined, User: username})
+	// Session keys of everyone already online, then ours to everyone, so
+	// members can encrypt to each other right away.
+	for other := range s.clients {
+		if other != c {
+			s.to(c, wire.Msg{T: wire.TPeer, User: other.username, KX: other.kx, SK: other.sk})
+		}
+	}
+	s.broadcastAll(wire.Msg{T: wire.TJoined, User: username, KX: c.kx, SK: c.sk})
 	s.mu.Unlock()
 	conn.SetDeadline(time.Time{})
 
@@ -865,9 +849,11 @@ func messageCost(t string) float64 {
 	switch t {
 	case wire.TFileAccept, wire.TFileCredit, wire.TFileEnd, wire.TFileCancel, wire.TFileDecline:
 		return 0
-	case wire.TJoin:
-		return 5 // password hashing is expensive
-	case wire.TFileOffer:
+	case wire.TRoomKey:
+		// Members hand out room keys to each other when someone joins or
+		// leaves: one per member, so they must not exhaust the budget.
+		return 0.1
+	case wire.TJoin, wire.TFileOffer:
 		return 2
 	}
 	return 1
@@ -895,6 +881,10 @@ func (s *Server) dispatch(c *Client, m wire.Msg) {
 		s.handleJoin(c, m)
 	case wire.TLeave:
 		s.handleLeave(c, m)
+	case wire.TRoomHello:
+		s.handleRoomHello(c, m)
+	case wire.TRoomKey:
+		s.handleRoomKey(c, m)
 	case wire.TRooms:
 		s.handleRooms(c)
 	case wire.TUsers:
@@ -993,7 +983,33 @@ func cleanText(t string) (string, bool) {
 	return t, t != "" && len(t) <= wire.MaxTextBytes
 }
 
+// validCipher checks the size of an encrypted field (base64).
+func validCipher(ct string) bool { return ct != "" && len(ct) <= wire.MaxCipherText }
+
 func (s *Server) handleChat(c *Client, m wire.Msg) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var r *Room
+	if m.Room != "" {
+		r = s.rooms[m.Room]
+		if r == nil || !c.rooms[m.Room] {
+			s.fail(c, fmt.Sprintf("You are not a member of %s", m.Room))
+			return
+		}
+	}
+	if r != nil && r.locked() {
+		// End-to-end encrypted: relay as is. Members check the signature.
+		if !validCipher(m.CT) || m.Sig == "" || len(m.Sig) > wire.MaxSigField || m.Text != "" {
+			s.fail(c, "Invalid encrypted message")
+			return
+		}
+		s.broadcastRoom(r, wire.Msg{T: wire.TChat, From: c.username, Room: m.Room, KID: m.KID, N: m.N, CT: m.CT, Sig: m.Sig, Time: now()})
+		return
+	}
+	if m.CT != "" {
+		s.fail(c, "Encrypted messages are only for password rooms")
+		return
+	}
 	text, ok := cleanText(m.Text)
 	if !ok {
 		if text != "" {
@@ -1001,28 +1017,19 @@ func (s *Server) handleChat(c *Client, m wire.Msg) {
 		}
 		return
 	}
-	out := wire.Msg{T: wire.TChat, From: c.username, Text: text, Time: now()}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if m.Room == "" {
+	out := wire.Msg{T: wire.TChat, From: c.username, Room: m.Room, Text: text, Time: now()}
+	if r == nil {
 		s.broadcastAll(out)
 		return
 	}
-	r := s.rooms[m.Room]
-	if r == nil || !c.rooms[m.Room] {
-		s.fail(c, fmt.Sprintf("You are not a member of %s", m.Room))
-		return
-	}
-	out.Room = m.Room
 	s.broadcastRoom(r, out)
 }
 
+// handleDM relays an end-to-end encrypted direct message. The sender gets a
+// delivery notice without the ciphertext (it shows its own copy).
 func (s *Server) handleDM(c *Client, m wire.Msg) {
-	text, ok := cleanText(m.Text)
-	if !ok {
-		if text != "" {
-			s.fail(c, fmt.Sprintf("Message too long (max %d bytes)", wire.MaxTextBytes))
-		}
+	if !validCipher(m.CT) || m.Text != "" {
+		s.fail(c, "Invalid encrypted message")
 		return
 	}
 	s.mu.Lock()
@@ -1032,12 +1039,59 @@ func (s *Server) handleDM(c *Client, m wire.Msg) {
 		s.fail(c, fmt.Sprintf("User '%s' is not online.", m.To))
 		return
 	}
-	out := encode(wire.Msg{T: wire.TDM, From: c.username, To: target.username, Text: text, Time: now()})
-	target.send(out)
-	if target != c {
-		c.send(out)
+	if target == c {
+		s.fail(c, "You cannot send a direct message to yourself.")
+		return
 	}
+	t := now()
+	target.send(encode(wire.Msg{T: wire.TDM, From: c.username, To: target.username, N: m.N, CT: m.CT, Time: t}))
+	s.to(c, wire.Msg{T: wire.TDM, From: c.username, To: target.username, N: m.N, Time: t})
 	s.logMeta("DM: %s -> %s", c.username, target.username)
+}
+
+// handleRoomHello relays a member's proof of the room password to the other
+// members, who answer with their room keys if it checks out.
+func (s *Server) handleRoomHello(c *Client, m wire.Msg) {
+	if m.Proof == "" || len(m.Proof) > wire.MaxKeyField {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.rooms[m.Room]
+	if r == nil || !r.locked() || !c.rooms[m.Room] {
+		return
+	}
+	out := encode(wire.Msg{T: wire.TRoomHello, From: c.username, Room: m.Room, Proof: m.Proof})
+	for other := range r.members {
+		if other != c {
+			other.send(out)
+		}
+	}
+}
+
+// handleRoomKey relays an encrypted room key to a member sharing a password
+// room with the sender.
+func (s *Server) handleRoomKey(c *Client, m wire.Msg) {
+	if !validCipher(m.CT) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	target := s.usernames[wire.UsernameKey(m.To)]
+	if target == nil || target == c {
+		return
+	}
+	shared := false
+	for name := range c.rooms {
+		if r := s.rooms[name]; r != nil && r.locked() && target.rooms[name] {
+			shared = true
+			break
+		}
+	}
+	if !shared {
+		return
+	}
+	target.send(encode(wire.Msg{T: wire.TRoomKey, From: c.username, N: m.N, CT: m.CT}))
 }
 
 func (s *Server) handleJoin(c *Client, m wire.Msg) {
@@ -1046,79 +1100,45 @@ func (s *Server) handleJoin(c *Client, m wire.Msg) {
 		s.fail(c, fmt.Sprintf("Invalid room name. Use # followed by 1-%d letters, digits, '_', '-' or '.' (e.g., #general)", wire.MaxRoomNameLen))
 		return
 	}
-	password := strings.TrimSpace(m.Password)
-	if len(password) > wire.MaxPasswordBytes {
-		s.fail(c, "Password too long")
-		return
-	}
-
-	s.mu.Lock()
-	r := s.rooms[name]
-	already := c.rooms[name]
-	count := len(c.rooms)
-	total := len(s.rooms)
-	var pw *roomPassword
-	if r != nil {
-		pw = r.password
-	}
-	s.mu.Unlock()
-
-	switch {
-	case already:
-		s.info(c, fmt.Sprintf("You are already in %s", name))
-		return
-	case count >= s.config.MaxRoomsPerMember:
-		s.fail(c, fmt.Sprintf("You are in too many rooms (max %d)", s.config.MaxRoomsPerMember))
-		return
-	case r == nil && total >= s.config.MaxRooms:
-		s.fail(c, "Too many rooms on this server")
-		return
-	}
-
-	// Password hashing runs without holding the lock.
-	var newPw *roomPassword
-	if r != nil && pw != nil {
-		if password == "" {
-			s.fail(c, "This room is password-protected. Usage: /join "+name+" <password>")
+	var vf []byte
+	if m.VF != "" {
+		b, err := e2e.Decode(m.VF, e2e.KeyLen)
+		if err != nil || len(b) != e2e.KeyLen {
+			s.fail(c, "Invalid room verifier")
 			return
 		}
-		if !pw.matches(password) {
-			s.fail(c, "Incorrect password for room "+name)
-			return
-		}
-	} else if r == nil && password != "" {
-		var err error
-		if newPw, err = newRoomPassword(password); err != nil {
-			s.fail(c, "Error creating room password.")
-			return
-		}
+		vf = hashVerifier(b)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.clients[c] {
-		return
-	}
-	current := s.rooms[name]
-	created := false
+	r := s.rooms[name]
 	switch {
-	case current == nil && r == nil:
-		if len(s.rooms) >= s.config.MaxRooms {
-			s.fail(c, "Too many rooms on this server")
-			return
-		}
-		current = &Room{name: name, members: make(map[*Client]bool), password: newPw}
-		s.rooms[name] = current
-		created = true
-	case current != r:
-		// The room was created or removed by someone else while the
-		// password was checked: ask to retry rather than guess.
-		s.fail(c, "Room "+name+" changed while joining; please try again")
+	case c.rooms[name]:
+		s.info(c, fmt.Sprintf("You are already in %s", name))
+		return
+	case len(c.rooms) >= s.config.MaxRoomsPerMember:
+		s.fail(c, fmt.Sprintf("You are in too many rooms (max %d)", s.config.MaxRoomsPerMember))
+		return
+	case r == nil && len(s.rooms) >= s.config.MaxRooms:
+		s.fail(c, "Too many rooms on this server")
+		return
+	case r != nil && r.locked() && vf == nil:
+		s.fail(c, "This room is password-protected. Usage: /join "+name+" <password>")
+		return
+	case r != nil && r.locked() && subtle.ConstantTimeCompare(vf, r.verifier) != 1:
+		s.fail(c, "Incorrect password for room "+name)
 		return
 	}
-	current.members[c] = true
+	created := false
+	if r == nil {
+		r = &Room{name: name, members: make(map[*Client]bool), verifier: vf}
+		s.rooms[name] = r
+		created = true
+	}
+	r.members[c] = true
 	c.rooms[name] = true
-	s.broadcastRoom(current, wire.Msg{T: wire.TJoined, User: c.username, Room: name, Created: created})
+	s.broadcastRoom(r, wire.Msg{T: wire.TJoined, User: c.username, Room: name, Created: created, Locked: r.locked()})
 }
 
 func (s *Server) handleLeave(c *Client, m wire.Msg) {
@@ -1153,7 +1173,7 @@ func (s *Server) handleRooms(c *Client) {
 		for _, name := range names {
 			r := s.rooms[name]
 			locked := ""
-			if r.password != nil {
+			if r.locked() {
 				locked = " 🔒"
 			}
 			fmt.Fprintf(&b, "  %s%s (%d users)\n", name, locked, len(r.members))
@@ -1188,7 +1208,7 @@ func (s *Server) handleMembers(c *Client, m wire.Msg) {
 	} else {
 		r := s.rooms[target]
 		// Password rooms are only visible to their members.
-		if r == nil || (r.password != nil && !c.rooms[target]) {
+		if r == nil || (r.locked() && !c.rooms[target]) {
 			s.mu.Unlock()
 			s.fail(c, "Room not found or access denied.")
 			return
@@ -1219,16 +1239,14 @@ func (s *Server) handleOffer(c *Client, m wire.Msg) {
 	if len(m.Ref) > 32 {
 		return
 	}
-	name := wire.CleanFileName(m.Name)
+	// The name, real size and hash travel encrypted in CT; Size is the
+	// number of encrypted bytes, whole chunks only.
 	switch {
-	case name == "":
-		failRef("Invalid file name.")
-		return
-	case m.Size <= 0:
+	case m.Size <= 0 || m.Size%wire.DataChunk != 0:
 		failRef("Invalid file size.")
 		return
-	case !wire.ValidSHA256(m.SHA256):
-		failRef("Invalid hash format. SHA-256 hash must be 64 hex characters.")
+	case !validCipher(m.CT):
+		failRef("Invalid file offer.")
 		return
 	}
 	s.mu.Lock()
@@ -1270,15 +1288,14 @@ func (s *Server) handleOffer(c *Client, m wire.Msg) {
 	}
 	t := &transfer{
 		id: id, idStr: wire.IDString(id), sender: c, recipient: target,
-		name: name, size: m.Size, sha: strings.ToLower(m.SHA256),
-		created: time.Now(), activity: time.Now(),
+		size: m.Size, created: time.Now(), activity: time.Now(),
 	}
 	s.transfers[t.idStr] = t
 	s.tmu.Unlock()
 
-	s.to(target, wire.Msg{T: wire.TFileOffer, ID: t.idStr, From: c.username, Name: name, Size: t.size, SHA256: t.sha})
-	s.to(c, wire.Msg{T: wire.TFileOffered, Ref: m.Ref, ID: t.idStr, To: target.username, Name: name, Size: t.size, SHA256: t.sha})
-	s.logMeta("File transfer offered: %s -> %s (%s, %d bytes)", c.username, target.username, name, t.size)
+	s.to(target, wire.Msg{T: wire.TFileOffer, ID: t.idStr, From: c.username, Size: t.size, N: m.N, CT: m.CT})
+	s.to(c, wire.Msg{T: wire.TFileOffered, Ref: m.Ref, ID: t.idStr, To: target.username, Size: t.size})
+	s.logMeta("File transfer offered: %s -> %s (%d bytes encrypted)", c.username, target.username, t.size)
 }
 
 // lookup returns a transfer by ID. Caller holds s.tmu.

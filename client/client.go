@@ -12,9 +12,10 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// Package client is the QuietRoom protocol 3 client used by the CLI and GUI.
-// It owns the connection, chat messages and file transfers (with flow
-// control); the user interface only renders Events and calls methods.
+// Package client is the QuietRoom protocol 4 client used by the CLI and GUI.
+// It owns the connection, chat messages, end-to-end encryption and file
+// transfers (with flow control); the user interface only renders Events and
+// calls methods.
 package client
 
 import (
@@ -33,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/darkfiber-lab/quietroom/e2e"
 	"github.com/darkfiber-lab/quietroom/wire"
 )
 
@@ -68,7 +70,7 @@ type Kind int
 const (
 	EvChat         Kind = iota // From, Room ("" = lobby), Text, Time, Self
 	EvDM                       // From, To, Text, Time, Self (sent by us)
-	EvJoined                   // User, Room ("" = joined the chat), Self, Created
+	EvJoined                   // User, Room ("" = joined the chat), Self, Created, Locked
 	EvLeft                     // User, Room ("" = left the chat), Self
 	EvInfo                     // Text: help, lists, confirmations
 	EvError                    // Text, Code: a refused request
@@ -93,6 +95,7 @@ type Event struct {
 	Code     string
 	Self     bool
 	Created  bool
+	Locked   bool      // EvJoined: a password room, end-to-end encrypted
 	Transfer *Transfer // a snapshot; safe to keep
 }
 
@@ -128,6 +131,9 @@ type Client struct {
 	wg        sync.WaitGroup
 
 	emitMu sync.Mutex
+
+	smu sync.Mutex // end-to-end encryption state
+	sec *secureState
 
 	mu     sync.Mutex
 	refSeq int
@@ -214,7 +220,7 @@ func describe(err error) error {
 	case strings.Contains(msg, "remote error: tls") && strings.Contains(msg, "certificate"):
 		return fmt.Errorf("access denied — the server rejected your access key; your %s is wrong or outdated (the server may have been restarted)", AccessFileName)
 	case errors.Is(err, wire.ErrFrame):
-		return fmt.Errorf("the server speaks a different protocol version (QuietRoom 3 clients need a QuietRoom 3 server)")
+		return fmt.Errorf("the server speaks a different protocol version (QuietRoom 4 clients need a QuietRoom 4 server)")
 	}
 	return err
 }
@@ -262,6 +268,11 @@ func Dial(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	id, err := e2e.NewIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("cannot create session keys: %w", err)
+	}
+	kx, sk := id.Public().Encode()
 	tlsCfg := access.TLSConfig()
 	dialer := &net.Dialer{Timeout: cfg.DialTimeout, KeepAlive: 30 * time.Second}
 	conn, err := tls.DialWithDialer(dialer, "tcp", cfg.Addr, tlsCfg)
@@ -275,7 +286,7 @@ func Dial(cfg Config) (*Client, error) {
 	// Login: hello -> welcome | error. In TLS 1.3 a rejected access key
 	// surfaces on this first read.
 	conn.SetDeadline(time.Now().Add(cfg.DialTimeout))
-	hello, _ := wire.EncodeMsg(wire.Msg{T: wire.THello, V: wire.Version, User: user})
+	hello, _ := wire.EncodeMsg(wire.Msg{T: wire.THello, V: wire.Version, User: user, KX: kx, SK: sk})
 	if _, err := conn.Write(hello); err != nil {
 		conn.Close()
 		return nil, describe(err)
@@ -311,6 +322,7 @@ func Dial(cfg Config) (*Client, error) {
 		ctrl:   make(chan []byte, 256),
 		bulk:   make(chan []byte, 8),
 		done:   make(chan struct{}),
+		sec:    newSecureState(id),
 		offers: make(map[string]*outgoing),
 		out:    make(map[string]*outgoing),
 		in:     make(map[string]*incoming),
@@ -467,7 +479,8 @@ func (c *Client) keepalive() {
 // the normal API; this exists for tools and tests.
 func (c *Client) SendMsg(m wire.Msg) error { return c.send(m) }
 
-// Chat sends a message to the lobby (room "") or a room we are in.
+// Chat sends a message to the lobby (room "") or a room we are in. Messages
+// to password rooms are end-to-end encrypted.
 func (c *Client) Chat(room, text string) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -476,10 +489,23 @@ func (c *Client) Chat(room, text string) error {
 	if len(text) > wire.MaxTextBytes {
 		return fmt.Errorf("message too long (max %d bytes)", wire.MaxTextBytes)
 	}
+	if room != "" {
+		c.smu.Lock()
+		r := c.sec.rooms[room]
+		_, joining := c.sec.joining[room]
+		if r != nil {
+			defer c.smu.Unlock()
+			return c.sendSecureChat(r, text)
+		}
+		c.smu.Unlock()
+		if joining {
+			return fmt.Errorf("still joining %s; try again in a moment", room)
+		}
+	}
 	return c.send(wire.Msg{T: wire.TChat, Room: room, Text: text})
 }
 
-// DM sends a private message.
+// DM sends an end-to-end encrypted private message.
 func (c *Client) DM(to, text string) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -488,13 +514,26 @@ func (c *Client) DM(to, text string) error {
 	if len(text) > wire.MaxTextBytes {
 		return fmt.Errorf("message too long (max %d bytes)", wire.MaxTextBytes)
 	}
-	return c.send(wire.Msg{T: wire.TDM, To: to, Text: text})
+	return c.sendDM(to, text)
 }
 
-// Join joins or creates a room. Success is reported by an EvJoined event
-// with Self set; a refusal by EvError.
+// Join joins or creates a room. With a password the room is end-to-end
+// encrypted: the password never leaves this computer (deriving the keys
+// takes a moment). Success is reported by an EvJoined event with Self set;
+// a refusal by EvError.
 func (c *Client) Join(room, password string) error {
-	return c.send(wire.Msg{T: wire.TJoin, Room: room, Password: password})
+	password = strings.TrimSpace(password)
+	if len(password) > wire.MaxPasswordBytes {
+		return fmt.Errorf("password too long (max %d bytes)", wire.MaxPasswordBytes)
+	}
+	m := wire.Msg{T: wire.TJoin, Room: room}
+	if password != "" {
+		if !wire.ValidRoomName(room) {
+			return c.send(m) // let the server explain the naming rules
+		}
+		m.VF = c.prepareJoin(room, password)
+	}
+	return c.send(m)
 }
 
 // Leave leaves a room.
@@ -538,6 +577,13 @@ func (c *Client) Command(line, room string) error {
 		return c.Request(wire.TMembers, cmd.Args[0])
 	case "msg":
 		return c.DM(cmd.Args[0], cmd.Rest)
+	case "verify":
+		text, err := c.VerifyText(cmd.Args[0])
+		if err != nil {
+			return err
+		}
+		c.emit(Event{Kind: EvInfo, Text: text})
+		return nil
 	case "join":
 		return c.Join(cmd.Args[0], cmd.Rest)
 	case "leave":
@@ -598,15 +644,57 @@ func (c *Client) reader() {
 func (c *Client) handleMsg(m wire.Msg) {
 	switch m.T {
 	case wire.TChat:
+		if m.CT != "" {
+			c.handleSecureChat(m)
+			return
+		}
+		if m.Room != "" && c.IsSecureRoom(m.Room) {
+			return // a password room carries only encrypted messages
+		}
 		// The server already cleans text; cleaning again protects against
 		// a server that does not.
 		c.emit(Event{Kind: EvChat, From: m.From, Room: m.Room, Text: wire.CleanText(m.Text), Time: m.Time, Self: m.From == c.user})
 	case wire.TDM:
-		c.emit(Event{Kind: EvDM, From: m.From, To: m.To, Text: wire.CleanText(m.Text), Time: m.Time, Self: m.From == c.user})
+		c.handleDM(m)
+	case wire.TPeer:
+		c.addPeer(m.User, m.KX, m.SK)
+	case wire.TRoomHello:
+		c.handleRoomHello(m)
+	case wire.TRoomKey:
+		c.handleRoomKey(m)
 	case wire.TJoined:
-		c.emit(Event{Kind: EvJoined, User: m.User, Room: m.Room, Self: m.User == c.user, Created: m.Created})
+		self := m.User == c.user
+		locked := m.Locked
+		if m.Room == "" && !self {
+			c.addPeer(m.User, m.KX, m.SK)
+		}
+		if m.Room != "" && self {
+			var leave bool
+			var note string
+			locked, leave, note = c.joinedSecure(m.Room, m.Locked)
+			if note != "" {
+				kind := EvInfo
+				if leave {
+					kind = EvError
+				}
+				c.emit(Event{Kind: kind, Text: note})
+			}
+			if leave {
+				c.send(wire.Msg{T: wire.TLeave, Room: m.Room})
+			}
+		}
+		c.emit(Event{Kind: EvJoined, User: m.User, Room: m.Room, Self: self, Created: m.Created, Locked: locked})
 	case wire.TLeft:
-		c.emit(Event{Kind: EvLeft, User: m.User, Room: m.Room, Self: m.User == c.user})
+		self := m.User == c.user
+		switch {
+		case m.Room == "" && !self:
+			c.removePeer(m.User)
+		case m.Room != "" && self:
+			c.leftSecure(m.Room)
+		case m.Room != "":
+			c.memberLeft(m.Room, m.User)
+		}
+		c.emit(Event{Kind: EvLeft, User: m.User, Room: m.Room, Self: self})
 	case wire.TInfo:
 		c.emit(Event{Kind: EvInfo, Text: m.Text})
 	case wire.TError:
@@ -635,3 +723,5 @@ func (c *Client) handleMsg(m wire.Msg) {
 		c.finishOut(m.ID, true, "")
 	}
 }
+
+func nowClock() string { return time.Now().Format("15:04:05") }

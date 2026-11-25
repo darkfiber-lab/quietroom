@@ -179,7 +179,58 @@ func TestPasswordRoom(t *testing.T) {
 	eve.C.Request(wire.TMembers, "#vault")
 	eve.Wait("hidden members", wait, testserver.Text(client.EvError, "access denied"))
 	eve.C.Join("#vault", "correct horse")
-	eve.Wait("joined", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#vault" })
+	eve.Wait("joined", wait, func(e client.Event) bool {
+		return e.Kind == client.EvJoined && e.Self && e.Room == "#vault" && e.Locked
+	})
+	if !eve.C.IsSecureRoom("#vault") {
+		t.Fatal("password room not end-to-end encrypted")
+	}
+
+	// Members read each other once keys are exchanged (right after joining),
+	// in both directions, and again after a member left and came back
+	// (everyone switches to new keys when someone leaves).
+	converse := func(from, to *testserver.Member, text string) {
+		t.Helper()
+		deadline := time.Now().Add(wait)
+		for {
+			from.C.Chat("#vault", text)
+			if _, ok := to.TryWait(500*time.Millisecond, func(e client.Event) bool {
+				return e.Kind == client.EvChat && e.Room == "#vault" && e.From == from.Name && e.Text == text
+			}); ok {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s never read %q from %s", to.Name, text, from.Name)
+			}
+		}
+	}
+	converse(alice, eve, "hello eve")
+	converse(eve, alice, "hello alice")
+	carol := s.Join(t, "carol")
+	carol.C.Join("#vault", "correct horse")
+	carol.Wait("carol joined", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#vault" })
+	converse(carol, alice, "carol here")
+	converse(alice, carol, "welcome carol")
+	eve.C.Leave("#vault")
+	alice.Wait("eve left", wait, func(e client.Event) bool { return e.Kind == client.EvLeft && e.User == "eve" && e.Room == "#vault" })
+	converse(alice, carol, "after eve left")
+	converse(carol, alice, "still here")
+	eve.C.Join("#vault", "correct horse")
+	eve.Wait("eve back", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#vault" })
+	converse(alice, eve, "welcome back")
+	converse(eve, carol, "thanks")
+
+	// A password join into a room that exists without a password (or that a
+	// server claims is open) is left at once: nothing private goes out in
+	// the clear.
+	carol.C.Join("#open", "")
+	carol.Wait("open room", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#open" })
+	alice.C.Join("#open", "my secret room")
+	alice.Wait("downgrade refused", wait, testserver.Text(client.EvError, "already exists as an open room"))
+	alice.Wait("left again", wait, func(e client.Event) bool { return e.Kind == client.EvLeft && e.Self && e.Room == "#open" })
+	if alice.C.IsSecureRoom("#open") {
+		t.Fatal("open room treated as encrypted")
+	}
 
 	// Long passwords (up to the 256-byte limit) work, and differ in every byte.
 	long := strings.Repeat("ü", wire.MaxPasswordBytes/2) // 256 bytes
@@ -229,6 +280,44 @@ func TestDM(t *testing.T) {
 	carol.Wait("help", wait, testserver.Text(client.EvInfo, "Available Commands"))
 	if _, ok := carol.TryWait(time.Second, testserver.Kind(client.EvDM)); ok {
 		t.Fatal("third party received a DM")
+	}
+	s.CheckOutput(t)
+}
+
+// TestSafetyNumbers: both sides of a conversation see the same pair of
+// numbers, and the numbers change with every connection.
+func TestSafetyNumbers(t *testing.T) {
+	s := start(t)
+	alice := s.Join(t, "alice")
+	bob := s.Join(t, "bob")
+	alice.C.DM("bob", "sync") // waits for bob's keys
+	bob.Wait("dm", wait, testserver.Kind(client.EvDM))
+	am, ab, err := alice.C.SafetyNumbers("bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bm, ba, err := bob.C.SafetyNumbers("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if am != ba || ab != bm || am == ab {
+		t.Fatalf("alice sees %s/%s, bob sees %s/%s", am, ab, bm, ba)
+	}
+	alice.C.Command("/verify bob", "")
+	alice.Wait("verify output", wait, func(e client.Event) bool {
+		return e.Kind == client.EvInfo && strings.Contains(e.Text, am) && strings.Contains(e.Text, ab)
+	})
+	if _, _, err := alice.C.SafetyNumbers("nobody"); err == nil {
+		t.Fatal("safety number for an unknown member")
+	}
+
+	bob.C.Close()
+	bob2 := s.Join(t, "bob")
+	bob2.C.DM("alice", "back")
+	alice.Wait("dm from new session", wait, func(e client.Event) bool { return e.Kind == client.EvDM && e.Text == "back" })
+	_, ab2, _ := alice.C.SafetyNumbers("bob")
+	if ab2 == ab {
+		t.Fatal("safety number unchanged after reconnecting")
 	}
 	s.CheckOutput(t)
 }

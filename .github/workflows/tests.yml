@@ -59,12 +59,12 @@ jobs:
 
       - name: Vet
         run: |
-          go vet ./wire/ ./client/ ./lineedit/... ./tests/...
+          go vet ./wire/ ./e2e/ ./client/ ./lineedit/... ./tests/...
           go vet quietroom_server.go
           go vet quietroom_client.go
 
       - name: Unit tests
-        run: go test -race -count=1 ./wire/ ./client/ ./lineedit/...
+        run: go test -race -count=1 ./wire/ ./e2e/ ./client/ ./lineedit/...
 
       - name: Linux desktop notifications (GUI, against a private D-Bus)
         working-directory: quietroom-gui
@@ -74,10 +74,13 @@ jobs:
           command -v dbus-daemon || { sudo apt-get update && sudo apt-get install -y --no-install-recommends dbus-daemon; }
           go test -race -count=1 ./internal/linuxnotify/
 
-      - name: Fuzz the frame reader, message decoder, command parser and ClientHello parser
+      - name: Fuzz the frame reader, message decoder, command parser, ClientHello parser and decryption
         run: |
           for target in FuzzRead FuzzDecodeMsg FuzzParseCommand FuzzReadClientHello; do
             go test ./wire/ -run=NONE -fuzz="^${target}\$" -fuzztime=60s
+          done
+          for target in FuzzPairOpen FuzzRoomOpen FuzzParsePublicKeys FuzzFileOpen; do
+            go test ./e2e/ -run=NONE -fuzz="^${target}\$" -fuzztime=30s
           done
 
   integration:
@@ -96,6 +99,12 @@ jobs:
           go-version: '1.26.x'
           check-latest: true
           cache: false
+
+      - name: Install the Python connector's dependencies (hash-pinned)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --require-hashes -r tests/integration/testdata/requirements.txt
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
 
       - name: Run integration tests (race-enabled server and client)
         run: go test -race -count=1 -timeout 15m -v ./tests/integration/

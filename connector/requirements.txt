@@ -1,6 +1,8 @@
 # QuietRoom LLM Bot — Python dependencies
 # Install with: pip install -r requirements.txt
-# The connector itself needs only the Python standard library.
+# The connector itself needs only cryptography (end-to-end encryption).
+
+cryptography>=44       # X25519, Ed25519, ChaCha20-Poly1305, Argon2id
 
 requests>=2.33.0       # Ollama backend
 openai>=1.0.0          # OpenAI-compatible backend (also works with local servers)

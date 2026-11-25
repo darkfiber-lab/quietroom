@@ -28,12 +28,15 @@ import (
 //
 // Client to server:
 //
-//	hello{v,user}          first message; answered by welcome or error
-//	chat{room,text}        room "" = lobby
-//	dm{to,text}
-//	join{room,password} leave{room}
+//	hello{v,user,kx,sk}    first message; kx, sk = session public keys
+//	chat{room,text}        lobby (room "") and open rooms
+//	chat{room,kid,n,ct,sig}  password rooms: end-to-end encrypted
+//	dm{to,n,ct}            end-to-end encrypted direct message
+//	join{room,vf} leave{room}   vf = room verifier (password rooms)
+//	rhello{room,proof}     prove the room password to the other members
+//	rkey{to,n,ct}          encrypted room key for one member
 //	rooms users members{room} help   (room "lobby" for lobby members)
-//	file_offer{ref,to,name,size,sha256}
+//	file_offer{ref,to,size,n,ct}   size = encrypted bytes to be sent
 //	file_accept{id,bytes}  bytes = initial flow-control window
 //	file_credit{id,bytes}  grant more window
 //	file_decline{id} file_cancel{id} file_end{id}
@@ -42,11 +45,16 @@ import (
 // Server to client:
 //
 //	welcome{user,v}
-//	chat{from,room,text,time} dm{from,to,text,time}
-//	joined{user,room,created} left{user,room}   room "" = the chat itself
+//	peer{user,kx,sk}       session keys of a member already online
+//	chat{from,room,text,time} chat{from,room,kid,n,ct,sig,time}
+//	dm{from,to,n,ct,time}  to the recipient
+//	dm{from,to,n,time}     to the sender: delivered
+//	joined{user,room,created,locked,kx,sk}   room "" = the chat itself
+//	left{user,room}
+//	rhello{from,room,proof} rkey{from,n,ct}
 //	info{text} error{code,text}
-//	file_offer{id,from,name,size,sha256}        to the recipient
-//	file_offered{ref,id,to,name}                to the sender
+//	file_offer{id,from,size,n,ct}               to the recipient
+//	file_offered{ref,id,to,size}                to the sender
 //	file_accept{id,bytes} file_credit{id,bytes} to the sender
 //	file_decline{id,user} file_cancel{id,text}
 //	file_end{id}                                 to the recipient
@@ -75,6 +83,9 @@ const (
 	TFileCancel  = "file_cancel"
 	TFileEnd     = "file_end"
 	TFileDone    = "file_done"
+	TPeer        = "peer"
+	TRoomHello   = "rhello"
+	TRoomKey     = "rkey"
 )
 
 // Error codes (Msg.Code) the client may act on.
@@ -93,6 +104,11 @@ const (
 	MaxRoomNameLen   = 32
 	MaxFileNameBytes = 255
 	MaxPasswordBytes = 256
+	// MaxCipherText bounds an encrypted payload field (base64): a padded
+	// plaintext of at most 32 KiB plus the authentication tag.
+	MaxCipherText = (32*1024 + 16 + 2) / 3 * 4
+	MaxKeyField   = 44 // base64 of a 32-byte key
+	MaxSigField   = 88 // base64 of a 64-byte signature
 )
 
 // Flow control for file transfers. The recipient grants credit in bytes; the
@@ -106,23 +122,33 @@ const (
 // Msg is a control message. One flat struct keeps the encoding simple for
 // every client (Go and Python); unused fields are omitted.
 type Msg struct {
-	T        string `json:"t"`
-	V        int    `json:"v,omitempty"`
-	User     string `json:"user,omitempty"`
-	From     string `json:"from,omitempty"`
-	To       string `json:"to,omitempty"`
-	Room     string `json:"room,omitempty"`
-	Text     string `json:"text,omitempty"`
-	Password string `json:"password,omitempty"`
-	Time     string `json:"time,omitempty"`
-	Code     string `json:"code,omitempty"`
-	Created  bool   `json:"created,omitempty"`
-	Ref      string `json:"ref,omitempty"`
-	ID       string `json:"id,omitempty"`
-	Name     string `json:"name,omitempty"`
-	Size     int64  `json:"size,omitempty"`
-	SHA256   string `json:"sha256,omitempty"`
-	Bytes    int64  `json:"bytes,omitempty"`
+	T       string `json:"t"`
+	V       int    `json:"v,omitempty"`
+	User    string `json:"user,omitempty"`
+	From    string `json:"from,omitempty"`
+	To      string `json:"to,omitempty"`
+	Room    string `json:"room,omitempty"`
+	Text    string `json:"text,omitempty"`
+	Time    string `json:"time,omitempty"`
+	Code    string `json:"code,omitempty"`
+	Created bool   `json:"created,omitempty"`
+	Ref     string `json:"ref,omitempty"`
+	ID      string `json:"id,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Size    int64  `json:"size,omitempty"`
+	SHA256  string `json:"sha256,omitempty"`
+	Bytes   int64  `json:"bytes,omitempty"`
+	Locked  bool   `json:"locked,omitempty"` // joined: an end-to-end encrypted room
+
+	// End-to-end encryption (protocol 4), all base64 except the counters.
+	KX    string `json:"kx,omitempty"`    // X25519 session key
+	SK    string `json:"sk,omitempty"`    // Ed25519 session key
+	N     uint32 `json:"n,omitempty"`     // message counter
+	KID   uint32 `json:"kid,omitempty"`   // room sender key ID
+	CT    string `json:"ct,omitempty"`    // ciphertext
+	Sig   string `json:"sig,omitempty"`   // room message signature
+	Proof string `json:"proof,omitempty"` // knowledge of the room password
+	VF    string `json:"vf,omitempty"`    // room verifier
 }
 
 // EncodeMsg builds a control frame.

@@ -20,7 +20,9 @@ Only the maintainer can see the report. You will get an acknowledgement when the
 
 Some properties are deliberate design decisions, not vulnerabilities:
 
-- The server decrypts and re-encrypts messages; the operator's server is trusted by design.
+- The lobby and rooms without a password are not end-to-end encrypted: they are open to everyone holding the access file, and the server relays them in the clear (inside TLS). Direct messages, file transfers and password rooms are end-to-end encrypted (see [docs/E2E_DESIGN.md](docs/E2E_DESIGN.md)); ways for the server or anyone else to read or forge them are very much in scope.
+- The server sees metadata (who is online, who sends a DM or file to whom, room membership, message sizes rounded to a size class).
+- A server can substitute keys in direct messages unless the members compare safety numbers (`/verify`); this is detected, not prevented.
 - All participants share one access key (`quietroom_access.pem`); access is revoked by restarting the server, which issues a new key.
 
 Reports about other aspects of these mechanisms (for example ways to bypass the access key) are very welcome.

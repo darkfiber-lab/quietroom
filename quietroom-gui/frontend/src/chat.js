@@ -170,7 +170,7 @@ export const Chat = {
     // Update topbar title
     const title = document.getElementById('topbar-title')
     if (channelKey === '__lobby__') title.textContent = 'Lobby'
-    else if (channelKey.startsWith('__dm__')) title.textContent = '@ ' + channelKey.replace('__dm__', '')
+    else if (channelKey.startsWith('__dm__')) title.textContent = '🔒 @ ' + channelKey.replace('__dm__', '')
     else title.textContent = channelKey
 
     // Re-render messages for this channel
@@ -233,6 +233,8 @@ export const Chat = {
         <span class="unread-badge hidden" data-room="${this._escapeText(key)}"></span>`
       li.addEventListener('click', () => this.switchTo(key))
       document.getElementById('dm-list').appendChild(li)
+      this.appendSystem(`🔒 Direct messages and files with ${partner} are end-to-end encrypted. ` +
+        `To make sure nobody is in between, type /verify ${partner} and compare the numbers with them.`, key)
     }
     this.switchTo(key)
   },

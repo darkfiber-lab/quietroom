@@ -36,6 +36,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/darkfiber-lab/quietroom/e2e"
 	"github.com/darkfiber-lab/quietroom/tests/testserver"
 	"github.com/darkfiber-lab/quietroom/wire"
 )
@@ -102,7 +103,7 @@ func rejected(conn *tls.Conn, err error) bool {
 		return true
 	}
 	defer conn.Close()
-	conn.Write(mustMsg(wire.Msg{T: wire.THello, V: wire.Version, User: uniqueName("x")}))
+	conn.Write(mustMsg(hello(newIdentity(), uniqueName("x"))))
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, rerr := wire.Read(conn)
 	return rerr != nil && !isTimeout(rerr)
@@ -118,6 +119,21 @@ type raw struct {
 	t    *testing.T
 	name string
 	conn *tls.Conn
+	id   *e2e.Identity // session keys announced in hello
+}
+
+func newIdentity() *e2e.Identity {
+	id, err := e2e.NewIdentity()
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
+// hello is a well-formed login with session keys.
+func hello(id *e2e.Identity, name string) wire.Msg {
+	kx, sk := id.Public().Encode()
+	return wire.Msg{T: wire.THello, V: wire.Version, User: name, KX: kx, SK: sk}
 }
 
 // rawSession opens a TLS session with the valid access key, without login.
@@ -127,7 +143,7 @@ func rawSession(t *testing.T, s *testserver.Server) *raw {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	r := &raw{t: t, conn: conn}
+	r := &raw{t: t, conn: conn, id: newIdentity()}
 	t.Cleanup(func() { conn.Close() })
 	return r
 }
@@ -137,7 +153,7 @@ func rawLogin(t *testing.T, s *testserver.Server, name string) *raw {
 	t.Helper()
 	r := rawSession(t, s)
 	r.name = name
-	r.send(wire.Msg{T: wire.THello, V: wire.Version, User: name})
+	r.send(hello(r.id, name))
 	m := r.next(15 * time.Second)
 	if m.T != wire.TWelcome {
 		t.Fatalf("login %s: got %+v", name, m)

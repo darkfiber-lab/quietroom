@@ -7,7 +7,7 @@ An LLM integration layer for QuietRoom built on top of `quietroom_connector`. Us
 ## Requirements
 
 ```bash
-pip install requests openai
+pip install -r requirements.txt   # requests, openai and cryptography
 ```
 
 - Python 3.11 or higher
@@ -207,7 +207,7 @@ Logs go to stdout and `llm_bot.log`. Entries include connection events, incoming
 
 ## Security notes
 
-- Certificate pinning and the access key are handled by the connector and inherited automatically.
+- Certificate pinning, the access key and end-to-end encryption are handled by the connector and inherited automatically: direct messages to and from the bot are encrypted, so the server cannot read them. The bot itself, and the LLM backend it forwards prompts to, do read them.
 - When a user leaves the chat, their conversation history is purged (via the connector's presence events).
 - The bot never responds to room messages and cannot be triggered without a deliberate DM.
 - Conversation histories are held in memory only and never written to disk.

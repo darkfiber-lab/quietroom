@@ -1,6 +1,6 @@
 # QuietRoom Connector
 
-A Python library for building automated clients on top of a QuietRoom server. Handles the full protocol stack (QuietRoom protocol 3: TLS 1.3 with the access key, framed and padded messages, decoys and keepalives) and exposes a clean callback-based interface. It uses only the Python standard library.
+A Python library for building automated clients on top of a QuietRoom server. Handles the full protocol stack (QuietRoom protocol 4: TLS 1.3 with the access key, framed and padded messages, end-to-end encryption, decoys and keepalives) and exposes a clean callback-based interface.
 
 The connector maintains a persistent connection for as long as it runs. The username it registers appears on the server from the moment `connect()` returns until `disconnect()` is called or the process exits.
 
@@ -8,9 +8,13 @@ The connector maintains a persistent connection for as long as it runs. The user
 
 ## Requirements
 
-No packages to install: the connector uses only the Python standard library.
+The connector needs one package, `cryptography` (version 44 or later), for the end-to-end encryption of direct messages and password rooms:
 
-Python 3.11 or higher, and a QuietRoom 3 server. `quietroom_access.pem` must be copied from the server to the working directory. It is secret (it contains the access key) and is replaced every time the server restarts.
+```bash
+pip install 'cryptography>=44'
+```
+
+Python 3.11 or higher, and a QuietRoom 4 server. `quietroom_access.pem` must be copied from the server to the working directory. It is secret (it contains the access key) and is replaced every time the server restarts.
 
 ---
 
@@ -180,19 +184,29 @@ Raises `ValueError` if `room` does not start with `#`.
 
 ### `send_dm(recipient, text)`
 
-Send a direct message to a specific user.
+Send a direct message to a specific user. Direct messages are end-to-end encrypted: the server relays them but cannot read them. If the user is not online, a notice arrives via `on_system_message`.
 
 ```python
 conn.send_dm("alice", "Hello!")
+```
+
+### `safety_numbers(user)`
+
+Return `(ours, theirs)`: the safety numbers of this session and of the other member's. If the other member sees the same two numbers (`/verify <bot name>` in the QuietRoom clients), nobody, not even the server, has substituted keys between you. The numbers change on every connection. Raises `ConnectorError` if the user is not online.
+
+```python
+ours, theirs = conn.safety_numbers("alice")
 ```
 
 ### `join_room(room, password="")`
 
 Join a room. Room names must start with `#`. The room is tracked locally so `send_room_message()` can validate membership.
 
+With a password, the room is end-to-end encrypted: the password never leaves the connector (it is turned into keys with Argon2id, which takes a moment and about 64 MiB of memory), and only members who know it can read the room. Messages sent right after joining may be refused with `ConnectorError("still joining ...")` until the server confirms the join.
+
 ```python
 conn.join_room("#general")
-conn.join_room("#private", password="secret")
+conn.join_room("#private", password="a long and unguessable passphrase")
 ```
 
 ### `leave_room(room)`

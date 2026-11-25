@@ -9,6 +9,7 @@ Available for macOS, Windows, and Linux.
 ## Features
 
 ### Security
+- **End-to-end encryption** — direct messages, files and password rooms are encrypted between members (🔒); the server relays them without being able to read them. Type `/verify <user>` in a DM to compare safety numbers
 - **TLS 1.3** — all traffic encrypted with ephemeral keys (forward secrecy)
 - **Access key** — the client presents the master access key from `quietroom_access.pem` during the TLS handshake; the server refuses connections without it
 - **Certificate pinning** — the server's TLS certificate is compared byte-for-byte against the one stored in `quietroom_access.pem`; connections are refused if they don't match, blocking man-in-the-middle attacks
@@ -17,9 +18,9 @@ Available for macOS, Windows, and Linux.
 
 ### Messaging
 - **Lobby** — the default channel, visible to all users not currently in a room
-- **Rooms** — create or join named rooms (`#roomname`), optionally password-protected
+- **Rooms** — create or join named rooms (`#roomname`); rooms with a password are end-to-end encrypted
 - **Multi-room** — join multiple rooms simultaneously and receive messages from all of them; switch between channels in the sidebar without leaving
-- **Direct messages** — private encrypted DMs to any online user via the DM panel
+- **Direct messages** — end-to-end encrypted DMs to any online user via the DM panel
 - **Unread badges** — unread message counts shown in the sidebar for all channels
 
 ### User directory
@@ -127,4 +128,4 @@ Open settings via the **⚙** button on the login screen or the settings button 
 - The client never stores messages on disk — all conversation history is held in memory for the duration of the session only
 - Server profiles (host, port, username, certificate path) are stored in the OS config directory (`~/Library/Application Support/QuietRoom/config.json` on macOS, `~/.config/QuietRoom/config.json` on Linux, `%AppData%\QuietRoom\config.json` on Windows)
 - The access file (`quietroom_access.pem`) is read from disk on each connection — it is never embedded in the application
-- File transfers are relayed through the server, which means the server operator can see file contents in transit. This is an architectural limitation of the relay model and is documented behaviour.
+- File transfers are relayed through the server but end-to-end encrypted: the server operator sees neither the contents nor the file name, only the size rounded to 32 KiB. Messages in the lobby and in rooms without a password are readable by the server.

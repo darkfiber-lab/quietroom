@@ -17,6 +17,7 @@ package client
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"hash"
 	"io"
@@ -27,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/darkfiber-lab/quietroom/e2e"
 	"github.com/darkfiber-lab/quietroom/wire"
 )
 
@@ -35,20 +37,24 @@ const progressEvery = 250 * time.Millisecond
 // maxIncoming bounds the offers and transfers to us we keep track of.
 const maxIncoming = 64
 
-// outgoing is a file we offered.
+// outgoing is a file we offered. Sizes and flow control on the wire count
+// encrypted bytes (csize, credit, csent); size and sent are the file's.
 type outgoing struct {
-	ref  string
-	id   string
-	idb  [wire.IDLen]byte
-	to   string
-	path string
-	name string
-	size int64
-	sha  string
+	ref   string
+	id    string
+	idb   [wire.IDLen]byte
+	to    string
+	path  string
+	name  string
+	size  int64
+	csize int64
+	sha   string
+	key   []byte
 
 	mu      sync.Mutex
 	credit  int64
 	sent    int64
+	csent   int64
 	started bool
 	wake    chan struct{} // credit arrived
 	stop    chan struct{} // cancelled
@@ -63,21 +69,26 @@ func (o *outgoing) snapshot() *Transfer {
 
 func (o *outgoing) halt() { o.once.Do(func() { close(o.stop) }) }
 
-// incoming is a file offered to us.
+// incoming is a file offered to us. recv counts file bytes; crecv and
+// granted count encrypted bytes on the wire.
 type incoming struct {
-	id   string
-	idb  [wire.IDLen]byte
-	from string
-	name string
-	size int64
-	sha  string
+	id    string
+	idb   [wire.IDLen]byte
+	from  string
+	name  string
+	size  int64
+	csize int64
+	sha   string
+	key   []byte
 
 	accepted bool
 	f        *os.File
 	part     string // temporary path while receiving
 	dir      string
 	h        hash.Hash
+	open     *e2e.FileOpener
 	recv     int64
+	crecv    int64
 	granted  int64
 	lastProg time.Time
 }
@@ -100,8 +111,10 @@ func HashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// OfferFile hashes a file and offers it to a member. It returns once the
-// offer is sent; EvFileOffered follows when the server has registered it.
+// OfferFile hashes a file and offers it to a member, end-to-end encrypted:
+// the name, size, hash and file key travel inside the encrypted offer. It
+// returns once the offer is sent; EvFileOffered follows when the server has
+// registered it.
 func (c *Client) OfferFile(to, path string) (*Transfer, error) {
 	path = filepath.Clean(path)
 	info, err := os.Stat(path)
@@ -122,17 +135,38 @@ func (c *Client) OfferFile(to, path string) (*Transfer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot hash file: %w", err)
 	}
+	key, err := e2e.NewFileKey()
+	if err != nil {
+		return nil, err
+	}
 
 	c.mu.Lock()
 	c.refSeq++
 	o := &outgoing{
-		ref: strconv.Itoa(c.refSeq), to: to, path: path, name: name, size: info.Size(), sha: sum,
+		ref: strconv.Itoa(c.refSeq), to: to, path: path, name: name, size: info.Size(),
+		csize: e2e.CipherSize(info.Size()), sha: sum, key: key,
 		wake: make(chan struct{}, 1), stop: make(chan struct{}),
 	}
 	c.offers[o.ref] = o
 	c.mu.Unlock()
 
-	err = c.send(wire.Msg{T: wire.TFileOffer, Ref: o.ref, To: to, Name: name, Size: o.size, SHA256: sum})
+	if strings.EqualFold(to, c.user) {
+		snap := o.snapshot()
+		c.failOffer(o.ref, "You cannot send files to yourself.")
+		return snap, nil
+	}
+	p := c.waitPeer(to)
+	if p == nil {
+		c.smu.Unlock()
+		snap := o.snapshot()
+		c.failOffer(o.ref, fmt.Sprintf("User '%s' is not online.", to))
+		return snap, nil
+	}
+	n, ct, err := p.pair.Seal(wire.TFileOffer, marshal(fileBody{Name: name, Size: o.size, SHA256: sum, Key: e2e.Encode(key)}))
+	if err == nil {
+		err = c.send(wire.Msg{T: wire.TFileOffer, Ref: o.ref, To: p.name, Size: o.csize, N: n, CT: e2e.Encode(ct)})
+	}
+	c.smu.Unlock()
 	if err != nil {
 		c.mu.Lock()
 		delete(c.offers, o.ref)
@@ -214,24 +248,24 @@ func (c *Client) stream(o *outgoing) {
 		return
 	}
 	defer f.Close()
+	sealer, err := e2e.NewFileSealer(o.key)
+	if err != nil {
+		fail(err.Error())
+		return
+	}
 
-	buf := make([]byte, wire.DataChunk)
+	buf := make([]byte, e2e.PlainChunk)
 	last := time.Now()
 	for {
+		// Whole encrypted chunks only: wait until the credit covers one.
 		o.mu.Lock()
 		remaining := o.size - o.sent
-		n := int64(len(buf))
-		if o.credit < n {
-			n = o.credit
-		}
-		if remaining < n {
-			n = remaining
-		}
+		ready := o.credit >= e2e.CipherChunk
 		o.mu.Unlock()
 		if remaining == 0 {
 			break
 		}
-		if n == 0 {
+		if !ready {
 			select {
 			case <-o.wake:
 				continue
@@ -241,11 +275,20 @@ func (c *Client) stream(o *outgoing) {
 				return
 			}
 		}
+		n := int64(len(buf))
+		if remaining < n {
+			n = remaining
+		}
 		if _, err := io.ReadFull(f, buf[:n]); err != nil {
 			fail("file changed while sending")
 			return
 		}
-		frame, err := wire.EncodeData(o.idb, buf[:n])
+		chunk, err := sealer.Seal(buf[:n], n == remaining)
+		if err != nil {
+			fail(err.Error())
+			return
+		}
+		frame, err := wire.EncodeData(o.idb, chunk)
 		if err != nil {
 			fail(err.Error())
 			return
@@ -258,7 +301,8 @@ func (c *Client) stream(o *outgoing) {
 			return
 		}
 		o.mu.Lock()
-		o.credit -= n
+		o.credit -= e2e.CipherChunk
+		o.csent += e2e.CipherChunk
 		o.sent += n
 		o.mu.Unlock()
 		if time.Since(last) >= progressEvery {
@@ -297,11 +341,28 @@ func (c *Client) finishOut(id string, ok bool, reason string) {
 
 func (c *Client) handleOffer(m wire.Msg) {
 	idb, ok := wire.ParseID(m.ID)
-	name := wire.CleanFileName(m.Name)
-	if !ok || name == "" || m.Size <= 0 || !wire.ValidSHA256(m.SHA256) {
+	if !ok {
 		return
 	}
-	in := &incoming{id: m.ID, idb: idb, from: m.From, name: name, size: m.Size, sha: strings.ToLower(m.SHA256)}
+	plain, err := c.openPair(m.From, wire.TFileOffer, m.N, m.CT)
+	if err != nil {
+		c.send(wire.Msg{T: wire.TFileDecline, ID: m.ID})
+		c.emit(Event{Kind: EvError, Text: fmt.Sprintf("A file offer from %s could not be decrypted and was declined.", m.From)})
+		return
+	}
+	var body fileBody
+	if json.Unmarshal(plain, &body) != nil {
+		return
+	}
+	name := wire.CleanFileName(body.Name)
+	key, kerr := e2e.Decode(body.Key, e2e.KeyLen)
+	if name == "" || body.Size <= 0 || !wire.ValidSHA256(body.SHA256) || kerr != nil || len(key) != e2e.KeyLen ||
+		e2e.CipherSize(body.Size) != m.Size {
+		c.send(wire.Msg{T: wire.TFileDecline, ID: m.ID})
+		return
+	}
+	in := &incoming{id: m.ID, idb: idb, from: m.From, name: name, size: body.Size, csize: m.Size,
+		sha: strings.ToLower(body.SHA256), key: key}
 	c.mu.Lock()
 	if _, dup := c.in[m.ID]; dup || len(c.in) >= maxIncoming {
 		c.mu.Unlock()
@@ -336,6 +397,10 @@ func (c *Client) AcceptFile(id string) error {
 	if err := os.MkdirAll(c.cfg.DownloadDir, 0700); err != nil {
 		return fmt.Errorf("cannot create download directory: %w", err)
 	}
+	opener, err := e2e.NewFileOpener(in.key)
+	if err != nil {
+		return err
+	}
 	f, err := os.CreateTemp(c.cfg.DownloadDir, "."+name+".*.part")
 	if err != nil {
 		return fmt.Errorf("cannot create file: %w", err)
@@ -352,6 +417,7 @@ func (c *Client) AcceptFile(id string) error {
 	in.part = f.Name()
 	in.dir = c.cfg.DownloadDir
 	in.h = sha256.New()
+	in.open = opener
 	in.granted = wire.InitialWindow
 	in.lastProg = time.Now()
 	snap := in.snapshot()
@@ -413,17 +479,26 @@ func (c *Client) handleData(payload []byte) {
 	case in == nil || !in.accepted || in.f == nil:
 		c.mu.Unlock()
 		return
-	case in.recv+int64(len(data)) > in.size:
+	case in.crecv+int64(len(data)) > in.csize:
 		failure = "sender sent more data than announced"
 	default:
-		if _, err := in.f.Write(data); err != nil {
+		in.crecv += int64(len(data))
+		plain, err := in.open.Open(data, in.crecv == in.csize)
+		if err != nil {
+			failure = "file data failed authentication (corrupted or tampered with)"
+			break
+		}
+		if rest := in.size - in.recv; int64(len(plain)) > rest {
+			plain = plain[:rest] // padding of the last chunk
+		}
+		if _, err := in.f.Write(plain); err != nil {
 			failure = "cannot write file: " + err.Error()
 			break
 		}
-		in.h.Write(data)
-		in.recv += int64(len(data))
+		in.h.Write(plain)
+		in.recv += int64(len(plain))
 		// Keep about InitialWindow bytes of credit outstanding.
-		if in.granted-in.recv <= wire.InitialWindow-wire.CreditStep && in.granted < in.size {
+		if in.granted-in.crecv <= wire.InitialWindow-wire.CreditStep && in.granted < in.csize {
 			in.granted += wire.CreditStep
 			credit = wire.CreditStep
 		}
@@ -458,13 +533,16 @@ func (c *Client) completeIn(id string) {
 	delete(c.in, id)
 	t := in.snapshot()
 	recv, size, part, dir, name, want := in.recv, in.size, in.part, in.dir, in.name, in.sha
+	if !in.open.Done() {
+		recv = -1 // the final chunk never arrived
+	}
 	sum := hex.EncodeToString(in.h.Sum(nil))
 	closeErr := in.f.Close()
 	c.mu.Unlock()
 
 	if recv != size {
 		os.Remove(part)
-		c.emit(Event{Kind: EvFileFailed, Transfer: t, Text: fmt.Sprintf("incomplete file (%d of %d bytes)", recv, size)})
+		c.emit(Event{Kind: EvFileFailed, Transfer: t, Text: fmt.Sprintf("incomplete file (%d of %d bytes)", max(recv, 0), size)})
 		return
 	}
 	if sum != want {

@@ -163,7 +163,7 @@ func TestGUIBackend(t *testing.T) {
 
 	// Rooms: the current room changes only on the server's confirmation.
 	a.JoinRoom("guiroom", "")
-	rec.wait("room_joined", map[string]string{"username": "gui", "room": "#guiroom"})
+	rec.wait("room_joined", map[string]string{"username": "gui", "room": "#guiroom", "locked": "false"})
 	if a.GetCurrentRoom() != "#guiroom" {
 		t.Fatalf("current room = %q", a.GetCurrentRoom())
 	}
@@ -174,7 +174,7 @@ func TestGUIBackend(t *testing.T) {
 		return e.Kind == client.EvChat && e.Room == "#guiroom" && e.Text == "in the room"
 	})
 	a.JoinRoom("#locked", "pw")
-	rec.wait("room_joined", map[string]string{"username": "gui", "room": "#locked"})
+	rec.wait("room_joined", map[string]string{"username": "gui", "room": "#locked", "locked": "true"})
 	alice.C.Join("#locked", "wrong")
 	alice.Wait("refused", wait, func(e client.Event) bool { return e.Kind == client.EvError })
 	a.SetCurrentRoom("#guiroom")

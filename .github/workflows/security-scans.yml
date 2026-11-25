@@ -71,7 +71,7 @@ jobs:
         run: |
           work="${RUNNER_TEMP}/vulncheck-${PROGRAM}"
           mkdir -p "${work}"
-          cp -R go.mod go.sum wire client lineedit "quietroom_${PROGRAM}.go" "${work}/"
+          cp -R go.mod go.sum wire e2e client lineedit "quietroom_${PROGRAM}.go" "${work}/"
           (cd "${work}" && govulncheck -format sarif ./... > "${GITHUB_WORKSPACE}/govulncheck-${PROGRAM}.sarif")
 
       - name: Upload results

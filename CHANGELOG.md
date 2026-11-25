@@ -2,11 +2,23 @@
 
 ## [Unreleased]
 
+Protocol 4: not compatible with 3.x servers and clients. Update the server and every client (CLI, GUI, Python connector) together.
+
 ### Added
+- **End-to-end encryption** for direct messages, file transfers and password rooms: the server relays them without being able to read them. Keys are created for every connection and kept in memory only; nothing is stored. Design and limits: [docs/E2E_DESIGN.md](docs/E2E_DESIGN.md).
+  - **Direct messages and files** — encrypted between the two members (X25519, a key chain per direction for forward secrecy, ChaCha20-Poly1305, padded to size classes). File names, sizes and hashes travel inside the encrypted offer; the server sees the encrypted size only, rounded to 32 KiB.
+  - **`/verify <user>`** shows the safety numbers of a conversation (both members' numbers, computed like Signal's). If both members see the same numbers, nobody, not even the server, is in between. Also `SafetyNumbers()` in the Go client and `safety_numbers()` in the Python connector.
+  - **Password rooms** — the password never leaves the client: it is stretched with Argon2id and gives a verifier for the server and a key that members use to prove they know the password. Only members with a valid proof get the room keys, so the server (or anyone it lets in) cannot read the room; members who cannot prove the password are reported. Each member's messages are signed, so members cannot forge each other's. Newcomers cannot read earlier messages, and keys change whenever someone leaves.
+  - CLI, GUI and connector show which rooms and conversations are end-to-end encrypted (🔒).
 - **OpenSSF Best Practices badge** — QuietRoom meets the "passing" level and Baseline level 1; the badge is shown in the README. The README's contribution guidelines now state the pull-request process and that new functionality comes with tests.
 - **Container deployment examples** in `deploy/`: a rootless Podman Quadlet unit run by an unprivileged `quietroom` system user (nothing runs as root; private user namespace, host network, read-only, no capabilities, resource limits, started at boot), a rootful variant for cgroup v1 hosts in `deploy/rootful/`, and an nftables egress guard that blocks every outbound connection from the server's user and keeps the service user away from cloud metadata services. Documented in SERVER_README.MD, "Running in a container"; the DOCKERFILE comments now cover Docker and Podman.
 
 ### ⚠ Changed
+- **Protocol 4** — clients send session keys when logging in; direct messages and file offers are always encrypted; `join` carries a room verifier instead of the password. Servers refuse protocol 3 clients, and the other way round.
+- **The lobby and rooms without a password are still readable by the server** (inside TLS, as before): they are open to everyone with the access file. Use a password room or direct messages for anything private.
+- **Python connector needs `cryptography`** (44 or later) for the end-to-end encryption; it was standard-library only before. `connector/requirements.txt` lists it.
+- **Direct messages to yourself** stay on your computer (shown, not sent); before, the server echoed them.
+- **Room passwords are no longer hashed by the server** — it compares verifiers derived on the clients with Argon2id (64 MiB, a fraction of a second per join on the client) instead of running PBKDF2 itself, so joining password rooms no longer costs the server CPU time.
 - **Container image runs as uid/gid 65532** instead of 1000. On most Linux hosts 1000 is the first login user, so a process escaping the container would have been that user; 65532 belongs to no account. Existing data volumes must be given to 65532 before upgrading (`chown -R 65532:65532` on the volume, or Podman's `:U` mount option); see SERVER_README.MD, "Running in a container".
 - **No generated files in the repository** — the built GUI frontend (`quietroom-gui/frontend/dist/`, a minified bundle produced by Vite) is no longer committed; `wails build` and `wails dev` generate it. Only an empty `dist/.gitkeep` remains, so the GUI's Go code compiles on a fresh clone; the Vite config puts it back after each build. Stray `.DS_Store` files and Wails' `package.json.md5` are gone and ignored.
 
