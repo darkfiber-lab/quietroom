@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.0.1] - 2026-11-25
+
+Compatible with 4.0 servers and clients (protocol 4).
+
+### Fixed
+- **Release archives keep the execute permission** — the binaries in the CLI and server zips (`quietroom-cli-*.zip`) were stored without it, so after unzipping they had to be made executable with `chmod +x` before they would start. The release now sets it before zipping and fails if any binary in a zip is not executable.
+
 ## [4.0.0] - 2026-11-25
 
 Protocol 4: not compatible with 3.x servers and clients. Update the server and every client (CLI, GUI, Python connector) together.
