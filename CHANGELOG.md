@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [4.0.0] - 2026-11-25
 
 Protocol 4: not compatible with 3.x servers and clients. Update the server and every client (CLI, GUI, Python connector) together.
 
