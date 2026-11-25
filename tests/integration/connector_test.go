@@ -38,6 +38,10 @@ func TestPythonConnector(t *testing.T) {
 	alice := s.Join(t, "alice")
 	alice.C.Join("#py", "")
 	alice.Wait("join", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#py" })
+	alice.C.Join("#pysecret", "py-and-go")
+	alice.Wait("join secure", wait, func(e client.Event) bool {
+		return e.Kind == client.EvJoined && e.Self && e.Room == "#pysecret" && e.Locked
+	})
 
 	host, port, _ := net.SplitHostPort(s.Addr)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -97,6 +101,31 @@ func TestPythonConnector(t *testing.T) {
 	if l := expect("JOINED "); l != "JOINED #py" {
 		t.Fatalf("joined rooms: %q", l)
 	}
+	mine, theirs, err := alice.C.SafetyNumbers("pybot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l := expect("SAFETY "); l != "SAFETY "+theirs+" / "+mine {
+		t.Fatalf("safety numbers differ between Go and Python: %q vs %s / %s", l, theirs, mine)
+	}
+	// Keys are exchanged once pybot has joined; repeat until it answers.
+	alice.Wait("pybot joins #pysecret", wait, func(e client.Event) bool {
+		return e.Kind == client.EvJoined && e.User == "pybot" && e.Room == "#pysecret"
+	})
+	deadline := time.Now().Add(wait)
+	for {
+		alice.C.Chat("#pysecret", "go to python")
+		if _, ok := alice.TryWait(500*time.Millisecond, chatFrom("pybot", "secure echo: go to python")); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no encrypted answer from the Python connector; stderr:\n%s", stderr.String())
+		}
+	}
+	if l := expect("SECURE "); l != "SECURE alice: go to python" {
+		t.Fatalf("secure line: %q", l)
+	}
+	expect("SECURE OK")
 	if l := expect("DUPLICATE "); !strings.Contains(l, "REFUSED") || !strings.Contains(l, "already taken") {
 		t.Fatalf("duplicate: %q", l)
 	}

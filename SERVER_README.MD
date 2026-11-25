@@ -1,14 +1,15 @@
 # Secure Chat Server
 
-A self-hosted encrypted chat server: TLS 1.3 with forward secrecy, a shared access key that keeps outsiders out, padded traffic and decoys against traffic analysis.
+A self-hosted encrypted chat server: it relays end-to-end encrypted direct messages, files and password rooms without being able to read them; TLS 1.3 with forward secrecy, a shared access key that keeps outsiders out, padded traffic and decoys against traffic analysis.
 
 ## Features
 
+- 🔒 **Cannot read private conversations** - Direct messages, files and password rooms are end-to-end encrypted between clients; the server never sees room passwords
 - 🔐 **TLS 1.3 only** - Forward secrecy; clients pin the exact server certificate
 - 🔑 **Access key (mutual TLS)** - Connections without the current access key are refused during the handshake
 - 🕵️ **Traffic padding** - Every frame is padded to a size class, hiding message lengths
 - 🎭 **Decoy Traffic** - Random cover frames at random intervals hide activity patterns
-- 📁 **Flow-controlled file relay** - Files of any size; the server never stores them and buffers at most a few MB per transfer
+- 📁 **Flow-controlled file relay** - Files of any size, encrypted end to end; the server never stores them and buffers at most a few MB per transfer
 - 📝 **Privacy-preserving Logging** - Security events are logged without recording participants (metadata logging is opt-in)
 - 👥 **Multi-client Support** - Concurrent connections with thread-safe broadcasting
 
@@ -72,7 +73,7 @@ You should see:
 ✓ Access file saved to: quietroom_access.pem
 ⚠ COPY quietroom_access.pem to client machines before connecting — it is SECRET, anyone holding it can join!
 ⚠ Restarting the server invalidates the previous access file.
-✓ QuietRoom server (protocol 3) listening on port 37842 (TLS 1.3, access key required, silent to strangers)
+✓ QuietRoom server (protocol 4) listening on port 37842 (TLS 1.3, access key required, silent to strangers)
 ✓ Logging to: chat_server.log
 ✓ Security logging to: security.log
 ✓ Metadata logging off: logs contain no participant information
@@ -211,10 +212,12 @@ Usernames are 1–32 letters, digits, `_`, `-` or `.` (no spaces), and unique re
    - Tokens are valid for ±5 minutes (clock skew) and only once (replays are refused)
    - The port still accepts TCP connections; use a firewall if it must not appear open at all
 
-4. **Trusted server**
-   - The server decrypts and relays messages and files (by design); it never stores them
+4. **End-to-end encryption**
+   - Direct messages, file transfers and password rooms are encrypted between clients; the server relays them without being able to read them, and never sees room passwords (only a verifier derived from them)
+   - The lobby and rooms without a password are relayed in the clear (inside TLS); the server never stores any message
+   - The server still handles metadata: who is online, who sends a DM or file to whom, room membership. See [docs/E2E_DESIGN.md](docs/E2E_DESIGN.md)
 
-### Protocol (version 3)
+### Protocol (version 4)
 
 - Every frame states its exact length; the receiver never guesses where a frame ends, so the stream cannot get out of sync
 - Control messages are typed JSON; the server sets sender names and timestamps itself, so members cannot impersonate each other
@@ -234,7 +237,7 @@ By default (`log_metadata: false`) the logs contain no information about partici
 ### Security Log (`security.log`), default
 
 ```
-[SECURITY] 2026/11/22 15:30:45 Server started (protocol 3)
+[SECURITY] 2026/11/22 15:30:45 Server started (protocol 4)
 [SECURITY] 2026/11/22 15:31:02 Rejected connection from 203.0.113.7:51544: no gate token
 [SECURITY] 2026/11/22 15:31:40 Rejected connection from 198.51.100.4:40212: no TLS ClientHello: not a TLS ClientHello
 [SECURITY] 2026/11/22 15:32:00 Refused 12 connection(s) over connection limits in the last minute
@@ -374,7 +377,7 @@ netstat -tulpn | grep 37842
 1. `no gate token` / `no TLS ClientHello` is almost always an internet scanner; nothing was revealed to it
 2. `invalid or expired gate token` means a client with an old access file (a server restart replaces it) or a clock more than 5 minutes off; `replayed gate token` means someone re-sent a captured connection attempt
 3. `access key not recognised` / `client didn't provide a certificate` means a client passed the gate but presented a wrong access key
-4. `No valid hello` usually means an outdated client: QuietRoom 3 servers need QuietRoom 3 clients
+4. `No valid hello` usually means an outdated client: QuietRoom 4 servers need QuietRoom 4 clients
 
 ## Security Best Practices
 

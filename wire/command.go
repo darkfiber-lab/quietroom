@@ -81,6 +81,11 @@ func ParseCommand(line string) (Command, error) {
 			p = p[1 : len(p)-1]
 		}
 		cmd.Rest = p
+	case "verify":
+		if len(args) < 1 {
+			return cmd, fmt.Errorf("Usage: /verify <user>")
+		}
+		cmd.Args = args[:1]
 	case "accept", "decline", "cancel":
 		if len(args) < 1 {
 			return cmd, fmt.Errorf("Usage: /%s <transfer id>", name)
@@ -95,13 +100,14 @@ func ParseCommand(line string) (Command, error) {
 // HelpText is shown for /help (by the server, so all clients agree).
 const HelpText = `Available Commands:
   /help                      - Show this help message
-  /msg <user> <message>      - Send a private message
-  /join <#room> [password]   - Join or create a room (optionally password-protected)
+  /msg <user> <message>      - Send a private message (end-to-end encrypted)
+  /verify <user>             - Show safety numbers to check nobody is in between
+  /join <#room> [password]   - Join or create a room (with a password: end-to-end encrypted)
   /leave <#room>             - Leave a room
   /rooms                     - List active rooms
   /users                     - List online users
   /members <#room|lobby>     - List members of a room or the lobby
-  /file <user> <path>        - Offer a file to a user
+  /file <user> <path>        - Offer a file to a user (end-to-end encrypted)
   /accept <id>               - Accept a file transfer
   /decline <id>              - Decline a file transfer
   /cancel <id>               - Cancel a file transfer in progress

@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"net"
 	"os"
 	"strings"
@@ -28,11 +29,15 @@ import (
 	"time"
 
 	"github.com/darkfiber-lab/quietroom/client"
+	"github.com/darkfiber-lab/quietroom/e2e"
 	"github.com/darkfiber-lab/quietroom/tests/testserver"
 	"github.com/darkfiber-lab/quietroom/wire"
 )
 
 const sha = "0000000000000000000000000000000000000000000000000000000000000000"
+
+// junkCT stands in for an encrypted offer: the server cannot tell.
+var junkCT = e2e.Encode(make([]byte, 96))
 
 // forgeAccessCert copies the subject and validity of the real access
 // certificate onto an attacker-owned key.
@@ -257,6 +262,19 @@ func TestMalformedFrames(t *testing.T) {
 		}
 		expectClosed(t, r.conn, 10*time.Second)
 	})
+	t.Run("hello without session keys", func(t *testing.T) {
+		for _, m := range []wire.Msg{
+			{T: wire.THello, V: wire.Version, User: uniqueName("nokeys")},
+			{T: wire.THello, V: wire.Version, User: uniqueName("badkeys"), KX: "AAAA", SK: "AAAA"},
+		} {
+			r := rawSession(t, s)
+			r.send(m)
+			if got := r.next(10 * time.Second); got.T != wire.TError || got.Code != wire.CodeProtocol {
+				t.Fatalf("got %+v", got)
+			}
+			expectClosed(t, r.conn, 10*time.Second)
+		}
+	})
 	t.Run("request before hello", func(t *testing.T) {
 		r := rawSession(t, s)
 		r.send(wire.Msg{T: wire.TChat, Text: "skip login"})
@@ -294,7 +312,7 @@ func TestHostileUsernames(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := rawSession(t, s)
-			r.send(wire.Msg{T: wire.THello, V: wire.Version, User: user})
+			r.send(hello(r.id, user))
 			m := r.next(10 * time.Second)
 			if m.T != wire.TError || m.Code != wire.CodeInvalidUsername {
 				t.Fatalf("got %+v", m)
@@ -307,7 +325,7 @@ func TestHostileUsernames(t *testing.T) {
 		rawLogin(t, s, name)
 		for _, variant := range []string{name, strings.ToUpper(name)} {
 			r := rawSession(t, s)
-			r.send(wire.Msg{T: wire.THello, V: wire.Version, User: variant})
+			r.send(hello(r.id, variant))
 			if m := r.next(10 * time.Second); m.T != wire.TError || m.Code != wire.CodeUsernameTaken {
 				t.Fatalf("%s: got %+v", variant, m)
 			}
@@ -327,11 +345,18 @@ func TestSpoofing(t *testing.T) {
 	if e.From != "mallory" || e.Time == "00:00:00" {
 		t.Fatalf("spoofed chat: %+v", e)
 	}
-	mallory.send(wire.Msg{T: wire.TDM, To: "alice", From: "admin", Text: "trust me"})
-	e = alice.Wait("dm", 15*time.Second, testserver.Kind(client.EvDM))
-	if e.From != "mallory" {
+	// A DM claiming another sender: the server stamps the real sender, and
+	// the forged ciphertext does not decrypt under mallory's keys either.
+	mallory.send(wire.Msg{T: wire.TDM, To: "alice", From: "admin", N: 0, CT: e2e.Encode(make([]byte, 80))})
+	e = alice.Wait("undecryptable dm", 15*time.Second, testserver.Text(client.EvError, "could not be decrypted"))
+	if !strings.Contains(e.Text, "from mallory") {
 		t.Fatalf("spoofed DM sender: %+v", e)
 	}
+	// Plain-text DMs no longer exist.
+	mallory.send(wire.Msg{T: wire.TDM, To: "alice", Text: "in the clear"})
+	mallory.waitFor("plain dm refused", func(m wire.Msg) bool {
+		return m.T == wire.TError && strings.Contains(m.Text, "Invalid encrypted message")
+	})
 	// Presence and transfer messages are server-only.
 	for _, m := range []wire.Msg{
 		{T: wire.TJoined, User: "admin", Room: "#x"},
@@ -355,11 +380,17 @@ func TestRoomAbuse(t *testing.T) {
 		eve.send(wire.Msg{T: wire.TJoin, Room: room})
 		eve.waitFor("invalid room", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "Invalid room name") })
 	}
-	eve.send(wire.Msg{T: wire.TJoin, Room: "#x", Password: strings.Repeat("p", wire.MaxPasswordBytes+1)})
-	eve.waitFor("long password", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "Password too long") })
+	for _, vf := range []string{"not base64!", e2e.Encode(make([]byte, 31)), e2e.Encode(make([]byte, 64))} {
+		eve.send(wire.Msg{T: wire.TJoin, Room: "#x", VF: vf})
+		eve.waitFor("bad verifier", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "Invalid room verifier") })
+	}
 
 	alice.C.Join("#vault", "correct horse")
 	alice.Wait("joined", 15*time.Second, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#vault" })
+	eve.send(wire.Msg{T: wire.TJoin, Room: "#vault"})
+	eve.waitFor("needs password", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "password-protected") })
+	eve.send(wire.Msg{T: wire.TJoin, Room: "#vault", VF: e2e.Encode(e2e.DeriveRoom("#vault", "wrong").Verifier)})
+	eve.waitFor("wrong password", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "Incorrect password") })
 	eve.send(wire.Msg{T: wire.TChat, Room: "#vault", Text: "let me in"})
 	eve.waitFor("not a member", func(m wire.Msg) bool { return m.T == wire.TError && strings.Contains(m.Text, "not a member of #vault") })
 	eve.send(wire.Msg{T: wire.TLeave, Room: "#vault"})
@@ -379,6 +410,116 @@ func TestRoomAbuse(t *testing.T) {
 	healthy(t, s)
 }
 
+// TestPasswordRoomWithoutPassword: someone who gets into a password room
+// without knowing the password (a malicious server lets them in, or the
+// verifier leaked) is refused the keys by every member and reads nothing.
+// Members who know the password read each other normally.
+func TestPasswordRoomWithoutPassword(t *testing.T) {
+	s := start(t, testserver.Config{})
+	alice := s.Join(t, uniqueName("alice"))
+	bob := s.Join(t, uniqueName("bob"))
+	eve := rawLogin(t, s, uniqueName("eve"))
+
+	const room, password = "#vault", "correct horse battery staple"
+	alice.C.Join(room, password)
+	alice.Wait("alice joined", 30*time.Second, func(e client.Event) bool {
+		return e.Kind == client.EvJoined && e.Self && e.Room == room && e.Locked
+	})
+
+	// Eve presents the verifier (all the server ever sees) with a proof she
+	// cannot compute without the password.
+	eve.send(wire.Msg{T: wire.TJoin, Room: room, VF: e2e.Encode(e2e.DeriveRoom(room, password).Verifier)})
+	eve.waitFor("eve joined", func(m wire.Msg) bool { return m.T == wire.TJoined && m.User == eve.name && m.Room == room })
+	eve.send(wire.Msg{T: wire.TRoomHello, Room: room, Proof: e2e.Encode(make([]byte, 32))})
+	alice.Wait("warning about eve", 15*time.Second, testserver.Text(client.EvError, eve.name+" is in "+room+" but could not prove"))
+
+	bob.C.Join(room, password)
+	bob.Wait("bob joined", 30*time.Second, func(e client.Event) bool {
+		return e.Kind == client.EvJoined && e.Self && e.Room == room && e.Locked
+	})
+	// Keys are exchanged after the join; retry until bob reads alice.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		alice.C.Chat(room, "the-secret-payload")
+		if _, ok := bob.TryWait(time.Second, testserver.Text(client.EvChat, "the-secret-payload")); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bob never read alice's message")
+		}
+	}
+
+	// Eve saw only ciphertext and never got a room key.
+	eve.send(wire.Msg{T: wire.THelp}) // sync point
+	sawCipher := false
+	for {
+		m := eve.next(15 * time.Second)
+		if strings.Contains(m.Text, "the-secret-payload") {
+			t.Fatal("eve read the room in the clear")
+		}
+		if m.T == wire.TRoomKey {
+			t.Fatalf("eve was given a room key by %s", m.From)
+		}
+		if m.T == wire.TChat && m.Room == room && m.CT != "" {
+			sawCipher = true
+		}
+		if m.T == wire.TInfo && strings.Contains(m.Text, "Available Commands") {
+			break
+		}
+	}
+	if !sawCipher {
+		t.Fatal("eve did not even see the ciphertext (test did not exercise the relay)")
+	}
+	// Plain text into a password room is refused by the server.
+	eve.send(wire.Msg{T: wire.TChat, Room: room, Text: "plain"})
+	eve.waitFor("plain refused", func(m wire.Msg) bool {
+		return m.T == wire.TError && strings.Contains(m.Text, "Invalid encrypted message")
+	})
+	healthy(t, s)
+}
+
+// TestRoomHelloFlood: a member who repeats its proof of the password gets
+// each member's key once, not once per hello (no amplification).
+func TestRoomHelloFlood(t *testing.T) {
+	s := start(t, testserver.Config{})
+	alice := s.Join(t, uniqueName("alice"))
+	mallory := rawLogin(t, s, uniqueName("mallory"))
+	const room, password = "#flood", "a shared password"
+	alice.C.Join(room, password)
+	alice.Wait("alice joined", 30*time.Second, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == room })
+	rs := e2e.DeriveRoom(room, password)
+	mallory.send(wire.Msg{T: wire.TJoin, Room: room, VF: e2e.Encode(rs.Verifier)})
+	mallory.waitFor("joined", func(m wire.Msg) bool { return m.T == wire.TJoined && m.User == mallory.name && m.Room == room })
+	proof := e2e.Encode(rs.Proof(mallory.name, mallory.id.Public()))
+	for i := 0; i < 5; i++ {
+		mallory.send(wire.Msg{T: wire.TRoomHello, Room: room, Proof: proof})
+	}
+	// Mallory's DM after the hellos: once alice shows it, she has handled
+	// every hello. Her DM back then arrives after any keys she sent.
+	pair, err := mallory.id.NewPair(alice.C.PublicKeys())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, ct, _ := pair.Seal(wire.TDM, []byte(`{"text":"done"}`))
+	mallory.send(wire.Msg{T: wire.TDM, To: alice.Name, N: n, CT: e2e.Encode(ct)})
+	alice.Wait("mallory's dm", 15*time.Second, func(e client.Event) bool { return e.Kind == client.EvDM && e.Text == "done" })
+	alice.C.DM(mallory.name, "sync")
+	keys := 0
+	for {
+		m := mallory.next(15 * time.Second)
+		if m.T == wire.TRoomKey {
+			keys++
+		}
+		if m.T == wire.TDM && m.From == alice.Name { // not the notice for mallory's own DM
+			break
+		}
+	}
+	if keys != 1 {
+		t.Fatalf("alice sent %d room keys for 5 hellos, want 1", keys)
+	}
+	healthy(t, s)
+}
+
 // sha256 hex of n zero bytes is not needed: the server does not verify file
 // content, only sizes and flow control. Recipients verify hashes.
 
@@ -386,7 +527,7 @@ func TestRoomAbuse(t *testing.T) {
 // recipient accept with the given window. Returns the transfer ID.
 func offerRaw(t *testing.T, sender, recipient *raw, size, window int64) [wire.IDLen]byte {
 	t.Helper()
-	sender.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: recipient.name, Name: "f.bin", Size: size, SHA256: sha})
+	sender.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: recipient.name, Size: size, CT: junkCT})
 	offer := recipient.waitFor("offer", func(m wire.Msg) bool { return m.T == wire.TFileOffer })
 	sender.waitFor("offered", func(m wire.Msg) bool { return m.T == wire.TFileOffered })
 	recipient.send(wire.Msg{T: wire.TFileAccept, ID: offer.ID, Bytes: window})
@@ -415,12 +556,27 @@ func TestHashMismatchDiscarded(t *testing.T) {
 	mallory := rawLogin(t, s, uniqueName("mallory"))
 	bob := s.Join(t, uniqueName("bob"))
 
-	mallory.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: bob.Name, Name: "setup.exe", Size: 1000, SHA256: sha})
+	// Mallory encrypts properly to bob, but announces a hash the data does
+	// not have.
+	pair, err := mallory.id.NewPair(bob.C.PublicKeys())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _ := e2e.NewFileKey()
+	body, _ := json.Marshal(map[string]any{"name": "setup.exe", "size": 1000, "sha256": sha, "key": e2e.Encode(key)})
+	n, ct, _ := pair.Seal(wire.TFileOffer, body)
+	mallory.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: bob.Name, Size: e2e.CipherSize(1000), N: n, CT: e2e.Encode(ct)})
 	o := bob.Wait("offer", 15*time.Second, func(e client.Event) bool { return e.Kind == client.EvFileOffer })
+	if o.Transfer.Name != "setup.exe" || o.Transfer.Size != 1000 {
+		t.Fatalf("offer: %+v", o.Transfer)
+	}
 	bob.C.AcceptFile(o.Transfer.ID)
 	accept := mallory.waitFor("accept", func(m wire.Msg) bool { return m.T == wire.TFileAccept })
 	id, _ := wire.ParseID(accept.ID)
-	mallory.write(dataFrame(id, 1000)) // zeros: not the announced hash
+	sealer, _ := e2e.NewFileSealer(key)
+	chunk, _ := sealer.Seal(make([]byte, 1000), true) // zeros: not the announced hash
+	frame, _ := wire.EncodeData(id, chunk)
+	mallory.write(frame)
 	mallory.send(wire.Msg{T: wire.TFileEnd, ID: accept.ID})
 
 	e := bob.Wait("result", 15*time.Second, func(e client.Event) bool {
@@ -443,7 +599,7 @@ func TestTransferAbuse(t *testing.T) {
 
 	t.Run("sender exceeds credit", func(t *testing.T) {
 		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
-		id := offerRaw(t, a, b, 10<<20, 64<<10)
+		id := offerRaw(t, a, b, 320*wire.DataChunk, 64<<10)
 		a.write(dataFrame(id, wire.DataChunk))
 		a.write(dataFrame(id, wire.DataChunk))
 		a.write(dataFrame(id, 64<<10-2*wire.DataChunk+1)) // one byte over the window
@@ -452,20 +608,21 @@ func TestTransferAbuse(t *testing.T) {
 	})
 	t.Run("sender sends more than announced", func(t *testing.T) {
 		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
-		id := offerRaw(t, a, b, 100, wire.InitialWindow)
-		a.write(dataFrame(id, 101))
+		id := offerRaw(t, a, b, wire.DataChunk, wire.InitialWindow)
+		a.write(dataFrame(id, wire.DataChunk))
+		a.write(dataFrame(id, 1))
 		b.waitFor("cancel", cancelled("more data than announced"))
 	})
 	t.Run("early file_end", func(t *testing.T) {
 		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
-		id := offerRaw(t, a, b, 1000, wire.InitialWindow)
+		id := offerRaw(t, a, b, 2*wire.DataChunk, wire.InitialWindow)
 		a.write(dataFrame(id, 10))
 		a.send(wire.Msg{T: wire.TFileEnd, ID: wire.IDString(id)})
 		b.waitFor("cancel", cancelled("incomplete"))
 	})
 	t.Run("data before acceptance", func(t *testing.T) {
 		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
-		a.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: b.name, Name: "f.bin", Size: 100, SHA256: sha})
+		a.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: b.name, Size: wire.DataChunk, CT: junkCT})
 		offered := a.waitFor("offered", func(m wire.Msg) bool { return m.T == wire.TFileOffered })
 		id, _ := wire.ParseID(offered.ID)
 		a.write(dataFrame(id, 10))
@@ -473,22 +630,22 @@ func TestTransferAbuse(t *testing.T) {
 	})
 	t.Run("recipient over-grants credit", func(t *testing.T) {
 		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
-		id := offerRaw(t, a, b, 100<<20, wire.InitialWindow)
+		id := offerRaw(t, a, b, 3200*wire.DataChunk, wire.InitialWindow)
 		b.send(wire.Msg{T: wire.TFileCredit, ID: wire.IDString(id), Bytes: wire.MaxWindow})
 		a.waitFor("cancel", cancelled("invalid flow-control credit"))
 	})
 	t.Run("oversized initial window", func(t *testing.T) {
 		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
-		a.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: b.name, Name: "f.bin", Size: 100, SHA256: sha})
+		a.send(wire.Msg{T: wire.TFileOffer, Ref: "1", To: b.name, Size: wire.DataChunk, CT: junkCT})
 		offer := b.waitFor("offer", func(m wire.Msg) bool { return m.T == wire.TFileOffer })
 		b.send(wire.Msg{T: wire.TFileAccept, ID: offer.ID, Bytes: 1 << 40})
 		a.waitFor("cancel", cancelled("invalid flow-control window"))
 	})
 	t.Run("third party injects data", func(t *testing.T) {
 		a, b, e := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b")), rawLogin(t, s, uniqueName("e"))
-		id := offerRaw(t, a, b, 100, wire.InitialWindow)
+		id := offerRaw(t, a, b, wire.DataChunk, wire.InitialWindow)
 		e.write(dataFrame(id, 50)) // eve knows the ID: dropped, not relayed
-		a.write(dataFrame(id, 100))
+		a.write(dataFrame(id, wire.DataChunk))
 		a.send(wire.Msg{T: wire.TFileEnd, ID: wire.IDString(id)})
 		a.waitFor("done", func(m wire.Msg) bool { return m.T == wire.TFileDone })
 		// Bob received exactly the sender's 100 bytes, then file_end.
@@ -510,32 +667,31 @@ func TestTransferAbuse(t *testing.T) {
 				}
 			}
 		}
-		if got != 100 {
-			t.Fatalf("recipient got %d bytes, want 100", got)
+		if got != wire.DataChunk {
+			t.Fatalf("recipient got %d bytes, want %d", got, wire.DataChunk)
 		}
 	})
 	t.Run("hostile offers", func(t *testing.T) {
 		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
 		for _, m := range []wire.Msg{
-			{Name: "..", Size: 1, SHA256: sha},
-			{Name: "f", Size: 0, SHA256: sha},
-			{Name: "f", Size: -5, SHA256: sha},
-			{Name: "f", Size: 1, SHA256: "nothex"},
+			{Size: 0, CT: junkCT},
+			{Size: -wire.DataChunk, CT: junkCT},
+			{Size: 1, CT: junkCT},                    // not whole encrypted chunks
+			{Size: wire.DataChunk},                   // no encrypted metadata
+			{Size: wire.DataChunk, CT: "x" + junkCT}, // oversized below
 		} {
+			if m.CT != "" && m.CT[0] == 'x' {
+				m.CT = strings.Repeat("A", wire.MaxCipherText+4)
+			}
 			m.T, m.Ref, m.To = wire.TFileOffer, "r", b.name
 			a.send(m)
 			a.waitFor("refusal", func(r wire.Msg) bool { return r.T == wire.TError && r.Ref == "r" })
-		}
-		a.send(wire.Msg{T: wire.TFileOffer, Ref: "p", To: b.name, Name: "../../etc/passwd", Size: 1, SHA256: sha})
-		offer := b.waitFor("offer", func(m wire.Msg) bool { return m.T == wire.TFileOffer })
-		if offer.Name != "passwd" {
-			t.Fatalf("path not stripped: %q", offer.Name)
 		}
 	})
 	t.Run("offer flood", func(t *testing.T) {
 		a, b := rawLogin(t, s, uniqueName("a")), rawLogin(t, s, uniqueName("b"))
 		for i := 0; i < 10; i++ {
-			a.send(wire.Msg{T: wire.TFileOffer, Ref: "f", To: b.name, Name: "f", Size: 1, SHA256: sha})
+			a.send(wire.Msg{T: wire.TFileOffer, Ref: "f", To: b.name, Size: wire.DataChunk, CT: junkCT})
 		}
 		a.waitFor("limit", func(m wire.Msg) bool {
 			return m.T == wire.TError && strings.Contains(m.Text, "Too many file transfers")
@@ -587,7 +743,7 @@ func TestReconnectRace(t *testing.T) {
 					return
 				}
 				name := uniqueName("flap")
-				conn.Write(mustMsg(wire.Msg{T: wire.THello, V: wire.Version, User: name}))
+				conn.Write(mustMsg(hello(newIdentity(), name)))
 				conn.Write(mustMsg(wire.Msg{T: wire.TJoin, Room: "#race"}))
 				conn.Write(mustMsg(wire.Msg{T: wire.TChat, Room: "#race", Text: "hello"}))
 				conn.Write(mustMsg(wire.Msg{T: wire.TChat, Text: "hello lobby"}))

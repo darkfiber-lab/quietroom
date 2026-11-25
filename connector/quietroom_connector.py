@@ -16,10 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 quietroom_connector.py
 
-A persistent connection client for QuietRoom (protocol 3). Handles TLS 1.3
-with the access key, the framed message protocol and keepalives, and exposes
-a callback-based interface for building bots, bridges and other automated
-clients. Uses only the Python standard library.
+A persistent connection client for QuietRoom (protocol 4). Handles TLS 1.3
+with the access key, the framed message protocol, end-to-end encryption and
+keepalives, and exposes a callback-based interface for building bots, bridges
+and other automated clients. Needs the 'cryptography' package (44 or later)
+for the end-to-end encryption; everything else is the standard library.
 
 Protocol notes
 --------------
@@ -31,6 +32,10 @@ Protocol notes
   traffic (enabled by default) or a keepalive every 60 seconds prevents this.
 - Room messages are sent with send_room_message(); you must have joined the
   room first.
+- Direct messages and password rooms are end-to-end encrypted: the server
+  relays ciphertext it cannot read. The lobby and rooms without a password
+  are not. safety_numbers() returns the numbers to compare with another
+  member (see /verify in the QuietRoom clients).
 
 Usage
 -----
@@ -70,7 +75,7 @@ from typing import Callable, Optional
 
 log = logging.getLogger("quietroom.connector")
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +191,7 @@ def _read_frame(sock: ssl.SSLSocket) -> tuple[int, bytes]:
     body = _read_exact(sock, length)
     frame_type, flags, pad = struct.unpack(">BBH", body[:4])
     if flags != 0 or pad > length - _HEADER or frame_type not in (FRAME_CONTROL, FRAME_DECOY, FRAME_DATA):
-        raise ConnectorError("protocol error: malformed frame (is the server QuietRoom 3?)")
+        raise ConnectorError("protocol error: malformed frame (is the server QuietRoom 4?)")
     return frame_type, body[_HEADER:length - pad]
 
 
@@ -261,6 +266,317 @@ def _load_client_cert(ctx: ssl.SSLContext, cert_and_key_pem: str):
 
 
 # ---------------------------------------------------------------------------
+# End-to-end encryption (protocol 4)
+# ---------------------------------------------------------------------------
+#
+# Mirrors the Go package e2e (see docs/E2E_DESIGN.md): every key is created
+# per connection and kept in memory only. Direct messages and room keys travel
+# on pairwise channels (X25519 + a KDF chain per direction); password rooms
+# use one sending chain per member, signed with Ed25519. Requires the
+# 'cryptography' package (44 or later, for Argon2id).
+
+try:
+    from cryptography.exceptions import InvalidSignature, InvalidTag
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    _CRYPTO_ERROR: Optional[str] = None
+except ImportError as _e:  # pragma: no cover - reported on connect()
+    _CRYPTO_ERROR = (
+        "QuietRoom 4 encrypts direct messages and password rooms end to end and needs the "
+        f"'cryptography' package, version 44 or later (pip install 'cryptography>=44'): {_e}"
+    )
+
+_L_PAIR      = b"QuietRoom v4 pair"
+_L_PAIR_AAD  = b"QuietRoom v4 pair message"
+_L_ROOM_SALT = b"QuietRoom v4 room salt"
+_L_ROOM_VF   = b"QuietRoom v4 room verifier"
+_L_ROOM_AUTH = b"QuietRoom v4 room auth"
+_L_PROOF     = b"QuietRoom v4 room member"
+_L_ROOM_AAD  = b"QuietRoom v4 room message"
+_L_ROOM_SIG  = b"QuietRoom v4 room signature"
+
+_KEY_LEN = 32
+_MAX_PADDED = 32 * 1024
+_MAX_SKIP = 1024
+_MAX_STORED = 256
+_NONCE0 = bytes(12)
+
+
+class DecryptError(Exception):
+    """A message did not authenticate (wrong key, tampered, replayed)."""
+
+
+def _b64(b: bytes) -> str:
+    return base64.b64encode(b).decode()
+
+
+def _unb64(s, max_len: int) -> bytes:
+    if not isinstance(s, str) or len(s) > (max_len + 2) // 3 * 4:
+        raise DecryptError("field too long")
+    try:
+        b = base64.b64decode(s, validate=True)
+    except ValueError as e:
+        raise DecryptError(str(e)) from e
+    if len(b) > max_len:
+        raise DecryptError("field too long")
+    return b
+
+
+def _pack(*fields: bytes) -> bytes:
+    return b"".join(struct.pack(">I", len(f)) + f for f in fields)
+
+
+def _u32(v: int) -> bytes:
+    return struct.pack(">I", v)
+
+
+def _hmac(key: bytes, data: bytes) -> bytes:
+    return hmac.new(key, data, hashlib.sha256).digest()
+
+
+def _hkdf(secret: bytes, info: bytes, length: int = _KEY_LEN) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=length, salt=None, info=info).derive(secret)
+
+
+def _pad(b: bytes) -> bytes:
+    size = 64
+    while size < len(b) + 1:
+        size *= 2
+    if size > _MAX_PADDED:
+        raise ValueError("message too large to encrypt")
+    return b + b"\x80" + bytes(size - len(b) - 1)
+
+
+def _unpad(b: bytes) -> bytes:
+    s = b.rstrip(b"\x00")
+    if not s or s[-1] != 0x80:
+        raise DecryptError("bad padding")
+    return s[:-1]
+
+
+def _seal_once(key: bytes, plain: bytes, aad: bytes) -> bytes:
+    return ChaCha20Poly1305(key).encrypt(_NONCE0, plain, aad)
+
+
+def _open_once(key: bytes, ct: bytes, aad: bytes) -> bytes:
+    try:
+        return ChaCha20Poly1305(key).decrypt(_NONCE0, ct, aad)
+    except InvalidTag as e:
+        raise DecryptError("authentication failed") from e
+
+
+def _step(ck: bytes) -> tuple[bytes, bytes]:
+    return _hmac(ck, b"\x01"), _hmac(ck, b"\x02")
+
+
+class _RecvChain:
+    """Receiving KDF chain tolerating dropped and reordered messages."""
+
+    def __init__(self, ck: bytes, n: int = 0):
+        self.ck, self.n = ck, n
+        self.skipped: dict[int, bytes] = {}
+
+    def key(self, n: int):
+        if n < self.n:
+            if n not in self.skipped:
+                raise DecryptError("replayed or too old")
+            return self.skipped[n], lambda: self.skipped.pop(n, None)
+        if n - self.n > _MAX_SKIP:
+            raise DecryptError("too far ahead")
+        ck, keys = self.ck, []
+        for _ in range(self.n, n):
+            mk, ck = _step(ck)
+            keys.append(mk)
+        mk, nck = _step(ck)
+
+        def commit():
+            for i, k in enumerate(keys):
+                self.skipped[self.n + i] = k
+            while len(self.skipped) > _MAX_STORED:
+                self.skipped.pop(min(self.skipped))
+            self.ck, self.n = nck, n + 1
+        return mk, commit
+
+
+class PublicKeys:
+    """A member's session public keys (X25519 and Ed25519)."""
+
+    def __init__(self, kx: bytes, sk: bytes):
+        self.kx, self.sk = kx, sk
+
+    @classmethod
+    def parse(cls, kx, sk) -> "PublicKeys":
+        k, s = _unb64(kx, _KEY_LEN), _unb64(sk, _KEY_LEN)
+        if len(k) != _KEY_LEN or len(s) != _KEY_LEN:
+            raise DecryptError("invalid public key")
+        return cls(k, s)
+
+
+class Identity:
+    """This connection's session keys."""
+
+    def __init__(self):
+        self._kx = X25519PrivateKey.generate()
+        self._sk = Ed25519PrivateKey.generate()
+        raw = (Encoding.Raw, PublicFormat.Raw)
+        self.public = PublicKeys(self._kx.public_key().public_bytes(*raw), self._sk.public_key().public_bytes(*raw))
+
+    def pair(self, peer: PublicKeys) -> "Pair":
+        return Pair(self, peer)
+
+    def sign(self, data: bytes) -> bytes:
+        return self._sk.sign(data)
+
+
+class Pair:
+    """Encrypted channel to one member: direct messages, file offers, room keys."""
+
+    def __init__(self, me: Identity, peer: PublicKeys):
+        if peer.kx == me.public.kx:
+            raise DecryptError("cannot open a channel to ourselves")
+        try:
+            shared = me._kx.exchange(X25519PublicKey.from_public_bytes(peer.kx))
+        except ValueError as e:  # low-order point
+            raise DecryptError("invalid public key") from e
+        lo, hi = (me.public, peer) if me.public.kx <= peer.kx else (peer, me.public)
+        okm = _hkdf(shared, _pack(_L_PAIR, lo.kx, lo.sk, hi.kx, hi.sk), 2 * _KEY_LEN)
+        lo_to_hi, hi_to_lo = okm[:_KEY_LEN], okm[_KEY_LEN:]
+        self_first = lo is me.public
+        self.me, self.peer = me.public, peer
+        self._send_ck = lo_to_hi if self_first else hi_to_lo
+        self._send_n = 0
+        self._recv = _RecvChain(hi_to_lo if self_first else lo_to_hi)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _aad(kind: str, frm: PublicKeys, to: PublicKeys, n: int) -> bytes:
+        return _pack(_L_PAIR_AAD, kind.encode(), frm.kx, to.kx, _u32(n))
+
+    def seal(self, kind: str, plain: bytes) -> tuple[int, bytes]:
+        padded = _pad(plain)
+        with self._lock:
+            mk, self._send_ck = _step(self._send_ck)
+            n = self._send_n
+            self._send_n += 1
+        return n, _seal_once(mk, padded, self._aad(kind, self.me, self.peer, n))
+
+    def open(self, kind: str, n: int, ct: bytes) -> bytes:
+        with self._lock:
+            mk, commit = self._recv.key(n)
+            plain = _unpad(_open_once(mk, ct, self._aad(kind, self.peer, self.me, n)))
+            commit()
+            return plain
+
+
+def safety_number(user: str, pub: PublicKeys) -> str:
+    """A member's 30-digit safety number for one session (see /verify)."""
+    keys = pub.kx + pub.sk
+    h = hashlib.sha512(_pack(b"QuietRoom v4 safety number", user.lower().encode(), keys)).digest()
+    for _ in range(5200):
+        h = hashlib.sha512(h + keys).digest()
+    return " ".join(f"{int.from_bytes(h[i * 5:i * 5 + 5], 'big') % 100000:05d}" for i in range(6))
+
+
+class RoomSecret:
+    """What a room password yields. The password never leaves this process."""
+
+    def __init__(self, room: str, password: str):
+        salt = hashlib.sha256(_pack(_L_ROOM_SALT, room.encode())).digest()
+        secret = Argon2id(salt=salt, length=_KEY_LEN, iterations=3, lanes=4,
+                          memory_cost=64 * 1024).derive(password.encode())
+        self.room = room
+        self.verifier = _hkdf(secret, _L_ROOM_VF)
+        self._auth = _hkdf(secret, _L_ROOM_AUTH)
+
+    def proof(self, user: str, pub: PublicKeys) -> bytes:
+        return _hmac(self._auth, _pack(_L_PROOF, self.room.encode(), user.lower().encode(), pub.kx, pub.sk))
+
+    def check(self, user: str, pub: PublicKeys, proof: bytes) -> bool:
+        return hmac.compare_digest(self.proof(user, pub), proof)
+
+
+def _room_aad(room: str, frm: PublicKeys, kid: int, n: int) -> bytes:
+    return _pack(_L_ROOM_AAD, room.encode(), frm.kx, _u32(kid), _u32(n))
+
+
+def _room_sig_input(room: str, kid: int, n: int, ct: bytes) -> bytes:
+    return _pack(_L_ROOM_SIG, room.encode(), _u32(kid), _u32(n), ct)
+
+
+class _Sender:
+    """Our sending chain in one password room."""
+
+    def __init__(self, room: str):
+        self.room = room
+        self.kid = int.from_bytes(secrets.token_bytes(4), "big")
+        self.ck, self.n = secrets.token_bytes(_KEY_LEN), 0
+
+    def seal(self, me: Identity, plain: bytes) -> tuple[int, int, bytes, bytes]:
+        mk, self.ck = _step(self.ck)
+        n = self.n
+        self.n += 1
+        ct = _seal_once(mk, _pad(plain), _room_aad(self.room, me.public, self.kid, n))
+        return self.kid, n, ct, me.sign(_room_sig_input(self.room, self.kid, n, ct))
+
+
+class _Receiver:
+    """Another member's sending chain in one password room."""
+
+    def __init__(self, room: str, frm: PublicKeys, kid: int, ck: bytes, n: int):
+        self.room, self.frm, self.kid = room, frm, kid
+        self._chain = _RecvChain(ck, n)
+
+    def open(self, kid: int, n: int, ct: bytes, sig: bytes) -> bytes:
+        if kid != self.kid:
+            raise DecryptError("unknown key id")
+        try:
+            Ed25519PublicKey.from_public_bytes(self.frm.sk).verify(sig, _room_sig_input(self.room, kid, n, ct))
+        except (InvalidSignature, ValueError) as e:
+            raise DecryptError("bad signature") from e
+        mk, commit = self._chain.key(n)
+        plain = _unpad(_open_once(mk, ct, _room_aad(self.room, self.frm, kid, n)))
+        commit()
+        return plain
+
+
+class _Member:
+    def __init__(self):
+        self.recv: Optional[_Receiver] = None
+        self.sent_kid: Optional[int] = None
+
+
+class _SecureRoom:
+    def __init__(self, name: str, secret: RoomSecret):
+        self.name, self.secret = name, secret
+        self.sender = _Sender(name)
+        self.members: dict[str, _Member] = {}
+        self.pending: dict[str, list[dict]] = {}
+        self.refused: set[str] = set()
+
+
+def _hidden(c: int) -> bool:
+    """Characters that change how text displays without being visible (as in
+    wire.CleanText): bidi controls and zero-width characters."""
+    return (0x202A <= c <= 0x202E or 0x2066 <= c <= 0x2069 or c in (0x200E, 0x200F, 0x061C)
+            or c in (0x200B, 0x2060, 0xFEFF, 0x180E) or 0x2061 <= c <= 0x2064)
+
+
+def _clean_text(s: str) -> str:
+    """Remove control characters (except newline and tab) and hidden ones."""
+    return "".join(ch for ch in s if ch in "\n\t" or not (
+        ord(ch) < 32 or ord(ch) == 127 or 0x80 <= ord(ch) < 0xA0 or ch == "\ufffd" or _hidden(ord(ch))))
+
+
+_MAX_CIPHER_B64 = (32 * 1024 + 16 + 2) // 3 * 4
+_PEER_WAIT = 3.0
+
+
+# ---------------------------------------------------------------------------
 # Callback type aliases
 # ---------------------------------------------------------------------------
 
@@ -319,6 +635,15 @@ class QuietRoomConnector:
 
         self._recv_thread:  Optional[threading.Thread] = None
         self._noise_thread: Optional[threading.Thread] = None
+
+        # End-to-end encryption state, guarded by _e2e_lock.
+        self._id: Optional["Identity"] = None
+        self._e2e_lock = threading.RLock()
+        self._peer_added = threading.Condition(self._e2e_lock)
+        self._peers: dict[str, tuple[str, "PublicKeys", "Pair"]] = {}  # by lower-case name
+        self._secure_rooms: dict[str, "_SecureRoom"] = {}
+        self._joining: dict[str, "RoomSecret"] = {}
+        self._sent: dict[tuple, str] = {}  # our encrypted messages until echoed
 
     # ------------------------------------------------------------------
     # Public: callback registration
@@ -399,7 +724,10 @@ class QuietRoomConnector:
             ConnectorError    — login refused (e.g. username taken) or protocol mismatch
             OSError           — network error during connect
         """
+        if _CRYPTO_ERROR:
+            raise ConnectorError(_CRYPTO_ERROR)
         self._validate_cert_file()
+        self._id = Identity()
         self._sock = self._tls_connect()
         try:
             self._login()
@@ -474,28 +802,76 @@ class QuietRoomConnector:
 
     def send_room_message(self, room: str, text: str):
         """
-        Send a message to a room you have joined. Thread-safe.
+        Send a message to a room you have joined (end-to-end encrypted in
+        password rooms). Thread-safe.
         Raises ValueError if room does not start with #.
         """
         if not room.startswith("#"):
             raise ValueError(f"Room name must start with #, got: {room!r}")
+        text = text.strip()
+        if not text:
+            return
+        with self._e2e_lock:
+            r = self._secure_rooms.get(room)
+            if r is not None:
+                kid, n, ct, sig = r.sender.seal(self._id, json.dumps({"text": text}).encode())
+                self._remember((room, kid, n), text)
+                self._send({"t": "chat", "room": room, "kid": kid, "n": n, "ct": _b64(ct), "sig": _b64(sig)})
+                return
+            if room in self._joining:
+                raise ConnectorError(f"still joining {room}; try again in a moment")
         self._send({"t": "chat", "room": room, "text": text})
 
     def send_dm(self, recipient: str, text: str):
-        """Send a direct message to a specific user. Thread-safe."""
-        self._send({"t": "dm", "to": recipient, "text": text})
+        """Send an end-to-end encrypted direct message. Thread-safe."""
+        text = text.strip()
+        if not text:
+            return
+        if recipient.lower() == self._cfg.username.lower():
+            self._call(self._message_callbacks, f"[DM to {recipient}]: {text}")
+            return
+        with self._e2e_lock:
+            peer = self._wait_peer(recipient)
+            if peer is None:
+                notice = f"User '{recipient}' is not online."
+                self._call(self._message_callbacks, notice)
+                self._call(self._system_message_callbacks, notice)
+                return
+            name, _, pair = peer
+            n, ct = pair.seal("dm", json.dumps({"text": text}).encode())
+            self._remember((name.lower(), 0, n), text)
+            self._send({"t": "dm", "to": name, "n": n, "ct": _b64(ct)})
 
     def join_room(self, room: str, password: str = ""):
         """
-        Join or create a room. room must start with #. joined_rooms is
-        updated when the server confirms the join.
+        Join or create a room. room must start with #. With a password the
+        room is end-to-end encrypted; the password never leaves this process
+        (deriving the keys takes a moment). joined_rooms is updated when the
+        server confirms the join.
         """
         if not room.startswith("#"):
             raise ValueError(f"Room name must start with #, got: {room!r}")
+        password = password.strip()
         msg = {"t": "join", "room": room}
         if password:
-            msg["password"] = password
+            secret = RoomSecret(room, password)
+            with self._e2e_lock:
+                self._joining[room] = secret
+            msg["vf"] = _b64(secret.verifier)
         self._send(msg)
+
+    def safety_numbers(self, user: str) -> tuple[str, str]:
+        """
+        Return (ours, theirs): the safety numbers of this session and of
+        another member's. If the other member sees the same two numbers,
+        nobody (the server included) has substituted keys between you.
+        Raises ConnectorError if the member is not online.
+        """
+        with self._e2e_lock:
+            peer = self._peers.get(user.lower())
+        if peer is None:
+            raise ConnectorError(f"User '{user}' is not online.")
+        return safety_number(self._cfg.username, self._id.public), safety_number(peer[0], peer[1])
 
     def leave_room(self, room: str):
         """Leave a chat room."""
@@ -597,7 +973,9 @@ class QuietRoomConnector:
 
     def _login(self):
         self._sock.settimeout(self._cfg.connect_timeout)
-        self._send({"t": "hello", "v": PROTOCOL_VERSION, "user": self._cfg.username})
+        pub = self._id.public
+        self._send({"t": "hello", "v": PROTOCOL_VERSION, "user": self._cfg.username,
+                    "kx": _b64(pub.kx), "sk": _b64(pub.sk)})
         while True:
             frame_type, payload = _read_frame(self._sock)
             if frame_type != FRAME_CONTROL:
@@ -659,18 +1037,21 @@ class QuietRoomConnector:
         t = msg.get("t")
         me = self._cfg.username
         if t == "chat":
-            room, sender, text = msg.get("room") or None, msg.get("from", ""), msg.get("text", "")
-            prefix = f"[{room}] " if room else ""
-            self._call(self._message_callbacks, f"[{msg.get('time', '')}] {prefix}{sender}: {text}")
-            if sender != me and room:
-                self._call(self._room_message_callbacks, room, sender, text)
+            room, sender = msg.get("room") or None, msg.get("from", "")
+            if msg.get("ct"):
+                self._secure_chat(msg)
+                return
+            if room and room in self._secure_rooms:
+                return  # a password room carries only encrypted messages
+            self._deliver_chat(room, sender, msg.get("text", ""), msg.get("time", ""))
         elif t == "dm":
-            sender, text = msg.get("from", ""), msg.get("text", "")
-            if sender == me:
-                self._call(self._message_callbacks, f"[DM to {msg.get('to', '')}]: {text}")
-            else:
-                self._call(self._message_callbacks, f"[DM from {sender}]: {text}")
-                self._call(self._dm_callbacks, sender, text)
+            self._dm(msg)
+        elif t == "peer":
+            self._add_peer(msg.get("user", ""), msg.get("kx"), msg.get("sk"))
+        elif t == "rhello":
+            self._room_hello(msg)
+        elif t == "rkey":
+            self._room_key(msg)
         elif t in ("joined", "left"):
             user, room = msg.get("user", ""), msg.get("room") or None
             if user == me and room:
@@ -679,6 +1060,18 @@ class QuietRoomConnector:
                         self._joined_rooms.add(room)
                     else:
                         self._joined_rooms.discard(room)
+            if t == "joined" and room is None and user != me:
+                self._add_peer(user, msg.get("kx"), msg.get("sk"))
+            elif t == "joined" and room and user == me:
+                self._joined_secure(room, bool(msg.get("locked")))
+            elif t == "left" and room is None and user != me:
+                with self._e2e_lock:
+                    self._peers.pop(user.lower(), None)
+            elif t == "left" and room and user == me:
+                with self._e2e_lock:
+                    self._secure_rooms.pop(room, None)
+            elif t == "left" and room:
+                self._member_left(room, user)
             where = room if room else "the chat"
             text = f"*** {user} {t} {where} ***"
             self._call(self._message_callbacks, text)
@@ -694,6 +1087,225 @@ class QuietRoomConnector:
                 self._send({"t": "file_decline", "id": msg.get("id", "")})
             except OSError:
                 pass
+
+    def _deliver_chat(self, room: Optional[str], sender: str, text: str, ts: str):
+        prefix = f"[{room}] " if room else ""
+        self._call(self._message_callbacks, f"[{ts}] {prefix}{sender}: {text}")
+        if sender != self._cfg.username and room:
+            self._call(self._room_message_callbacks, room, sender, text)
+
+    # ------------------------------------------------------------------
+    # Internal: end-to-end encryption
+    # ------------------------------------------------------------------
+
+    def _remember(self, key: tuple, text: str):
+        self._sent[key] = text
+        while len(self._sent) > 1024:
+            self._sent.pop(next(iter(self._sent)))
+
+    def _add_peer(self, name: str, kx, sk):
+        if not name or name.lower() == self._cfg.username.lower():
+            return
+        try:
+            pub = PublicKeys.parse(kx, sk)
+            pair = self._id.pair(pub)
+        except DecryptError:
+            return
+        with self._e2e_lock:
+            self._peers[name.lower()] = (name, pub, pair)
+            self._peer_added.notify_all()
+
+    def _wait_peer(self, name: str):
+        """Return a member's session, waiting briefly for their keys (they
+        arrive with their join notice). Caller holds _e2e_lock."""
+        deadline = time.monotonic() + _PEER_WAIT
+        on_receive_thread = threading.current_thread() is self._recv_thread
+        while True:
+            peer = self._peers.get(name.lower())
+            remaining = deadline - time.monotonic()
+            if peer is not None or on_receive_thread or remaining <= 0 or self._shutdown.is_set():
+                return peer
+            self._peer_added.wait(remaining)
+
+    def _open_pair(self, sender: str, kind: str, msg: dict) -> bytes:
+        with self._e2e_lock:
+            peer = self._peers.get(sender.lower())
+        if peer is None:
+            raise DecryptError("unknown sender")
+        n = msg.get("n", 0)
+        if not isinstance(n, int) or not 0 <= n < 2 ** 32:
+            raise DecryptError("bad counter")
+        return peer[2].open(kind, n, _unb64(msg.get("ct", ""), _MAX_CIPHER_B64))
+
+    @staticmethod
+    def _text_of(plain: bytes) -> Optional[str]:
+        """Text of a decrypted message, cleaned like the server cleans plain
+        text (it cannot clean what it cannot read)."""
+        try:
+            text = json.loads(plain).get("text", "")
+        except (ValueError, AttributeError):
+            return None
+        if not isinstance(text, str):
+            return None
+        text = _clean_text(text).strip()
+        return text if text and len(text.encode()) <= 8 * 1024 else None
+
+    def _dm(self, msg: dict):
+        sender, me = msg.get("from", ""), self._cfg.username
+        if sender == me:
+            with self._e2e_lock:
+                text = self._sent.pop((msg.get("to", "").lower(), 0, msg.get("n", 0)), None)
+            if text is not None:
+                self._call(self._message_callbacks, f"[DM to {msg.get('to', '')}]: {text}")
+            return
+        try:
+            text = self._text_of(self._open_pair(sender, "dm", msg))
+        except DecryptError:
+            notice = f"A direct message from {sender} could not be decrypted and was dropped."
+            self._call(self._message_callbacks, notice)
+            self._call(self._system_message_callbacks, notice)
+            return
+        if text is None:
+            return
+        self._call(self._message_callbacks, f"[DM from {sender}]: {text}")
+        self._call(self._dm_callbacks, sender, text)
+
+    def _send_room_key(self, r: "_SecureRoom", name: str, member: "_Member"):
+        """Give a verified member our current sending key. Caller holds _e2e_lock."""
+        peer = self._peers.get(name.lower())
+        if peer is None:
+            return
+        body = {"room": r.name, "proof": _b64(r.secret.proof(self._cfg.username, self._id.public)),
+                "kid": r.sender.kid, "ck": _b64(r.sender.ck), "n": r.sender.n}
+        n, ct = peer[2].seal("rkey", json.dumps(body).encode())
+        self._send({"t": "rkey", "to": peer[0], "n": n, "ct": _b64(ct)})
+        member.sent_kid = r.sender.kid
+
+    def _joined_secure(self, room: str, locked: bool):
+        """Set up a password room we just joined. A room joined with a password
+        that turns out to be open (or a server pretending so) is left at once,
+        so nothing meant to be private goes out in the clear."""
+        notice = None
+        with self._e2e_lock:
+            secret = self._joining.pop(room, None)
+            if not locked:
+                if secret is not None:
+                    notice = (f"⚠ {room} already exists as an open room, without a password: its messages "
+                              "would not be end-to-end encrypted. Left it again; choose another name.")
+                    self._send({"t": "leave", "room": room})
+            elif secret is None:
+                notice = f"⚠ Joined {room} without its password, so its keys are missing. Left it again."
+                self._send({"t": "leave", "room": room})
+            else:
+                self._secure_rooms[room] = _SecureRoom(room, secret)
+                self._send({"t": "rhello", "room": room,
+                            "proof": _b64(secret.proof(self._cfg.username, self._id.public))})
+        if notice:
+            self._call(self._message_callbacks, notice)
+            self._call(self._system_message_callbacks, notice)
+
+    def _member_left(self, room: str, user: str):
+        with self._e2e_lock:
+            r = self._secure_rooms.get(room)
+            if r is None:
+                return
+            key = user.lower()
+            member = r.members.pop(key, None)
+            r.pending.pop(key, None)
+            r.refused.discard(key)
+            if member is None or member.sent_kid is None:
+                return
+            # They held our key: switch to a new one for everyone else.
+            r.sender = _Sender(room)
+            for k, other in r.members.items():
+                peer = self._peers.get(k)
+                if peer is not None:
+                    self._send_room_key(r, peer[0], other)
+
+    def _room_hello(self, msg: dict):
+        notice = None
+        with self._e2e_lock:
+            r = self._secure_rooms.get(msg.get("room", ""))
+            peer = self._peers.get(msg.get("from", "").lower())
+            if r is None or peer is None:
+                return
+            name, pub, _ = peer
+            try:
+                proof = _unb64(msg.get("proof", ""), _KEY_LEN)
+            except DecryptError:
+                proof = b""
+            if r.secret.check(name, pub, proof):
+                member = r.members.setdefault(name.lower(), _Member())
+                if member.sent_kid != r.sender.kid:  # repeated hellos get no new copies
+                    self._send_room_key(r, name, member)
+            elif name.lower() not in r.refused:
+                r.refused.add(name.lower())
+                notice = (f"⚠ {name} is in {r.name} but could not prove the room password: "
+                          "they get no keys and cannot read the room.")
+        if notice:
+            self._call(self._message_callbacks, notice)
+            self._call(self._system_message_callbacks, notice)
+
+    def _room_key(self, msg: dict):
+        sender = msg.get("from", "")
+        try:
+            body = json.loads(self._open_pair(sender, "rkey", msg))
+            ck, proof = _unb64(body["ck"], _KEY_LEN), _unb64(body["proof"], _KEY_LEN)
+            kid, n, room = body["kid"], body["n"], body["room"]
+        except (DecryptError, ValueError, KeyError, TypeError):
+            return
+        if not (isinstance(kid, int) and isinstance(n, int) and isinstance(room, str) and len(ck) == _KEY_LEN):
+            return
+        with self._e2e_lock:
+            r = self._secure_rooms.get(room)
+            peer = self._peers.get(sender.lower())
+            if r is None or peer is None or not r.secret.check(peer[0], peer[1], proof):
+                return
+            key = peer[0].lower()
+            member = r.members.setdefault(key, _Member())
+            member.recv = _Receiver(room, peer[1], kid, ck, n)
+            if member.sent_kid != r.sender.kid:
+                self._send_room_key(r, peer[0], member)
+            retry = r.pending.pop(key, [])
+        for m in retry:
+            self._secure_chat(m)
+
+    def _secure_chat(self, msg: dict):
+        room, sender = msg.get("room", ""), msg.get("from", "")
+        kid, n = msg.get("kid", 0), msg.get("n", 0)
+        if sender == self._cfg.username:
+            with self._e2e_lock:
+                text = self._sent.pop((room, kid, n), None)
+            if text is not None:
+                self._deliver_chat(room, sender, text, msg.get("time", ""))
+            return
+        try:
+            ct, sig = _unb64(msg.get("ct", ""), _MAX_CIPHER_B64), _unb64(msg.get("sig", ""), 64)
+        except DecryptError:
+            return
+        with self._e2e_lock:
+            r = self._secure_rooms.get(room)
+            if r is None:
+                return
+            key = sender.lower()
+            member = r.members.get(key)
+            if member is None or member.recv is None or member.recv.kid != kid:
+                queue = r.pending.setdefault(key, [])
+                if len(queue) < 64:
+                    queue.append(msg)  # their key is on its way
+                return
+            try:
+                plain = member.recv.open(kid, n, ct, sig)
+            except DecryptError:
+                plain = None
+        if plain is None:
+            notice = f"A message from {sender} in {room} could not be verified and was dropped."
+            self._call(self._message_callbacks, notice)
+            self._call(self._system_message_callbacks, notice)
+            return
+        text = self._text_of(plain)
+        if text is not None:
+            self._deliver_chat(room, sender, text, msg.get("time", ""))
 
     def _fire_disconnect(self, reason: Optional[Exception]):
         self._call(self._disconnect_callbacks, reason)

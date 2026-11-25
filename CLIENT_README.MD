@@ -1,18 +1,19 @@
 # QuietRoom Client
 
-A command-line chat client for QuietRoom: TLS 1.3 with the server's access key, flow-controlled file transfers, and customizable visual themes.
+A command-line chat client for QuietRoom: end-to-end encrypted direct messages, files and password rooms, TLS 1.3 with the server's access key, flow-controlled file transfers, and customizable visual themes.
 
 ## Features
 
+- 🔒 **End-to-end encryption** - Direct messages, files and password rooms; `/verify` compares safety numbers
 - 🔐 **TLS 1.3** - Forward secrecy; the access key from `quietroom_access.pem` is presented to the server
 - 🔒 **Certificate Pinning** - Exact server verification prevents MITM attacks
 - 🎨 **Customizable Colors** - Full theme configuration
 - 🔔 **Sound Notifications** - Audio alerts for new messages (optional)
 - 🕵️ **Traffic Padding** - Message lengths are hidden
 - 🎭 **Decoy Traffic** - Hides communication patterns
-- 💬 **Private Messaging** - Direct messages to other users
-- 🚪 **Chat Rooms** - Join password-protected group conversations
-- 📁 **File Transfers** - Any size, several at once, with SHA-256 verification
+- 💬 **Private Messaging** - End-to-end encrypted direct messages to other users
+- 🚪 **Chat Rooms** - Open rooms, or end-to-end encrypted password rooms
+- 📁 **File Transfers** - End-to-end encrypted, any size, several at once, with SHA-256 verification
 - 📋 **Multiple Servers** - Store and switch between server configurations
 
 ## Installation
@@ -342,13 +343,15 @@ While connected, you can use these commands:
 - `/quit` - Disconnect from server and exit
 
 ### Communication Commands
-- `/msg <user> <message>` - Send private message to a user
+- `/msg <user> <message>` - Send a private message to a user (end-to-end encrypted)
   - Example: `/msg Alice Hey, how are you?`
+- `/verify <user>` - Show the safety numbers of your conversation with a user, to compare with them
+  - Example: `/verify Alice`
   - Private messages are not logged by the server
   - Recipient must be online
 
 ### Room Commands
-- `/join #room [password]` - Join or create a chat room
+- `/join #room [password]` - Join or create a chat room (with a password: end-to-end encrypted)
   - Example: `/join #general`
   - Example: `/join #private secretpassword`
   - Room names must start with `#`
@@ -412,7 +415,17 @@ Network monitors see:
 - ❌ Cannot read message content or exact length
 - ❌ Cannot tell when real messages are sent (with decoy traffic)
 
-The server decrypts and relays messages (it is trusted by design) and never stores them.
+The server never stores messages.
+
+### End-to-End Encryption
+
+- **Direct messages and files** (`/msg`, `/file`) are end-to-end encrypted: the server relays them but cannot read them, not even the file names
+- **Password rooms** (`/join #room password`) are end-to-end encrypted: the password never leaves your computer, and only members who know it can read the room. Joining takes a moment while the keys are derived. Choose a long password: someone who controls the server could try to guess it offline
+- **The lobby and rooms without a password** are not end-to-end encrypted: everyone with the access file can join them, and the server relays them in the clear (inside TLS)
+
+**Checking who you are talking to.** For direct messages, the server hands out the other member's keys. To make sure it did not hand out its own instead, type `/verify <user>` and compare both numbers with that person over another channel (in person, by phone). If they match, nobody is in between. The numbers change every time either of you reconnects.
+
+Newcomers to a room cannot read messages sent before they joined, and members who left cannot read what is sent after they left.
 
 ## File Transfers
 
@@ -509,7 +522,7 @@ The server decrypts and relays messages (it is trusted by design) and never stor
 
 **Problem**: `✗ the server speaks a different protocol version`
 
-**Solution**: QuietRoom 3 clients need a QuietRoom 3 server (and vice versa). Update the server or the client so both run 3.x.
+**Solution**: QuietRoom 4 clients need a QuietRoom 4 server (and vice versa). Update the server or the client so both run 4.x.
 
 ### Server closed the connection without answering
 

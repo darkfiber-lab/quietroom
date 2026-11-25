@@ -12,7 +12,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// Package wire implements the QuietRoom protocol, version 3, spoken inside a
+// Package wire implements the QuietRoom protocol, version 4, spoken inside a
 // mutually authenticated TLS 1.3 connection.
 //
 // Every frame is self-delimiting:
@@ -33,7 +33,7 @@ import (
 )
 
 // Version is the protocol version announced in the hello message.
-const Version = 3
+const Version = 4
 
 // Frame types.
 const (

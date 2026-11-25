@@ -493,7 +493,8 @@ func (a *App) handleEvent(e client.Event) {
 			a.currentRoom = e.Room // server confirmed our own join
 			a.clientMu.Unlock()
 		}
-		a.emit(a.ctx, "room_joined", map[string]string{"username": e.User, "room": e.Room})
+		// locked: a password room, end-to-end encrypted (set on our own join).
+		a.emit(a.ctx, "room_joined", map[string]interface{}{"username": e.User, "room": e.Room, "locked": e.Locked})
 
 	case client.EvLeft:
 		if e.Room == "" {

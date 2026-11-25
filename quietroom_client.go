@@ -299,6 +299,9 @@ func (u *UI) onEvent(e client.Event) {
 				verb = "Created and joined"
 			}
 			u.print(th.SystemColor, fmt.Sprintf("%s room %s — messages now go to %s (/leave %s to return to the lobby)", verb, e.Room, e.Room, e.Room))
+			if e.Locked {
+				u.print(th.SystemColor, "🔒 "+e.Room+" is end-to-end encrypted: only members who know the password can read it, not the server.")
+			}
 		default:
 			u.print(th.SystemColor, fmt.Sprintf("*** %s joined %s ***", e.User, e.Room))
 		}
@@ -510,6 +513,7 @@ func main() {
 	if config.DecoyTraffic {
 		fmt.Println(u.colorize(th.SystemColor, "✓ Decoy traffic active"))
 	}
+	fmt.Println(u.colorize(th.SystemColor, "🔒 Direct messages, files and password rooms are end-to-end encrypted (/verify <user> to check)"))
 	fmt.Println(u.colorize(th.SystemColor, "✓ Type /help for available commands"))
 	fmt.Println(u.colorize(th.SystemColor, "✓ Press Ctrl+C or type /quit to disconnect"))
 	fmt.Println()

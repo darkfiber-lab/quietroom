@@ -2,7 +2,7 @@
 
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/17081/badge)](https://www.bestpractices.dev/projects/17081)
 
-A privacy-focused, self-hosted encrypted chat system: TLS 1.3 with forward secrecy, a shared access key that keeps outsiders out, padded traffic and decoys against traffic analysis.
+A privacy-focused, self-hosted encrypted chat system: end-to-end encrypted direct messages, files and password rooms, TLS 1.3 with forward secrecy, a shared access key that keeps outsiders out, padded traffic and decoys against traffic analysis.
 
 ## Rationale and Design Principles
 
@@ -28,13 +28,14 @@ This project does not seek to compete with large-scale platforms. It offers some
 
 ## Features
 
+- 🔒 **End-to-end encryption** - Direct messages, files and password rooms are encrypted between members; the server relays them without being able to read them. `/verify` compares safety numbers
 - 🔐 **TLS 1.3 with forward secrecy** - All traffic encrypted; the server certificate is pinned by every client
 - 🔑 **Access key** - Only holders of the current `quietroom_access.pem` can connect; a server restart issues a new key
 - 🕵️ **Traffic padding** - Messages are padded to fixed size classes, so their length is hidden
 - 🎭 **Decoy Traffic** - Random cover messages at random intervals hide activity patterns
-- 💬 **Private Messaging** - Direct messages between users
-- 🚪 **Chat Rooms** - Create password-protected rooms for group conversations
-- 📁 **File Transfers** - Any size, with flow control, several at once, SHA-256 verification; chat stays responsive during transfers
+- 💬 **Private Messaging** - End-to-end encrypted direct messages between users
+- 🚪 **Chat Rooms** - Open rooms, or password rooms that are end-to-end encrypted (the password never leaves your computer)
+- 📁 **File Transfers** - End-to-end encrypted, any size, with flow control, several at once, SHA-256 verification; chat stays responsive during transfers
 - 📝 **Security Logging** - Security events without participant metadata (unless explicitly enabled)
 
 ## Quick Start
@@ -78,7 +79,15 @@ For detailed setup instructions, configuration options, and troubleshooting:
 4. **Silent to strangers** - Without a valid gate token (derived from the access key) in the first TLS message, the server closes the connection without sending anything: scanners never see its certificate
 5. **Fresh keys per run** - The server generates new keys on every start and keeps its private key in memory only; a restart revokes every access file
 
-The server decrypts and relays messages: the operator's server is trusted by design. Messages are never stored.
+### End-to-End Encryption
+
+Direct messages, file transfers and password rooms are end-to-end encrypted: the server relays them without being able to read them.
+
+- **Direct messages and files** - Encrypted between the two members with keys created for each connection (X25519, ChaCha20-Poly1305), with forward secrecy within the session. `/verify <user>` shows safety numbers to compare with the other member: if they match, nobody, not even the server, is in between
+- **Password rooms** - The password never leaves your computer. It is turned into keys with Argon2id; only members who know it get the room keys (the server cannot join as a reader), and keys change whenever someone leaves
+- **Lobby and open rooms** - Not end-to-end encrypted: they are open to everyone with the access file, and the server relays them in the clear (inside TLS)
+
+The server still sees who is online and who talks to whom, but not what they say. Details: [docs/E2E_DESIGN.md](docs/E2E_DESIGN.md).
 
 ### Traffic Protection
 
@@ -104,18 +113,26 @@ The server decrypts and relays messages: the operator's server is trusted by des
 ## Architecture
 
 ```
-┌──────────────┐                                  ┌──────────────┐
-│    Client    │◄──────────── TLS 1.3 ───────────►│    Server    │
-│              │  1. Handshake: server cert       │              │
-│ access file: │     pinned, client presents      │ keys made at │
-│ • server cert│     the access key               │ every start  │
-│ • access key │  2. hello / welcome              │              │
-│              │  3. Framed messages (JSON) and   │ relays chat, │
-│              │     file data, padded; decoys    │ DMs, files   │
-└──────────────┘                                  └──────────────┘
+┌──────────────┐             ┌──────────────┐             ┌──────────────┐
+│   Client A   │◄─ TLS 1.3 ─►│    Server    │◄─ TLS 1.3 ─►│   Client B   │
+│              │             │              │             │              │
+│ access file  │             │ keys made at │             │ access file  │
+│ session keys │             │ every start; │             │ session keys │
+│ (per login)  │             │ relays, but  │             │ (per login)  │
+│              │             │ cannot read  │             │              │
+└──────┬───────┘             │ DMs, files,  │             └──────┬───────┘
+       │                     │ password     │                    │
+       │                     │ rooms        │                    │
+       │                     └──────────────┘                    │
+       └─────── end-to-end: DMs, files, password rooms ──────────┘
 ```
 
-The protocol (version 3) is specified in the [`wire`](wire/) package. CLI and
+1. **TLS 1.3 to the server**: the client pins the server certificate and presents the access key; the server stays silent to anyone without a valid gate token
+2. **End-to-end between members**: direct messages, files and password rooms are encrypted with keys only the members hold; the lobby and open rooms are relayed in the clear inside TLS
+3. **Framed messages** (JSON) and file data, padded to size classes, with decoy traffic in both directions
+
+The protocol (version 4) is specified in the [`wire`](wire/) package and the
+end-to-end encryption in [`e2e`](e2e/) ([design](docs/E2E_DESIGN.md)). CLI and
 GUI share one client implementation in [`client`](client/).
 
 ## Verifying Downloads
@@ -199,6 +216,6 @@ commercial license. Contact the author for details.
 ## Acknowledgments
 
 Built with:
-- Go standard library (crypto/tls, TLS 1.3)
-- Go standard library (crypto/pbkdf2 for room passwords)
+- Go standard library (crypto/tls, TLS 1.3; X25519, Ed25519, HKDF)
+- golang.org/x/crypto (ChaCha20-Poly1305 and Argon2id for end-to-end encryption)
 - golang.org/x/term (CLI terminal input)
