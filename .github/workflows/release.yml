@@ -108,12 +108,20 @@ jobs:
         run: |
           mkdir -p release
 
-          # Package CLI artifacts — one zip per platform
+          # Package CLI artifacts — one zip per platform. Artifact downloads
+          # lose file permissions, so the binaries are made executable again
+          # before zipping; zip stores the mode and unzip restores it.
           for dir in artifacts/cli/*/; do
             platform=$(basename "$dir")
             platform="${platform#quietroom-cli-}"
             if [ -d "$dir" ]; then
+              chmod 0755 "$dir"/*
               zip -j "release/quietroom-cli-${platform}-v${VERSION}.zip" "$dir"/*
+              # Every entry must be executable (-rwxr-xr-x), or the release fails.
+              if zipinfo "release/quietroom-cli-${platform}-v${VERSION}.zip" | awk '/^-/ && $1 !~ /^-rwx/ { bad = 1; print "not executable: " $NF } END { exit bad }'; then :; else
+                echo "::error::binaries without execute permission in quietroom-cli-${platform}-v${VERSION}.zip"
+                exit 1
+              fi
             fi
           done
 
