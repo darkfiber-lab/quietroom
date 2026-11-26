@@ -20,58 +20,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
  *   "__dm__username"  — a DM thread with a user
  */
 
-// HTML sanitizer: allow only safe inline tags, strip everything else
-function sanitize(html) {
-  const allowed = ['b', 'i', 'em', 'strong', 'code', 'pre', 'br',
-                   'blockquote', 'u', 's', 'ul', 'ol', 'li', 'a']
-  const temp = document.createElement('div')
-  temp.textContent = html  // first pass: treat as text (escapes all HTML)
-
-  // Then selectively un-escape safe tags
-  // We use a DOMParser approach for safety
-  const parser = new DOMParser()
-  const doc = parser.parseFromString(html, 'text/html')
-
-  function clean(node) {
-    if (node.nodeType === Node.TEXT_NODE) {
-      return document.createTextNode(node.textContent)
-    }
-    if (node.nodeType !== Node.ELEMENT_NODE) return null
-    const tag = node.tagName.toLowerCase()
-    if (!allowed.includes(tag)) {
-      // Replace with span containing children
-      const span = document.createElement('span')
-      node.childNodes.forEach(child => {
-        const c = clean(child)
-        if (c) span.appendChild(c)
-      })
-      return span
-    }
-    const el = document.createElement(tag)
-    // Allow href on <a> if it's http/https only
-    if (tag === 'a') {
-      const href = node.getAttribute('href') || ''
-      if (href.startsWith('http://') || href.startsWith('https://')) {
-        el.setAttribute('href', href)
-        el.setAttribute('target', '_blank')
-        el.setAttribute('rel', 'noopener noreferrer')
-      }
-    }
-    node.childNodes.forEach(child => {
-      const c = clean(child)
-      if (c) el.appendChild(c)
-    })
-    return el
-  }
-
-  const result = document.createElement('span')
-  doc.body.childNodes.forEach(child => {
-    const c = clean(child)
-    if (c) result.appendChild(c)
-  })
-  return result.innerHTML
-}
-
 // Avatar colour palette — deterministic from username
 const AVATAR_COLOURS = [
   ['#00d4ff', '#002a33'],
@@ -343,8 +291,6 @@ export const Chat = {
     const el = document.createElement('div')
     el.className = 'msg' + (continued ? ' continued' : '')
 
-    const safeText = sanitize(msg.text || '')
-
     el.innerHTML = `
       <div class="msg-avatar" style="background:${bg};border:1.5px solid ${fg};color:${fg}">
         ${this._escapeText(initial)}
@@ -354,8 +300,10 @@ export const Chat = {
           <span class="msg-username ${isOwn ? 'own' : ''}">${this._escapeText(username)}</span>
           <span class="msg-ts">${this._escapeText(msg.timestamp || '')}</span>
         </div>
-        <div class="msg-text">${safeText}</div>
+        <div class="msg-text"></div>
       </div>`
+    // Message text is shown as plain text, never parsed as HTML.
+    el.querySelector('.msg-text').textContent = msg.text || ''
 
     pane.appendChild(el)
   },

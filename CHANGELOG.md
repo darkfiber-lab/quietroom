@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **GUI shows chat messages as plain text** — messages were rendered as a restricted subset of HTML (bold, code, links and the like). No QuietRoom client sends HTML, and the CLI always showed it as typed, so the GUI now does the same: what people type appears exactly as written, and line breaks are kept.
+- **Python connector needs `cryptography` 50.0.2 or later** (was 44): earlier releases have known issues of their own and bundle older OpenSSL builds. `pip install -r connector/requirements.txt` picks it up.
+
 ## [4.0.1] - 2026-11-25
 
 Compatible with 4.0 servers and clients (protocol 4).

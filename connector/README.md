@@ -8,10 +8,10 @@ The connector maintains a persistent connection for as long as it runs. The user
 
 ## Requirements
 
-The connector needs one package, `cryptography` (version 44 or later), for the end-to-end encryption of direct messages and password rooms:
+The connector needs one package, `cryptography` (version 50.0.2 or later), for the end-to-end encryption of direct messages and password rooms:
 
 ```bash
-pip install 'cryptography>=44'
+pip install 'cryptography>=50.0.2'
 ```
 
 Python 3.11 or higher, and a QuietRoom 4 server. `quietroom_access.pem` must be copied from the server to the working directory. It is secret (it contains the access key) and is replaced every time the server restarts.

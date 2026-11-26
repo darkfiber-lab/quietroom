@@ -343,6 +343,7 @@ html, body {
   font-size: 14px;
   color: var(--text-primary);
   word-break: break-word;
+  white-space: pre-wrap;
   line-height: 1.5;
 }
 
@@ -358,33 +359,6 @@ html, body {
 /* Consecutive messages from same user — collapse avatar */
 .msg.continued .msg-avatar { visibility: hidden; }
 .msg.continued .msg-header { display: none; }
-
-/* HTML content in messages */
-.msg-text a { color: var(--accent); text-decoration: underline; }
-.msg-text code {
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  padding: 0 4px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-.msg-text pre {
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
-  overflow-x: auto;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  margin: 4px 0;
-}
-.msg-text blockquote {
-  border-left: 3px solid var(--accent);
-  padding-left: 10px;
-  color: var(--text-secondary);
-  margin: 4px 0;
-}
 
 /* Date divider */
 .date-divider {

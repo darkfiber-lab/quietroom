@@ -19,7 +19,7 @@ quietroom_connector.py
 A persistent connection client for QuietRoom (protocol 4). Handles TLS 1.3
 with the access key, the framed message protocol, end-to-end encryption and
 keepalives, and exposes a callback-based interface for building bots, bridges
-and other automated clients. Needs the 'cryptography' package (44 or later)
+and other automated clients. Needs the 'cryptography' package (50.0.2 or later)
 for the end-to-end encryption; everything else is the standard library.
 
 Protocol notes
@@ -273,7 +273,7 @@ def _load_client_cert(ctx: ssl.SSLContext, cert_and_key_pem: str):
 # per connection and kept in memory only. Direct messages and room keys travel
 # on pairwise channels (X25519 + a KDF chain per direction); password rooms
 # use one sending chain per member, signed with Ed25519. Requires the
-# 'cryptography' package (44 or later, for Argon2id).
+# 'cryptography' package (50.0.2 or later).
 
 try:
     from cryptography.exceptions import InvalidSignature, InvalidTag
@@ -288,7 +288,7 @@ try:
 except ImportError as _e:  # pragma: no cover - reported on connect()
     _CRYPTO_ERROR = (
         "QuietRoom 4 encrypts direct messages and password rooms end to end and needs the "
-        f"'cryptography' package, version 44 or later (pip install 'cryptography>=44'): {_e}"
+        f"'cryptography' package, version 50.0.2 or later (pip install 'cryptography>=50.0.2'): {_e}"
     )
 
 _L_PAIR      = b"QuietRoom v4 pair"
