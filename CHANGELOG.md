@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [4.1.0] - 2026-11-28
 
 Compatible with 4.0 servers and clients (protocol 4); only the GUI and the connector change.
 
@@ -17,12 +17,16 @@ Compatible with 4.0 servers and clients (protocol 4); only the GUI and the conne
 ### Fixed
 - **GUI messages could disappear after using the Rooms, Users or Members buttons** — the GUI recognised the server's list replies by loose keywords, so while it waited for a list, another notice containing "room" (such as the `/help` text) could be taken for the list and not shown. Replies are now recognised exactly, and the GUI stops waiting after five seconds.
 
+---
+
 ## [4.0.1] - 2026-11-25
 
 Compatible with 4.0 servers and clients (protocol 4).
 
 ### Fixed
 - **Release archives keep the execute permission** — the binaries in the CLI and server zips (`quietroom-cli-*.zip`) were stored without it, so after unzipping they had to be made executable with `chmod +x` before they would start. The release now sets it before zipping and fails if any binary in a zip is not executable.
+
+---
 
 ## [4.0.0] - 2026-11-25
 

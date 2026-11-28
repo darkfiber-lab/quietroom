@@ -151,7 +151,7 @@ jobs:
           # Extract the section for this version from CHANGELOG.md if it exists
           if [ -f CHANGELOG.md ]; then
             # Get content between this version header and the next --- separator
-            NOTES=$(awk "/## \[${VERSION}\]/{found=1; next} found && /^---/{exit} found{print}" CHANGELOG.md)
+            NOTES=$(awk "/## \[${VERSION}\]/{found=1; next} found && (/^---/ || /^## \[/){exit} found{print}" CHANGELOG.md)
             if [ -z "$NOTES" ]; then
               NOTES="See CHANGELOG.md for details."
             fi
