@@ -340,18 +340,29 @@ func (a *App) RequestUserList() error { return a.request(wire.TUsers, "") }
 // RequestMemberList requests the members of a room or "lobby"
 func (a *App) RequestMemberList(target string) error { return a.request(wire.TMembers, target) }
 
-// SendCommand runs a slash command typed by the user.
-func (a *App) SendCommand(cmd string) error {
+// SafetyInfo holds the safety numbers of a direct conversation: one for
+// each member. Both members see the same two numbers unless someone (the
+// server included) is in between.
+type SafetyInfo struct {
+	Me     string `json:"me"`
+	Mine   string `json:"mine"`
+	Peer   string `json:"peer"`
+	Theirs string `json:"theirs"`
+}
+
+// SafetyNumbers returns the safety numbers for the conversation with user
+// (the Verify button). The GUI has no slash commands: every action has its
+// own button, so typed text is always just a message.
+func (a *App) SafetyNumbers(user string) (SafetyInfo, error) {
 	c, err := a.current()
 	if err != nil {
-		return err
+		return SafetyInfo{}, err
 	}
-	// Files are only sent after picking them in the native dialog, so
-	// frontend content can never name an arbitrary local file.
-	if parsed, perr := wire.ParseCommand(cmd); perr == nil && parsed.Name == "file" {
-		return fmt.Errorf("use the Send File button to send files")
+	mine, theirs, err := c.SafetyNumbers(user)
+	if err != nil {
+		return SafetyInfo{}, err
 	}
-	return c.Command(cmd, a.GetCurrentRoom())
+	return SafetyInfo{Me: c.Username(), Mine: mine, Peer: user, Theirs: theirs}, nil
 }
 
 // ─────────────────────────────────────────────

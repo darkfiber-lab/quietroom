@@ -2,9 +2,20 @@
 
 ## [Unreleased]
 
+Compatible with 4.0 servers and clients (protocol 4); only the GUI and the connector change.
+
+### Added
+- **🔒 Verify button in GUI direct messages** — shows the two safety numbers of the conversation in a dialog, to compare with the other person. Before, the GUI could only do this with a typed `/verify` command, and in a DM tab even that was sent to the other person as a message.
+
 ### Changed
-- **GUI shows chat messages as plain text** — messages were rendered as a restricted subset of HTML (bold, code, links and the like). No QuietRoom client sends HTML, and the CLI always showed it as typed, so the GUI now does the same: what people type appears exactly as written, and line breaks are kept.
+- **The GUI has no slash commands** — every action has a button, so what you type is always a message. Text starting with `/` gets a one-time reminder; pressing Enter again sends it as it is. The CLI keeps its commands.
+- **GUI file transfers start from a direct message** — the 📎 button works in DM tabs, where the recipient is known, and is disabled in the lobby and rooms. It no longer asks for a username in a browser popup.
+- **No browser popups in the GUI** — confirming a room leave (right-click) and settings errors use the app's own dialogs. On Windows the browser popups were titled with the app's internal address (`wails.localhost`).
+- **GUI shows chat messages as plain text** — messages were rendered as a restricted subset of HTML (bold, code, links and the like). No QuietRoom client sends HTML, and the CLI always showed it as typed, so the GUI now does the same: what people type appears exactly as written, and line breaks are kept (multi-line notices such as the room and user lists no longer run together).
 - **Python connector needs `cryptography` 50.0.2 or later** (was 44): earlier releases have known issues of their own and bundle older OpenSSL builds. `pip install -r connector/requirements.txt` picks it up.
+
+### Fixed
+- **GUI messages could disappear after using the Rooms, Users or Members buttons** — the GUI recognised the server's list replies by loose keywords, so while it waited for a list, another notice containing "room" (such as the `/help` text) could be taken for the list and not shown. Replies are now recognised exactly, and the GUI stops waiting after five seconds.
 
 ## [4.0.1] - 2026-11-25
 

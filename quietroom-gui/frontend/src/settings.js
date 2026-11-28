@@ -73,6 +73,7 @@ export const Settings = {
 
   openModal(config) {
     if (!config) return
+    document.getElementById('settings-error').classList.add('hidden')
 
     // Populate settings fields using lowercase keys with uppercase fallbacks
     const dec = document.getElementById('setting-decoy')
@@ -148,13 +149,16 @@ export const Settings = {
     delete config.SoundEnabled
     delete config.DownloadDir
 
+    const errBox = document.getElementById('settings-error')
+    errBox.classList.add('hidden')
     try {
       await window.go.main.App.SaveConfig(config)
       app.config = config
       Settings.populateConnectScreen(config)
       app.closeModal('modal-settings')
     } catch (e) {
-      alert('Failed to save settings: ' + e)
+      errBox.textContent = 'Failed to save settings: ' + e
+      errBox.classList.remove('hidden')
     }
   },
 }

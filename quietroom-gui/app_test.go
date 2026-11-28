@@ -179,7 +179,8 @@ func TestGUIBackend(t *testing.T) {
 	alice.Wait("refused", wait, func(e client.Event) bool { return e.Kind == client.EvError })
 	a.SetCurrentRoom("#guiroom")
 
-	// Lists, in the text format the frontend parses.
+	// Lists, in the text format the frontend parses: it recognises each
+	// reply by exactly how it starts (frontend/src/app.js, system_message).
 	a.RequestUserList()
 	e := rec.wait("system_message", nil)
 	if !strings.HasPrefix(fmt.Sprint(e.data["text"]), "Online Users (2):") {
@@ -192,7 +193,7 @@ func TestGUIBackend(t *testing.T) {
 	}
 	a.RequestRoomList()
 	e = rec.wait("system_message", nil)
-	if txt := fmt.Sprint(e.data["text"]); !strings.Contains(txt, "#guiroom (2 users)") || !strings.Contains(txt, "#locked 🔒") {
+	if txt := fmt.Sprint(e.data["text"]); !strings.HasPrefix(txt, "Active Rooms:\n") || !strings.Contains(txt, "#guiroom (2 users)") || !strings.Contains(txt, "#locked 🔒") {
 		t.Fatalf("room list: %q", txt)
 	}
 
@@ -203,14 +204,41 @@ func TestGUIBackend(t *testing.T) {
 	alice.C.DM("gui", "hey")
 	rec.wait("dm", map[string]string{"partner": "alice", "username": "alice", "text": "hey", "isOwn": "false"})
 
-	// Commands typed into the input box.
-	if err := a.SendCommand("/msg alice via command"); err != nil {
+	a.RequestMemberList("#nosuchroom")
+	e = rec.wait("system_message", nil)
+	if txt := fmt.Sprint(e.data["text"]); txt != "Room not found or access denied." {
+		t.Fatalf("member list of a missing room: %q", txt)
+	}
+
+	// The Verify button: both members see the same two numbers.
+	info, err := a.SafetyNumbers("alice")
+	if err != nil {
 		t.Fatal(err)
 	}
-	alice.Wait("dm via command", wait, func(e client.Event) bool { return e.Kind == client.EvDM && e.Text == "via command" })
+	aliceMine, aliceTheirs, err := alice.C.SafetyNumbers("gui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Me != "gui" || info.Peer != "alice" || info.Mine != aliceTheirs || info.Theirs != aliceMine || info.Mine == info.Theirs {
+		t.Fatalf("safety numbers: %+v, alice sees mine=%s theirs=%s", info, aliceMine, aliceTheirs)
+	}
+	if _, err := a.SafetyNumbers("nobody"); err == nil {
+		t.Fatal("safety numbers for a user who is not online")
+	}
+
+	// No commands: text typed into the box is a message, even if it looks
+	// like a command, so it can never send a DM or a file.
 	secret := makeFile(t, t.TempDir(), "secret.txt", 10)
-	if err := a.SendCommand("/file alice " + secret); err == nil {
-		t.Fatal("/file from the input box must be refused (files only via the picker)")
+	for _, text := range []string{"/msg alice via command", "/file alice " + secret} {
+		if err := a.SendMessage(text); err != nil {
+			t.Fatal(err)
+		}
+		alice.Wait("literal "+text, wait, func(e client.Event) bool {
+			if (e.Kind == client.EvDM && e.From == "gui") || e.Kind == client.EvFileOffer {
+				t.Fatalf("%q acted as a command: %+v", text, e)
+			}
+			return e.Kind == client.EvChat && e.Room == "#guiroom" && e.Text == text
+		})
 	}
 
 	// Sending a file: only a path chosen with the picker is accepted.

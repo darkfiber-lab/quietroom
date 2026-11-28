@@ -81,6 +81,24 @@ export namespace main {
 		    return a;
 		}
 	}
+	export class SafetyInfo {
+	    me: string;
+	    mine: string;
+	    peer: string;
+	    theirs: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SafetyInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.me = source["me"];
+	        this.mine = source["mine"];
+	        this.peer = source["peer"];
+	        this.theirs = source["theirs"];
+	    }
+	}
 
 }
 

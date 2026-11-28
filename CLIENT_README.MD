@@ -423,7 +423,7 @@ The server never stores messages.
 - **Password rooms** (`/join #room password`) are end-to-end encrypted: the password never leaves your computer, and only members who know it can read the room. Joining takes a moment while the keys are derived. Choose a long password: someone who controls the server could try to guess it offline
 - **The lobby and rooms without a password** are not end-to-end encrypted: everyone with the access file can join them, and the server relays them in the clear (inside TLS)
 
-**Checking who you are talking to.** For direct messages, the server hands out the other member's keys. To make sure it did not hand out its own instead, type `/verify <user>` and compare both numbers with that person over another channel (in person, by phone). If they match, nobody is in between. The numbers change every time either of you reconnects.
+**Checking who you are talking to.** For direct messages, the server hands out the other member's keys. To make sure it did not hand out its own instead, type `/verify <user>` (in the GUI, click 🔒 Verify in the DM) and compare both numbers with that person over another channel (in person, by phone). If they match, nobody is in between. The numbers change every time either of you reconnects.
 
 Newcomers to a room cannot read messages sent before they joined, and members who left cannot read what is sent after they left.
 

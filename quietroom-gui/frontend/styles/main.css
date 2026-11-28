@@ -697,3 +697,22 @@ input[type="checkbox"]:checked::after { transform: translateX(16px); background:
   color: var(--text-muted);
   margin-left: auto;
 }
+
+/* Modal text, safety numbers */
+.modal-text { font-size: 13px; color: var(--text-secondary); line-height: 1.5; }
+.modal-text strong { color: var(--text-primary); }
+.modal-note { font-size: 12px; color: var(--text-muted); }
+.safety-row { display: flex; flex-direction: column; gap: 4px; }
+.safety-name { font-size: 12px; color: var(--text-secondary); }
+.safety-number {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  color: var(--text-primary);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  user-select: all;
+  word-spacing: 0.3em;
+}

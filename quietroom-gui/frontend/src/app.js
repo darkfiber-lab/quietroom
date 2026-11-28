@@ -207,9 +207,9 @@ export const App = {
       this.openModal('modal-join-room')
       this._roomSuggestions = []
       // Fetch rooms on open
-      go().RequestRoomList().catch(console.error)
-      this._awaitingRoomList = true
+      this._expect('_awaitingRoomList')
       this._roomListForSuggestions = true
+      go().RequestRoomList().catch(console.error)
       setTimeout(() => document.getElementById('join-room-name').focus(), 50)
     })
 
@@ -235,9 +235,9 @@ export const App = {
       this.openModal('modal-new-dm')
       this._userSuggestions = []
       // Fetch users on open
-      go().RequestUserList().catch(console.error)
-      this._awaitingUserList = true
+      this._expect('_awaitingUserList')
       this._userListForSuggestions = true
+      go().RequestUserList().catch(console.error)
       setTimeout(() => document.getElementById('dm-target-username').focus(), 50)
     })
 
@@ -257,6 +257,8 @@ export const App = {
     document.getElementById('btn-list-users').addEventListener('click', () => this.listUsers())
     document.getElementById('btn-list-members').addEventListener('click', () => this.listMembers())
     document.getElementById('btn-list-rooms').addEventListener('click', () => this.listRooms())
+    document.getElementById('btn-verify').addEventListener('click', () => this.showSafetyNumbers())
+    document.getElementById('btn-confirm-ok').addEventListener('click', () => this._resolveConfirm(true))
     document.querySelectorAll('[data-close-modal]').forEach(btn => {
       btn.addEventListener('click', () => this.closeModal(btn.dataset.closeModal))
     })
@@ -309,6 +311,16 @@ export const App = {
     const text  = input.value.trim()
     if (!text) return
 
+    // The app has no slash commands: every action has a button. Text that
+    // looks like a command is held back once with a hint; pressing Enter
+    // again sends it as an ordinary message.
+    if (text.startsWith('/') && this._heldText !== text) {
+      this._heldText = text
+      Chat.appendSystem('The app has no commands; use the buttons instead (lists in the top bar, ' +
+        '🔒 Verify and 📎 files in a direct message). Press Enter again to send this as a message.')
+      return
+    }
+    this._heldText = null
     input.value = ''
 
     const currentChannel = Chat.currentChannel
@@ -317,13 +329,6 @@ export const App = {
     if (currentChannel.startsWith('__dm__')) {
       const partner = currentChannel.replace('__dm__', '')
       go().SendDM(partner, text).catch(e => Chat.appendSystem(`Error: ${e}`))
-      // Chat.appendOwnMessage(text)
-      return
-    }
-
-    // Raw command
-    if (text.startsWith('/')) {
-      go().SendCommand(text).catch(e => Chat.appendSystem(`Error: ${e}`))
       return
     }
 
@@ -395,8 +400,8 @@ export const App = {
       const text = data.text || ''
 
       // Room list response — lines starting with # are rooms
-      if (this._awaitingRoomList && (text.includes('#') || text.toLowerCase().includes('room'))) {
-        this._awaitingRoomList = false
+      if (this._awaitingRoomList && (text.startsWith('Active Rooms:') || text.startsWith('No active rooms'))) {
+        this._done('_awaitingRoomList')
         const rooms = text.split('\n')
           .map(l => l.trim())
           .filter(l => l.startsWith('#'))
@@ -413,8 +418,8 @@ export const App = {
 
       // User list response
       if (this._awaitingUserList) {
-        if (text.toLowerCase().includes('online users')) {
-          this._awaitingUserList = false
+        if (text.startsWith('Online Users (')) {
+          this._done('_awaitingUserList')
           const colonIdx = text.indexOf(':')
           if (colonIdx !== -1) {
             const users = text.substring(colonIdx + 1)
@@ -436,8 +441,8 @@ export const App = {
       }
 
     if (this._awaitingMemberList) {
-        if (text.toLowerCase().includes('members of')) {
-            this._awaitingMemberList = false
+        if (text.startsWith('Members of ')) {
+            this._done('_awaitingMemberList')
             const colonIdx = text.indexOf(':')
             if (colonIdx !== -1) {
                 const members = text.substring(colonIdx + 1)
@@ -449,8 +454,8 @@ export const App = {
             }
         }
         // Access denied response
-        if (text.includes('access denied') || text.includes('not found')) {
-            this._awaitingMemberList = false
+        if (text === 'Room not found or access denied.') {
+            this._done('_awaitingMemberList')
             Chat.appendSystem(text)
             return
         }
@@ -519,27 +524,79 @@ export const App = {
 
   closeModal(id) {
     document.getElementById(id).classList.add('hidden')
+    if (id === 'modal-confirm') this._resolveConfirm(false)
   },
 
   // ── Convenience proxies used by inline onclick handlers ─────
   listRooms() {
+    this._roomListForSuggestions = false
+    this._expect('_awaitingRoomList')
     go().RequestRoomList().catch(console.error)
-    this._awaitingRoomList = true
   },
 
   listUsers() {
-      go().RequestUserList().catch(console.error)
-      this._awaitingUserList = true
+    this._userListForSuggestions = false
+    this._expect('_awaitingUserList')
+    go().RequestUserList().catch(console.error)
   },
 
   listMembers() {
       const channel = Chat.currentChannel
       const target = channel === '__lobby__' ? 'lobby' :
                     channel.startsWith('__dm__') ? 'lobby' : channel
-      go().RequestMemberList(target).catch(console.error)
-      this._awaitingMemberList = true
+      this._expect('_awaitingMemberList')
       this._memberListContext = target
+      go().RequestMemberList(target).catch(console.error)
   },
+  // Waits for the reply to a list request. Replies are recognised by the
+  // exact way the server starts them; if none comes within a few seconds
+  // the wait ends, so a lost reply can never swallow a later message.
+  _expect(flag) {
+    this[flag] = true
+    clearTimeout(this[flag + 'Timer'])
+    this[flag + 'Timer'] = setTimeout(() => { this[flag] = false }, 5000)
+  },
+
+  _done(flag) {
+    this[flag] = false
+    clearTimeout(this[flag + 'Timer'])
+  },
+
+  // In-app replacement for the browser's confirm(), whose window on
+  // Windows is titled with the app's internal address.
+  confirmDialog(title, text, okLabel = 'OK') {
+    document.getElementById('confirm-title').textContent = title
+    document.getElementById('confirm-text').textContent = text
+    document.getElementById('btn-confirm-ok').textContent = okLabel
+    this._resolveConfirm(false) // settle any earlier dialog
+    this.openModal('modal-confirm')
+    return new Promise(resolve => { this._confirmResolve = resolve })
+  },
+
+  _resolveConfirm(ok) {
+    const resolve = this._confirmResolve
+    this._confirmResolve = null
+    if (ok) this.closeModal('modal-confirm')
+    if (resolve) resolve(ok)
+  },
+
+  async showSafetyNumbers() {
+    const channel = Chat.currentChannel
+    if (!channel.startsWith('__dm__')) return
+    const partner = channel.replace('__dm__', '')
+    try {
+      const info = await go().SafetyNumbers(partner)
+      document.getElementById('verify-peer-name').textContent = info.peer
+      document.getElementById('verify-me').textContent = `${info.me} (you)`
+      document.getElementById('verify-mine').textContent = info.mine
+      document.getElementById('verify-peer').textContent = info.peer
+      document.getElementById('verify-theirs').textContent = info.theirs
+      this.openModal('modal-verify')
+    } catch (e) {
+      Chat.appendSystem(`Cannot verify ${partner}: ${e}`, channel)
+    }
+  },
+
   showRoomListModal(rooms) {
     const list = document.getElementById('room-list-items')
     list.innerHTML = ''

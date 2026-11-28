@@ -86,12 +86,12 @@ export function RequestUserList() {
   return window['go']['main']['App']['RequestUserList']();
 }
 
-export function SaveConfig(arg1) {
-  return window['go']['main']['App']['SaveConfig'](arg1);
+export function SafetyNumbers(arg1) {
+  return window['go']['main']['App']['SafetyNumbers'](arg1);
 }
 
-export function SendCommand(arg1) {
-  return window['go']['main']['App']['SendCommand'](arg1);
+export function SaveConfig(arg1) {
+  return window['go']['main']['App']['SaveConfig'](arg1);
 }
 
 export function SendDM(arg1, arg2) {

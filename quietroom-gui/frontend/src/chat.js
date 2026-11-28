@@ -121,6 +121,14 @@ export const Chat = {
     else if (channelKey.startsWith('__dm__')) title.textContent = '🔒 @ ' + channelKey.replace('__dm__', '')
     else title.textContent = channelKey
 
+    // Verify and file sending belong to direct messages: both are about
+    // one other person, so the buttons only work in a DM tab.
+    const isDM = channelKey.startsWith('__dm__')
+    document.getElementById('btn-verify').classList.toggle('hidden', !isDM)
+    const attach = document.getElementById('btn-attach')
+    attach.disabled = !isDM
+    attach.title = isDM ? 'Send file' : 'Open a direct message to send a file'
+
     // Re-render messages for this channel
     this.renderChannel(channelKey)
   },
@@ -151,13 +159,14 @@ export const Chat = {
     // Add leave button on right-click
     li.addEventListener('contextmenu', e => {
       e.preventDefault()
-      if (confirm(`Leave ${room}?`)) {
+      window.App.confirmDialog('Leave room', `Leave ${room}?`, 'Leave').then(ok => {
+        if (!ok) return
         window.go.main.App.LeaveRoom(room).then(() => {
           li.remove()
           delete this.channels[room]
           this.switchTo('__lobby__')
         }).catch(console.error)
-      }
+      })
     })
 
     document.getElementById('room-list').appendChild(li)
@@ -182,7 +191,7 @@ export const Chat = {
       li.addEventListener('click', () => this.switchTo(key))
       document.getElementById('dm-list').appendChild(li)
       this.appendSystem(`🔒 Direct messages and files with ${partner} are end-to-end encrypted. ` +
-        `To make sure nobody is in between, type /verify ${partner} and compare the numbers with them.`, key)
+        `To make sure nobody is in between, click 🔒 Verify above and compare the numbers with them.`, key)
     }
     this.switchTo(key)
   },

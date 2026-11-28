@@ -28,7 +28,7 @@ This project does not seek to compete with large-scale platforms. It offers some
 
 ## Features
 
-- 🔒 **End-to-end encryption** - Direct messages, files and password rooms are encrypted between members; the server relays them without being able to read them. `/verify` compares safety numbers
+- 🔒 **End-to-end encryption** - Direct messages, files and password rooms are encrypted between members; the server relays them without being able to read them. `/verify` (or the 🔒 Verify button in the GUI) compares safety numbers
 - 🔐 **TLS 1.3 with forward secrecy** - All traffic encrypted; the server certificate is pinned by every client
 - 🔑 **Access key** - Only holders of the current `quietroom_access.pem` can connect; a server restart issues a new key
 - 🕵️ **Traffic padding** - Messages are padded to fixed size classes, so their length is hidden
@@ -83,7 +83,7 @@ For detailed setup instructions, configuration options, and troubleshooting:
 
 Direct messages, file transfers and password rooms are end-to-end encrypted: the server relays them without being able to read them.
 
-- **Direct messages and files** - Encrypted between the two members with keys created for each connection (X25519, ChaCha20-Poly1305), with forward secrecy within the session. `/verify <user>` shows safety numbers to compare with the other member: if they match, nobody, not even the server, is in between
+- **Direct messages and files** - Encrypted between the two members with keys created for each connection (X25519, ChaCha20-Poly1305), with forward secrecy within the session. `/verify <user>` (in the GUI, the 🔒 Verify button of the DM) shows safety numbers to compare with the other member: if they match, nobody, not even the server, is in between
 - **Password rooms** - The password never leaves your computer. It is turned into keys with Argon2id; only members who know it get the room keys (the server cannot join as a reader), and keys change whenever someone leaves
 - **Lobby and open rooms** - Not end-to-end encrypted: they are open to everyone with the access file, and the server relays them in the clear (inside TLS)
 

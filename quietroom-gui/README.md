@@ -9,7 +9,7 @@ Available for macOS, Windows, and Linux.
 ## Features
 
 ### Security
-- **End-to-end encryption** — direct messages, files and password rooms are encrypted between members (🔒); the server relays them without being able to read them. Type `/verify <user>` in a DM to compare safety numbers
+- **End-to-end encryption** — direct messages, files and password rooms are encrypted between members (🔒); the server relays them without being able to read them. click **🔒 Verify** in a DM to compare safety numbers
 - **TLS 1.3** — all traffic encrypted with ephemeral keys (forward secrecy)
 - **Access key** — the client presents the master access key from `quietroom_access.pem` during the TLS handshake; the server refuses connections without it
 - **Certificate pinning** — the server's TLS certificate is compared byte-for-byte against the one stored in `quietroom_access.pem`; connections are refused if they don't match, blocking man-in-the-middle attacks
@@ -85,9 +85,17 @@ To leave a room, click the **✕** button next to the room name in the sidebar.
 
 Click **+ New DM** in the sidebar or click the **DM** button next to a username in the Users or Members list. Type your message and press Enter.
 
+### Checking who you are talking to
+
+In a DM, click **🔒 Verify** in the top bar. It shows two safety numbers, one for you and one for the other person. Compare them with that person over another channel (in person, by phone): if both of you see the same two numbers, nobody, not even the server, can read your direct messages and files. The numbers change whenever either of you reconnects.
+
 ### Sending a file
 
-Click the **📎** button in the input bar. If you're in a DM thread the file will be offered to that user. If you're in a room or lobby you'll be prompted for the recipient's username. The recipient receives a file transfer request and must click **Accept** in the dialog that appears.
+Open a DM with the person and click the **📎** button in the input bar, then pick the file. Files always go to one person, end-to-end encrypted, so the button only works in a DM. The recipient receives a file transfer request and must click **Accept** in the dialog that appears.
+
+### No slash commands
+
+The app has a button for every action, so it has no `/commands`: what you type is always sent as a message. If a message starts with `/`, the app reminds you once; press Enter again to send it as it is. The command-line client keeps its commands.
 
 ### Viewing online users
 
