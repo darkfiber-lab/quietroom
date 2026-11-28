@@ -156,7 +156,7 @@ never leaves the client.
 3. Every member who verifies the proof answers with an `rkey` on the pairwise
    channel: its own proof and the current state of its sending chain
    (`kid`, chain key, counter). The newcomer verifies the proof and answers
-   with its own `rkey`.
+   with its own `rkey`, giving its chain from its first message (see below).
 
 A member who cannot produce a valid proof (for example someone a malicious
 server let in, or who obtained the verifier) gets no keys from anyone, and
@@ -184,6 +184,16 @@ others, so **a member who left cannot read what follows**.
 
 Messages that arrive before the sender's key (for example right after a join)
 are kept briefly (up to 64 per sender) and decrypted when the key arrives.
+
+A newcomer may write before the keys are swapped (the exchange takes
+milliseconds). Its chain has moved on by then, so the members it answers in
+step 3, who were in the room first and received those messages, get its chain
+**from its first message** rather than its current position; otherwise they
+could not read them. This start is only offered while the chain is young (its
+first 64 messages and 10 seconds), then wiped. Members who join later always
+get the current position. The bound matters in one case: someone who knows
+the password and, with the server's help, poses as an earlier member could
+read what a newcomer wrote in its first seconds; never anything older.
 
 ## Protocol messages
 

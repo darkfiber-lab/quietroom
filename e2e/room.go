@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -77,11 +78,27 @@ type SenderKey struct {
 	N   uint32 // counter of the next message
 }
 
+// StartWindow and StartAge bound how long a new sending chain can still be
+// shared from its first message (see StartKey): the key exchange after
+// joining takes milliseconds, so these are generous.
+const (
+	StartWindow = 64
+	StartAge    = 10 * time.Second
+)
+
+var now = time.Now // replaced in tests
+
 // Sender is our own sending chain in one room.
 type Sender struct {
 	room string
 	kid  uint32
 	c    chain
+
+	// The chain key before the first message, kept briefly for members
+	// who were in the room before us (StartKey), then wiped.
+	start   [KeyLen]byte
+	startOK bool
+	created time.Time
 }
 
 // NewSender creates a fresh sending chain with a random key ID.
@@ -93,12 +110,33 @@ func NewSender(room string) (*Sender, error) {
 	}
 	s.kid = binary.BigEndian.Uint32(b[:4])
 	copy(s.c.ck[:], b[4:])
+	s.start, s.startOK, s.created = s.c.ck, true, now()
 	return s, nil
 }
 
-// Key returns the current chain state, to share with a member.
+// Key returns the current chain state, to share with a member who joins
+// after us: they cannot read anything we sent before.
 func (s *Sender) Key() SenderKey {
 	return SenderKey{KID: s.kid, CK: append([]byte{}, s.c.ck[:]...), N: s.c.n}
+}
+
+// StartKey returns the chain from its first message, to share with a
+// member who was already in the room when we created it. They received
+// everything we sent with it, including messages sent before our keys
+// reached them; with Key they could not read those. It is only available
+// for the first StartWindow messages and StartAge, then wiped, so it
+// cannot later expose what we sent.
+func (s *Sender) StartKey() (SenderKey, bool) {
+	if !s.startOK || s.c.n >= StartWindow || now().Sub(s.created) > StartAge {
+		s.forgetStart()
+		return SenderKey{}, false
+	}
+	return SenderKey{KID: s.kid, CK: append([]byte{}, s.start[:]...), N: 0}, true
+}
+
+func (s *Sender) forgetStart() {
+	clear(s.start[:])
+	s.startOK = false
 }
 
 func roomAAD(room string, from PublicKeys, kid, n uint32) []byte {
@@ -119,6 +157,9 @@ func (s *Sender) Seal(id *Identity, plain []byte) (kid, n uint32, ct, sig []byte
 	mk, n, err := s.c.next()
 	if err != nil {
 		return 0, 0, nil, nil, err
+	}
+	if s.c.n >= StartWindow {
+		s.forgetStart()
 	}
 	ct = sealOnce(mk, padded, roomAAD(s.room, id.pub, s.kid, n))
 	sig = ed25519.Sign(id.sk, roomSigInput(s.room, s.kid, n, ct))

@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 )
 
 func mustID(t *testing.T) *Identity {
@@ -300,5 +301,57 @@ func TestFileStream(t *testing.T) {
 	o, _ := NewFileOpener(wrong)
 	if _, err := o.Open(cts[0], false); err == nil {
 		t.Fatal("wrong key decrypted")
+	}
+}
+
+// A member who was in the room before us gets our key from its start and
+// reads what we sent before the keys were swapped; a newcomer's key starts
+// now. The start is only offered briefly, then wiped.
+func TestRoomStartKey(t *testing.T) {
+	ida := mustID(t)
+	send, _ := NewSender("#team")
+	kid0, n0, ct0, sig0, _ := send.Seal(ida, []byte("hi, just joined"))
+	kid1, n1, ct1, sig1, _ := send.Seal(ida, []byte("anyone here?"))
+
+	start, ok := send.StartKey()
+	if !ok || start.N != 0 || start.KID != send.Key().KID {
+		t.Fatalf("start key %+v %v", start, ok)
+	}
+	early, _ := NewReceiver("#team", ida.Public(), start)
+	for _, m := range []struct {
+		kid, n  uint32
+		ct, sig []byte
+		want    string
+	}{{kid0, n0, ct0, sig0, "hi, just joined"}, {kid1, n1, ct1, sig1, "anyone here?"}} {
+		if got, err := early.Open(m.kid, m.n, m.ct, m.sig); err != nil || string(got) != m.want {
+			t.Fatalf("existing member: %q %v", got, err)
+		}
+	}
+
+	late, _ := NewReceiver("#team", ida.Public(), send.Key())
+	if _, err := late.Open(kid0, n0, ct0, sig0); err == nil {
+		t.Fatal("newcomer read a message from before they joined")
+	}
+
+	// Gone after StartWindow messages, and wiped.
+	for i := 2; i < StartWindow; i++ {
+		send.Seal(ida, []byte("x"))
+	}
+	if _, ok := send.StartKey(); ok {
+		t.Fatal("start key still offered after StartWindow messages")
+	}
+	if send.start != [KeyLen]byte{} {
+		t.Fatal("start key not wiped")
+	}
+
+	// Gone after StartAge.
+	defer func() { now = time.Now }()
+	young, _ := NewSender("#team")
+	if _, ok := young.StartKey(); !ok {
+		t.Fatal("young sender has no start key")
+	}
+	now = func() time.Time { return time.Now().Add(StartAge + time.Second) }
+	if _, ok := young.StartKey(); ok {
+		t.Fatal("start key still offered after StartAge")
 	}
 }

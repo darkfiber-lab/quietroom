@@ -37,7 +37,15 @@ def on_room(room, sender, text):
 
 conn.on_room_message(on_room)
 conn.on_system_message(lambda t: got_users.set() if t.startswith("Online Users") else None)
-conn.on_presence(lambda e, u, r: presence.append((e, u, r)))
+def on_presence(e, u, r):
+    presence.append((e, u, r))
+    # Write the moment the join is confirmed, before any key has been
+    # swapped: alice, who was in the room first, must still read it.
+    if (e, u, r) == ("joined", "pybot", "#pysecret"):
+        conn.send_room_message(r, "python's first words")
+
+
+conn.on_presence(on_presence)
 conn.connect()
 say("CONNECTED")
 

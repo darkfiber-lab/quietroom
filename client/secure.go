@@ -310,14 +310,22 @@ func (c *Client) IsSecureRoom(room string) bool {
 	return c.sec.rooms[room] != nil
 }
 
-// sendRoomKey gives a verified member our current sending key. Caller holds
-// smu.
-func (c *Client) sendRoomKey(r *secureRoom, name string, mb *member) {
+// sendRoomKey gives a verified member our sending key. A member who was in
+// the room before us (fromStart) gets it from its first message, so they can
+// read what we sent before the keys were exchanged; anyone else gets it from
+// now on, so they cannot read anything we sent before they came. Caller
+// holds smu.
+func (c *Client) sendRoomKey(r *secureRoom, name string, mb *member, fromStart bool) {
 	p := c.peerFor(name)
 	if p == nil {
 		return
 	}
 	k := r.sender.Key()
+	if fromStart {
+		if sk, ok := r.sender.StartKey(); ok {
+			k = sk
+		}
+	}
 	body := roomKeyBody{
 		Room: r.name, Proof: e2e.Encode(r.secret.Proof(c.user, c.sec.id.Public())),
 		KID: k.KID, CK: e2e.Encode(k.CK), N: k.N,
@@ -386,7 +394,7 @@ func (c *Client) memberLeft(room, name string) {
 	r.sender = sender
 	for k, other := range r.members {
 		if p := c.sec.peers[k]; p != nil {
-			c.sendRoomKey(r, p.name, other)
+			c.sendRoomKey(r, p.name, other, false)
 		}
 	}
 }
@@ -412,9 +420,10 @@ func (c *Client) handleRoomHello(m wire.Msg) {
 				mb = &member{}
 				r.members[key] = mb
 			}
-			// Repeated hellos get no new copies of an unchanged key.
+			// A hello comes from someone joining after us: they get our key
+			// from now on. Repeated hellos get no new copies of it.
 			if !mb.sent || mb.sentKID != r.sender.Key().KID {
-				c.sendRoomKey(r, p.name, mb)
+				c.sendRoomKey(r, p.name, mb, false)
 			}
 		} else if !r.refused[key] {
 			r.refused[key] = true
@@ -462,8 +471,12 @@ func (c *Client) handleRoomKey(m wire.Msg) {
 		r.members[key] = mb
 	}
 	mb.recv = recv
+	// If we have not given this member our key yet, theirs answers our
+	// hello: they were in the room before us and received everything we
+	// sent, so they get our key from its start (while it is still young)
+	// and can read our first messages, sent before the keys were swapped.
 	if !mb.sent || mb.sentKID != r.sender.Key().KID {
-		c.sendRoomKey(r, p.name, mb)
+		c.sendRoomKey(r, p.name, mb, !mb.sent)
 	}
 	retry = r.pending[key]
 	delete(r.pending, key)

@@ -508,6 +508,10 @@ def _room_sig_input(room: str, kid: int, n: int, ct: bytes) -> bytes:
     return _pack(_L_ROOM_SIG, room.encode(), _u32(kid), _u32(n), ct)
 
 
+_START_WINDOW = 64     # a new chain can be shared from its start for this many messages
+_START_AGE = 10.0      # and this many seconds (the key exchange takes milliseconds)
+
+
 class _Sender:
     """Our sending chain in one password room."""
 
@@ -515,11 +519,26 @@ class _Sender:
         self.room = room
         self.kid = int.from_bytes(secrets.token_bytes(4), "big")
         self.ck, self.n = secrets.token_bytes(_KEY_LEN), 0
+        # The key before the first message, kept briefly for members who were
+        # in the room before us (start_key), then dropped.
+        self._start: Optional[bytes] = self.ck
+        self._created = time.monotonic()
+
+    def start_key(self) -> Optional[tuple[bytes, int]]:
+        """The chain from its first message, for a member who was already in
+        the room: they received everything we sent with it, including what
+        went out before our keys reached them. Only while the chain is young."""
+        if self._start is None or self.n >= _START_WINDOW or time.monotonic() - self._created > _START_AGE:
+            self._start = None
+            return None
+        return self._start, 0
 
     def seal(self, me: Identity, plain: bytes) -> tuple[int, int, bytes, bytes]:
         mk, self.ck = _step(self.ck)
         n = self.n
         self.n += 1
+        if self.n >= _START_WINDOW:
+            self._start = None
         ct = _seal_once(mk, _pad(plain), _room_aad(self.room, me.public, self.kid, n))
         return self.kid, n, ct, me.sign(_room_sig_input(self.room, self.kid, n, ct))
 
@@ -1170,13 +1189,19 @@ class QuietRoomConnector:
         self._call(self._message_callbacks, f"[DM from {sender}]: {text}")
         self._call(self._dm_callbacks, sender, text)
 
-    def _send_room_key(self, r: "_SecureRoom", name: str, member: "_Member"):
-        """Give a verified member our current sending key. Caller holds _e2e_lock."""
+    def _send_room_key(self, r: "_SecureRoom", name: str, member: "_Member", from_start: bool = False):
+        """Give a verified member our sending key: from its first message to a
+        member who was in the room before us (from_start), so they can read
+        what we sent before the keys were swapped; from now on to anyone else,
+        who must not read what we sent before they came. Caller holds _e2e_lock."""
         peer = self._peers.get(name.lower())
         if peer is None:
             return
+        ck, n = r.sender.ck, r.sender.n
+        if from_start and (start := r.sender.start_key()) is not None:
+            ck, n = start
         body = {"room": r.name, "proof": _b64(r.secret.proof(self._cfg.username, self._id.public)),
-                "kid": r.sender.kid, "ck": _b64(r.sender.ck), "n": r.sender.n}
+                "kid": r.sender.kid, "ck": _b64(ck), "n": n}
         n, ct = peer[2].seal("rkey", json.dumps(body).encode())
         self._send({"t": "rkey", "to": peer[0], "n": n, "ct": _b64(ct)})
         member.sent_kid = r.sender.kid
@@ -1264,8 +1289,10 @@ class QuietRoomConnector:
             key = peer[0].lower()
             member = r.members.setdefault(key, _Member())
             member.recv = _Receiver(room, peer[1], kid, ck, n)
+            # No key of ours sent yet: theirs answers our hello, so they were
+            # here before us and get our key from its start.
             if member.sent_kid != r.sender.kid:
-                self._send_room_key(r, peer[0], member)
+                self._send_room_key(r, peer[0], member, from_start=member.sent_kid is None)
             retry = r.pending.pop(key, [])
         for m in retry:
             self._secure_chat(m)

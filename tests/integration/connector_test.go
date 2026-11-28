@@ -108,10 +108,18 @@ func TestPythonConnector(t *testing.T) {
 	if l := expect("SAFETY "); l != "SAFETY "+theirs+" / "+mine {
 		t.Fatalf("safety numbers differ between Go and Python: %q vs %s / %s", l, theirs, mine)
 	}
-	// Keys are exchanged once pybot has joined; repeat until it answers.
 	alice.Wait("pybot joins #pysecret", wait, func(e client.Event) bool {
 		return e.Kind == client.EvJoined && e.User == "pybot" && e.Room == "#pysecret"
 	})
+	// pybot writes as soon as it has joined, before the keys are swapped;
+	// alice was there first and reads it without it being resent.
+	alice.Wait("pybot's first words", wait, func(e client.Event) bool {
+		if e.Kind == client.EvError && strings.Contains(e.Text, "could not be verified") {
+			t.Fatalf("pybot's first message was dropped: %s", e.Text)
+		}
+		return e.Kind == client.EvChat && e.Room == "#pysecret" && e.From == "pybot" && e.Text == "python's first words"
+	})
+	// Keys are exchanged once pybot has joined; repeat until it answers.
 	deadline := time.Now().Add(wait)
 	for {
 		alice.C.Chat("#pysecret", "go to python")
