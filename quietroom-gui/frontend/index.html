@@ -124,6 +124,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
       <div class="topbar" style="--wails-draggable: drag">
         <div class="topbar-title" id="topbar-title">Lobby</div>
         <div class="topbar-actions">
+          <button class="btn btn-ghost btn-sm hidden" id="btn-verify" title="Compare safety numbers with this person">🔒 Verify</button>
           <button class="btn btn-ghost btn-sm" id="btn-list-users" title="List all online users">👥 Users</button>
           <button class="btn btn-ghost btn-sm" id="btn-list-members" title="List members of current channel">👁 Members</button>
           <button class="btn btn-ghost btn-sm" id="btn-list-rooms" title="List rooms">📋 Rooms</button>
@@ -144,7 +145,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
       <!-- Input area -->
       <div class="input-area">
-        <button class="btn btn-ghost btn-icon attach-btn" id="btn-attach" title="Send file">📎</button>
+        <button class="btn btn-ghost btn-icon attach-btn" id="btn-attach" title="Open a direct message to send a file" disabled>📎</button>
         <input
           type="text"
           id="message-input"
@@ -262,12 +263,40 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
         </div>
       </div>
 
+      <div id="settings-error" class="alert alert-error hidden"></div>
+
       <div class="modal-actions">
         <button class="btn btn-ghost" data-close-modal="modal-settings">Cancel</button>
         <button class="btn btn-primary" id="btn-save-settings">Save</button>
       </div>
     </div>
   </div>
+    <!-- Safety numbers modal (Verify button in a direct message) -->
+    <div id="modal-verify" class="modal-overlay hidden">
+      <div class="modal">
+        <h3>Safety numbers</h3>
+        <p class="modal-text">Compare both numbers with <strong id="verify-peer-name"></strong> over another channel (in person, by phone). If they match, nobody, not even the server, can read your direct messages and files.</p>
+        <div class="safety-row"><span class="safety-name" id="verify-me"></span><code class="safety-number" id="verify-mine"></code></div>
+        <div class="safety-row"><span class="safety-name" id="verify-peer"></span><code class="safety-number" id="verify-theirs"></code></div>
+        <p class="modal-note">The numbers change whenever either of you reconnects.</p>
+        <div class="modal-actions">
+          <button class="btn btn-primary" data-close-modal="modal-verify">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Confirmation modal (replaces the browser's confirm()) -->
+    <div id="modal-confirm" class="modal-overlay hidden">
+      <div class="modal">
+        <h3 id="confirm-title"></h3>
+        <p class="modal-text" id="confirm-text"></p>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" data-close-modal="modal-confirm">Cancel</button>
+          <button class="btn btn-primary" id="btn-confirm-ok">OK</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Room list modal -->
     <div id="modal-room-list" class="modal-overlay hidden">
       <div class="modal">

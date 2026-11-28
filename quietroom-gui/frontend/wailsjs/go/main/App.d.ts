@@ -44,9 +44,9 @@ export function RequestRoomList():Promise<void>;
 
 export function RequestUserList():Promise<void>;
 
-export function SaveConfig(arg1:main.AppConfig):Promise<void>;
+export function SafetyNumbers(arg1:string):Promise<main.SafetyInfo>;
 
-export function SendCommand(arg1:string):Promise<void>;
+export function SaveConfig(arg1:main.AppConfig):Promise<void>;
 
 export function SendDM(arg1:string,arg2:string):Promise<void>;
 

@@ -107,7 +107,7 @@ repeat 5200 times: h = SHA-512(h ‖ kx‖sk)
 number = six groups of five digits from h[0:30] (each 5 bytes mod 100000)
 ```
 
-`/verify <user>` shows both numbers. If both members see the same two numbers
+`/verify <user>` (CLI) and the 🔒 Verify button of a DM (GUI) show both numbers. If both members see the same two numbers
 (compared in person, by phone, ...), the server did not substitute keys. The
 numbers are per member rather than one combined number, so a server cannot
 use a birthday attack to make substituted keys collide; it would need a

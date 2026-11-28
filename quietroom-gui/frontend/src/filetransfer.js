@@ -52,17 +52,14 @@ export const FileTransfer = {
   },
 
   async pickAndInitiate(app) {
-    // Determine recipient from current channel
+    // Files go to one person, end-to-end encrypted, so they are sent from
+    // that person's DM tab (the button is disabled everywhere else).
     const channel = Chat.currentChannel
-    let recipient = ''
-
-    if (channel.startsWith('__dm__')) {
-      recipient = channel.replace('__dm__', '')
-    } else {
-      // Prompt for recipient if not in DM
-      recipient = prompt('Send file to (username):')
-      if (!recipient) return
+    if (!channel.startsWith('__dm__')) {
+      Chat.appendSystem('Open a direct message to send a file.')
+      return
     }
+    const recipient = channel.replace('__dm__', '')
 
     try {
       const path = await window.go.main.App.PickFileToSend()
