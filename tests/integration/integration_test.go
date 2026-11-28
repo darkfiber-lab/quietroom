@@ -694,3 +694,28 @@ func TestManyMembers(t *testing.T) {
 	}
 	s.CheckOutput(t)
 }
+
+// A member who writes right after joining a password room, before the keys
+// are swapped, is still read by those already in the room (no resending).
+func TestPasswordRoomFirstMessage(t *testing.T) {
+	s := start(t)
+	alice := s.Join(t, "alice")
+	alice.C.Join("#vault", "pw")
+	alice.Wait("alice in", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#vault" })
+
+	for i, name := range []string{"bob", "carol"} {
+		m := s.Join(t, name)
+		m.C.Join("#vault", "pw")
+		m.Wait("joined", wait, func(e client.Event) bool { return e.Kind == client.EvJoined && e.Self && e.Room == "#vault" })
+		text := fmt.Sprintf("first words of %s", name)
+		if err := m.C.Chat("#vault", text); err != nil { // at once, keys not yet swapped
+			t.Fatal(err)
+		}
+		alice.Wait(name+"'s first message", wait, func(e client.Event) bool {
+			if e.Kind == client.EvError && strings.Contains(e.Text, "could not be verified") {
+				t.Fatalf("message %d dropped: %s", i, e.Text)
+			}
+			return e.Kind == client.EvChat && e.Room == "#vault" && e.From == name && e.Text == text
+		})
+	}
+}

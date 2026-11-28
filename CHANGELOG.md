@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **First messages in a password room could be lost** — a member who wrote right after joining, before the room's keys had been swapped (a fraction of a second), had those messages dropped by everyone already in the room ("could not be verified and was dropped"), while seeing them as sent. Members who were in the room first now receive the newcomer's key from its first message, so they read them; members who join later still cannot read anything from before they came. Fixed in the Go client (CLI, GUI) and the Python connector; see docs/E2E_DESIGN.md, "Messages".
+
 ## [4.1.0] - 2026-11-28
 
 Compatible with 4.0 servers and clients (protocol 4); only the GUI and the connector change.
